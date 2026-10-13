@@ -1,0 +1,206 @@
+{
+  "chain": "InsightFlow-Agent2 -> ModelGate(test) -> local mock provider -> 200",
+  "gateway": {
+    "base_url": "http://127.0.0.1:18000/v1",
+    "database": "modelgate_docker_test",
+    "compose_project": "modelgate-docker-test"
+  },
+  "mock_upstream": {
+    "url": "http://host.docker.internal:9099",
+    "fixed_usage": {
+      "prompt_tokens": 12,
+      "completion_tokens": 8
+    },
+    "note": "固定模拟 usage，仅用于验证网关的提取与累加，不代表真实模型用量",
+    "requests_received": 6
+  },
+  "runs": [
+    {
+      "run_id": "ok-a2b8d2a77baf",
+      "agents_invoked": [
+        "planner"
+      ],
+      "totals": {
+        "total_requests": 1,
+        "success_count": 1,
+        "failure_count": 0,
+        "prompt_tokens": 12,
+        "completion_tokens": 8,
+        "total_tokens": 20,
+        "estimated_cost_usd": "0",
+        "avg_latency_ms": 11
+      },
+      "by_agent": [
+        {
+          "key": "planner",
+          "total_requests": 1,
+          "success_count": 1,
+          "failure_count": 0,
+          "prompt_tokens": 12,
+          "completion_tokens": 8,
+          "total_tokens": 20,
+          "estimated_cost_usd": "0",
+          "avg_latency_ms": 11
+        }
+      ],
+      "data_quality": {
+        "records_with_unknown_tokens": 0,
+        "records_without_cost": 1,
+        "records_with_retries": 0,
+        "note": "Token 与成本只累加已知值。发生过重试的请求，其 usage 仅来自最后一次尝试，中间尝试可能已在上游计费，因此成本是不完整的下限"
+      }
+    },
+    {
+      "run_id": "tokens-3e9d18bfaad0",
+      "agents_invoked": [
+        "executor"
+      ],
+      "totals": {
+        "total_requests": 1,
+        "success_count": 1,
+        "failure_count": 0,
+        "prompt_tokens": 12,
+        "completion_tokens": 8,
+        "total_tokens": 20,
+        "estimated_cost_usd": "0",
+        "avg_latency_ms": 2
+      },
+      "by_agent": [
+        {
+          "key": "executor",
+          "total_requests": 1,
+          "success_count": 1,
+          "failure_count": 0,
+          "prompt_tokens": 12,
+          "completion_tokens": 8,
+          "total_tokens": 20,
+          "estimated_cost_usd": "0",
+          "avg_latency_ms": 2
+        }
+      ],
+      "data_quality": {
+        "records_with_unknown_tokens": 0,
+        "records_without_cost": 1,
+        "records_with_retries": 0,
+        "note": "Token 与成本只累加已知值。发生过重试的请求，其 usage 仅来自最后一次尝试，中间尝试可能已在上游计费，因此成本是不完整的下限"
+      }
+    },
+    {
+      "run_id": "multiagent-17f12808613c",
+      "agents_invoked": [
+        "planner",
+        "executor"
+      ],
+      "totals": {
+        "total_requests": 2,
+        "success_count": 2,
+        "failure_count": 0,
+        "prompt_tokens": 24,
+        "completion_tokens": 16,
+        "total_tokens": 40,
+        "estimated_cost_usd": "0",
+        "avg_latency_ms": 4
+      },
+      "by_agent": [
+        {
+          "key": "executor",
+          "total_requests": 1,
+          "success_count": 1,
+          "failure_count": 0,
+          "prompt_tokens": 12,
+          "completion_tokens": 8,
+          "total_tokens": 20,
+          "estimated_cost_usd": "0",
+          "avg_latency_ms": 5
+        },
+        {
+          "key": "planner",
+          "total_requests": 1,
+          "success_count": 1,
+          "failure_count": 0,
+          "prompt_tokens": 12,
+          "completion_tokens": 8,
+          "total_tokens": 20,
+          "estimated_cost_usd": "0",
+          "avg_latency_ms": 4
+        }
+      ],
+      "data_quality": {
+        "records_with_unknown_tokens": 0,
+        "records_without_cost": 2,
+        "records_with_retries": 0,
+        "note": "Token 与成本只累加已知值。发生过重试的请求，其 usage 仅来自最后一次尝试，中间尝试可能已在上游计费，因此成本是不完整的下限"
+      }
+    },
+    {
+      "run_id": "listed-099e0b18b10f",
+      "agents_invoked": [
+        "critic"
+      ],
+      "totals": {
+        "total_requests": 1,
+        "success_count": 1,
+        "failure_count": 0,
+        "prompt_tokens": 12,
+        "completion_tokens": 8,
+        "total_tokens": 20,
+        "estimated_cost_usd": "0",
+        "avg_latency_ms": 3
+      },
+      "by_agent": [
+        {
+          "key": "critic",
+          "total_requests": 1,
+          "success_count": 1,
+          "failure_count": 0,
+          "prompt_tokens": 12,
+          "completion_tokens": 8,
+          "total_tokens": 20,
+          "estimated_cost_usd": "0",
+          "avg_latency_ms": 3
+        }
+      ],
+      "data_quality": {
+        "records_with_unknown_tokens": 0,
+        "records_without_cost": 1,
+        "records_with_retries": 0,
+        "note": "Token 与成本只累加已知值。发生过重试的请求，其 usage 仅来自最后一次尝试，中间尝试可能已在上游计费，因此成本是不完整的下限"
+      }
+    },
+    {
+      "run_id": "apptag-9b87ee09933e",
+      "agents_invoked": [
+        "reporter"
+      ],
+      "totals": {
+        "total_requests": 1,
+        "success_count": 1,
+        "failure_count": 0,
+        "prompt_tokens": 12,
+        "completion_tokens": 8,
+        "total_tokens": 20,
+        "estimated_cost_usd": "0",
+        "avg_latency_ms": 2
+      },
+      "by_agent": [
+        {
+          "key": "reporter",
+          "total_requests": 1,
+          "success_count": 1,
+          "failure_count": 0,
+          "prompt_tokens": 12,
+          "completion_tokens": 8,
+          "total_tokens": 20,
+          "estimated_cost_usd": "0",
+          "avg_latency_ms": 2
+        }
+      ],
+      "data_quality": {
+        "records_with_unknown_tokens": 0,
+        "records_without_cost": 1,
+        "records_with_retries": 0,
+        "note": "Token 与成本只累加已知值。发生过重试的请求，其 usage 仅来自最后一次尝试，中间尝试可能已在上游计费，因此成本是不完整的下限"
+      }
+    }
+  ]
+}

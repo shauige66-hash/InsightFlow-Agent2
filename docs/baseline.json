@@ -1,0 +1,332 @@
+{
+  "label": "P0 V2 Mock baseline",
+  "not_a_v1_measurement": "本数据在 P0 修改后的工作树上采集，模型调用已替换为 Mock。它不是原始 V1 的性能数据，也不构成 V1 与 V2 的性能对比。",
+  "note": "使用 Mock 模型与固定数据集采集，不访问真实模型服务。token 与成本不可用，因为 Mock 不返回 usage。",
+  "provenance": {
+    "commit": "64ccd6670edaff4c22826dca134cd462f61f6eb2",
+    "commit_subject": "docs: update README and report demo",
+    "worktree_dirty": true,
+    "worktree_changed_files": 51
+  },
+  "generated_at": "2026-10-13T09:33:14Z",
+  "python": "3.11.9",
+  "repeats": 3,
+  "inputs": {
+    "data_sources": [
+      "data/customers.csv",
+      "data/orders.csv"
+    ],
+    "knowledge_sources": [],
+    "mock_behavior": "每个 Agent 由固定脚本响应，内容预先写死；不调用任何模型服务，也不返回 usage。"
+  },
+  "environment_limits": [
+    "Mock 模型替代真实模型，无法反映真实推理延迟与失败率",
+    "未采集 token 与成本（Mock 不返回 usage）",
+    "PDF 产物由 Playwright 生成本地浏览器，耗时与模型无关且受机器负载影响",
+    "耗时在不同批次间波动明显（实测 1.4s~2.1s），只适合同一批次内横向比较",
+    "单机运行，未做并发与吞吐测试"
+  ],
+  "scenarios": {
+    "single_table": {
+      "scenario": "single_table",
+      "repeats": 3,
+      "elapsed_ms_min": 2016.2,
+      "elapsed_ms_median": 2167.4,
+      "elapsed_ms_max": 2307.6,
+      "llm_calls_per_run": {
+        "planner": 1,
+        "executor": 1,
+        "critic": 1,
+        "visualizer": 1,
+        "reporter": 1
+      },
+      "llm_calls_total_per_run": 5,
+      "tool_calls_per_run": 1,
+      "tools_used": [
+        "python"
+      ],
+      "tasks_planned": 1,
+      "tasks_failed": 0,
+      "artifacts": [
+        "analysis_report.md",
+        "analysis_report.html",
+        "analysis_report.pdf"
+      ],
+      "samples": [
+        {
+          "run_id": "baseline-single_table-1",
+          "elapsed_ms": 2016.2,
+          "llm_calls": {
+            "planner": 1,
+            "executor": 1,
+            "critic": 1,
+            "visualizer": 1,
+            "reporter": 1
+          },
+          "llm_calls_total": 5,
+          "tool_calls": 1,
+          "tools_used": [
+            "python"
+          ],
+          "tasks_planned": 1,
+          "tasks_failed": 0,
+          "artifacts": [
+            "analysis_report.md",
+            "analysis_report.html",
+            "analysis_report.pdf"
+          ]
+        },
+        {
+          "run_id": "baseline-single_table-2",
+          "elapsed_ms": 2167.4,
+          "llm_calls": {
+            "planner": 1,
+            "executor": 1,
+            "critic": 1,
+            "visualizer": 1,
+            "reporter": 1
+          },
+          "llm_calls_total": 5,
+          "tool_calls": 1,
+          "tools_used": [
+            "python"
+          ],
+          "tasks_planned": 1,
+          "tasks_failed": 0,
+          "artifacts": [
+            "analysis_report.md",
+            "analysis_report.html",
+            "analysis_report.pdf"
+          ]
+        },
+        {
+          "run_id": "baseline-single_table-3",
+          "elapsed_ms": 2307.6,
+          "llm_calls": {
+            "planner": 1,
+            "executor": 1,
+            "critic": 1,
+            "visualizer": 1,
+            "reporter": 1
+          },
+          "llm_calls_total": 5,
+          "tool_calls": 1,
+          "tools_used": [
+            "python"
+          ],
+          "tasks_planned": 1,
+          "tasks_failed": 0,
+          "artifacts": [
+            "analysis_report.md",
+            "analysis_report.html",
+            "analysis_report.pdf"
+          ]
+        }
+      ]
+    },
+    "multi_table": {
+      "scenario": "multi_table",
+      "repeats": 3,
+      "elapsed_ms_min": 1973.9,
+      "elapsed_ms_median": 2008.9,
+      "elapsed_ms_max": 2040.2,
+      "llm_calls_per_run": {
+        "planner": 1,
+        "executor": 1,
+        "critic": 1,
+        "visualizer": 1,
+        "reporter": 1
+      },
+      "llm_calls_total_per_run": 5,
+      "tool_calls_per_run": 1,
+      "tools_used": [
+        "python"
+      ],
+      "tasks_planned": 1,
+      "tasks_failed": 0,
+      "artifacts": [
+        "analysis_report.md",
+        "analysis_report.html",
+        "analysis_report.pdf"
+      ],
+      "samples": [
+        {
+          "run_id": "baseline-multi_table-1",
+          "elapsed_ms": 1973.9,
+          "llm_calls": {
+            "planner": 1,
+            "executor": 1,
+            "critic": 1,
+            "visualizer": 1,
+            "reporter": 1
+          },
+          "llm_calls_total": 5,
+          "tool_calls": 1,
+          "tools_used": [
+            "python"
+          ],
+          "tasks_planned": 1,
+          "tasks_failed": 0,
+          "artifacts": [
+            "analysis_report.md",
+            "analysis_report.html",
+            "analysis_report.pdf"
+          ]
+        },
+        {
+          "run_id": "baseline-multi_table-2",
+          "elapsed_ms": 2040.2,
+          "llm_calls": {
+            "planner": 1,
+            "executor": 1,
+            "critic": 1,
+            "visualizer": 1,
+            "reporter": 1
+          },
+          "llm_calls_total": 5,
+          "tool_calls": 1,
+          "tools_used": [
+            "python"
+          ],
+          "tasks_planned": 1,
+          "tasks_failed": 0,
+          "artifacts": [
+            "analysis_report.md",
+            "analysis_report.html",
+            "analysis_report.pdf"
+          ]
+        },
+        {
+          "run_id": "baseline-multi_table-3",
+          "elapsed_ms": 2008.9,
+          "llm_calls": {
+            "planner": 1,
+            "executor": 1,
+            "critic": 1,
+            "visualizer": 1,
+            "reporter": 1
+          },
+          "llm_calls_total": 5,
+          "tool_calls": 1,
+          "tools_used": [
+            "python"
+          ],
+          "tasks_planned": 1,
+          "tasks_failed": 0,
+          "artifacts": [
+            "analysis_report.md",
+            "analysis_report.html",
+            "analysis_report.pdf"
+          ]
+        }
+      ]
+    },
+    "repair_loop": {
+      "scenario": "repair_loop",
+      "repeats": 3,
+      "elapsed_ms_min": 2148.6,
+      "elapsed_ms_median": 2164.6,
+      "elapsed_ms_max": 2168.7,
+      "llm_calls_per_run": {
+        "planner": 1,
+        "executor": 1,
+        "repair": 1,
+        "critic": 1,
+        "visualizer": 1,
+        "reporter": 1
+      },
+      "llm_calls_total_per_run": 6,
+      "tool_calls_per_run": 2,
+      "tools_used": [
+        "python"
+      ],
+      "tasks_planned": 1,
+      "tasks_failed": 0,
+      "artifacts": [
+        "analysis_report.md",
+        "analysis_report.html",
+        "analysis_report.pdf"
+      ],
+      "samples": [
+        {
+          "run_id": "baseline-repair_loop-1",
+          "elapsed_ms": 2148.6,
+          "llm_calls": {
+            "planner": 1,
+            "executor": 1,
+            "repair": 1,
+            "critic": 1,
+            "visualizer": 1,
+            "reporter": 1
+          },
+          "llm_calls_total": 6,
+          "tool_calls": 2,
+          "tools_used": [
+            "python"
+          ],
+          "tasks_planned": 1,
+          "tasks_failed": 0,
+          "artifacts": [
+            "analysis_report.md",
+            "analysis_report.html",
+            "analysis_report.pdf"
+          ]
+        },
+        {
+          "run_id": "baseline-repair_loop-2",
+          "elapsed_ms": 2168.7,
+          "llm_calls": {
+            "planner": 1,
+            "executor": 1,
+            "repair": 1,
+            "critic": 1,
+            "visualizer": 1,
+            "reporter": 1
+          },
+          "llm_calls_total": 6,
+          "tool_calls": 2,
+          "tools_used": [
+            "python"
+          ],
+          "tasks_planned": 1,
+          "tasks_failed": 0,
+          "artifacts": [
+            "analysis_report.md",
+            "analysis_report.html",
+            "analysis_report.pdf"
+          ]
+        },
+        {
+          "run_id": "baseline-repair_loop-3",
+          "elapsed_ms": 2164.6,
+          "llm_calls": {
+            "planner": 1,
+            "executor": 1,
+            "repair": 1,
+            "critic": 1,
+            "visualizer": 1,
+            "reporter": 1
+          },
+          "llm_calls_total": 6,
+          "tool_calls": 2,
+          "tools_used": [
+            "python"
+          ],
+          "tasks_planned": 1,
+          "tasks_failed": 0,
+          "artifacts": [
+            "analysis_report.md",
+            "analysis_report.html",
+            "analysis_report.pdf"
+          ]
+        }
+      ]
+    }
+  },
+  "unavailable_metrics": [
+    "prompt_tokens",
+    "completion_tokens",
+    "estimated_cost_usd",
+    "task_success_rate_on_real_model"
+  ]
+}
