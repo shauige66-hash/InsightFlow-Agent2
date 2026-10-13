@@ -1,5 +1,5 @@
 # 定义各个 Agent 在工作流中共享的数据状态结构。
-from typing import Any, Literal,TypedDict
+from typing import Any, Literal, TypedDict
 from ingestion.models import TableResource
 
 
@@ -53,6 +53,10 @@ class TaskFailure(TypedDict):
 class InsightFlowState(TypedDict, total=False):
     run_id: str  # 每次workflow唯一编号
 
+    # 本次运行的模型注入点，携带 run_id 与各 Agent 身份。
+    # 运行期资源句柄、不可序列化，P1 引入 Checkpoint 时必须移出 state。
+    model_factory: Any
+
     analysis_focus: str | None  # 提供分析重点（可选）
 
     data_sources: list[str]  # 文件数据
@@ -90,6 +94,15 @@ class InsightFlowState(TypedDict, total=False):
     validation_passed: bool  # 验证是否通过
 
     artifacts: list[str]  # 生成的文件
+
+    # 本次运行的结果语义。failed_tasks 为空不等于分析成功：
+    # Planner 返回空计划时工作流会正常走完，但没有任何分析产出，
+    # 必须由这个字段区分，避免被下游当成成功。
+    # 取值：completed（有计划且全部成功）/ partial（有计划但有失败）/
+    #       no_tasks（计划为空，未进行分析）/ failed（工作流异常终止）
+    analysis_status: Literal["completed", "partial", "no_tasks", "failed"]
+
+    status_reason: str | None  # analysis_status 不是 completed 时的原因说明
 
     report_path: str | None  # 报告路径
 

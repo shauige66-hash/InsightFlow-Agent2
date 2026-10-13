@@ -9,6 +9,18 @@ MAX_RETRIES = 3
 MAX_REFINES = 3
 MAX_PLOT_RETRIES = 3
 
+def route_after_planner(
+    state: InsightFlowState
+) -> Literal["router", "complete"]:
+    """计划为空时直接收尾。
+
+    Planner 可能返回空任务列表（模型判断数据不足以支撑分析）。
+    此时若照常进入 router，会因为 analysis_plan[0] 越界而抛 IndexError，
+    把一次正常的"无可分析"变成工作流崩溃。
+    """
+    return "router" if state.get("analysis_plan") else "complete"
+
+
 def route_after_execution(
     state: InsightFlowState
 ) -> Literal["repair", "critic", "failed"]:

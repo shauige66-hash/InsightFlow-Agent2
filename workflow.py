@@ -29,6 +29,7 @@ from conditions import (
     route_after_execution,
     route_after_critic,
     route_after_advance,
+    route_after_planner,
     route_after_plot_execution,
     route_after_chart_advance,
     route_after_visualization_plan,
@@ -160,9 +161,13 @@ def create_workflow():
         "planner"
     )
 
-    graph.add_edge(
+    graph.add_conditional_edges(
         "planner",
-        "router"
+        route_after_planner,
+        {
+            "router": "router",
+            "complete": "visualization_planner",
+        }
     )
 
     graph.add_edge(

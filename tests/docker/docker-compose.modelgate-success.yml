@@ -1,0 +1,28 @@
+# ModelGate 成功链路测试用的覆盖配置。
+#
+# 只覆盖上游地址：把 ModelGate 测试栈的上游从 `.invalid` 保留域名改为本机
+# Mock Provider，从而验证"请求成功并被正确记账"这条链路。
+#
+# 隔离保证：
+#   - 沿用 ModelGate 项目自带的 docker-compose.test.yml（独立项目名、独立库
+#     modelgate_docker_test、独立端口 18000），不使用业务实例与业务数据库
+#   - 上游指向 host.docker.internal，请求不会离开本机，也不产生付费调用
+#   - host.docker.internal 是 Docker 的宿主网关地址，不是真实服务商域名
+#
+# 用法（由 tests/test_modelgate_success.py 自动执行）：
+#   docker compose -p modelgate-docker-test \
+#     -f <modelgate>/docker-compose.test.yml \
+#     -f tests/docker/docker-compose.modelgate-success.yml \
+#     up -d
+
+services:
+  api:
+    environment:
+      DEEPSEEK_BASE_URL: http://host.docker.internal:9099
+      OPENAI_BASE_URL: http://host.docker.internal:9099
+      # 上游是本地 Mock，密钥只用于占位，网关不会把它转发到任何真实服务
+      DEEPSEEK_API_KEY: sk-local-mock-upstream
+      OPENAI_API_KEY: sk-local-mock-upstream
+    extra_hosts:
+      # 显式声明，避免依赖不同 Docker 版本的默认行为
+      - "host.docker.internal:host-gateway"
