@@ -5,6 +5,7 @@ import json
 from typing import Any
 
 from langchain_core.output_parsers import JsonOutputParser
+from langchain_core.language_models import BaseChatModel
 from langchain_core.prompts import PromptTemplate
 
 from core.llm import create_llm
@@ -130,6 +131,8 @@ PLOT_REPAIR_PROMPT = """
 
 只返回合法 JSON，不要输出其他文字。
 
+{retry_hint}
+
 返回格式：
 
 {{
@@ -143,10 +146,15 @@ def repair_plot_code(
     data_context: dict[str, Any],
     execution_result: ExecutionResult,
     code: str,
-    error: str
+    error: str,
+    llm: BaseChatModel | None = None,
 ) -> str:
 
-    llm = create_llm()
+    if llm is None:
+
+        from core.llm import create_default_llm
+
+        llm = create_default_llm()
 
     prompt = PromptTemplate.from_template(
         PLOT_REPAIR_PROMPT
@@ -179,9 +187,16 @@ def repair_plot_code(
     "error": error
 }
 
+    def _extract(payload: dict[str, Any]):
+        """必填字段缺失属于可重试的格式问题，必须在校验器里抛错，
+        否则会在重试范围之外变成 KeyError，直接终止整条工作流。"""
+        if "code" not in payload:
+            raise ValueError("响应缺少字段: code")
+        return payload["code"]
+
     result = invoke_json_with_retry(
         chain,
-        inputs
+        inputs,
+        validate=_extract
     )
-
-    return result["code"]
+    return result

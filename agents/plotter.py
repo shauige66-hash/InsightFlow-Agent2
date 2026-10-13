@@ -5,6 +5,7 @@ import json
 from typing import Any
 
 from langchain_core.output_parsers import JsonOutputParser
+from langchain_core.language_models import BaseChatModel
 from langchain_core.prompts import PromptTemplate
 
 from core.llm import create_llm
@@ -121,6 +122,8 @@ PLOT_PROMPT = """
 
 16. 只返回合法 JSON，不要输出其他文字。
 
+{retry_hint}
+
 返回格式：
 
 {{
@@ -132,10 +135,15 @@ MAX_GENERATION_ATTEMPTS = 3
 def generate_plot_code(
     visualization_task: VisualizationTask,
     data_context: dict[str, Any],
-    execution_result: ExecutionResult
+    execution_result: ExecutionResult,
+    llm: BaseChatModel | None = None,
 ) -> dict[str, Any]:
 
-    llm = create_llm()
+    if llm is None:
+
+        from core.llm import create_default_llm
+
+        llm = create_default_llm()
 
     prompt = PromptTemplate.from_template(
         PLOT_PROMPT

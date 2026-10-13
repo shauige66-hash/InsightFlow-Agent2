@@ -4,6 +4,7 @@ import json
 from typing import Any
 
 from langchain_core.output_parsers import JsonOutputParser
+from langchain_core.language_models import BaseChatModel
 from langchain_core.prompts import PromptTemplate
 
 from core.llm import create_llm
@@ -55,6 +56,8 @@ CRITIC_PROMPT = """
 
 只返回合法 JSON，不要输出其他文字。
 
+{retry_hint}
+
 返回格式：
 
 {{
@@ -68,7 +71,8 @@ def review_execution_result(
     task: AnalysisTask,
     data_context: dict[str, Any],
     execution_result: ExecutionResult,
-    retrieved_knowledge: list[str] | None = None
+    retrieved_knowledge: list[str] | None = None,
+    llm: BaseChatModel | None = None,
 ) -> dict[str, Any]:
 
     knowledge_text = (
@@ -77,7 +81,11 @@ def review_execution_result(
     else "未提供与当前分析相关的额外业务知识。"
 )
 
-    llm = create_llm()
+    if llm is None:
+
+        from core.llm import create_default_llm
+
+        llm = create_default_llm()
 
     prompt = PromptTemplate.from_template(
         CRITIC_PROMPT
@@ -108,9 +116,16 @@ def review_execution_result(
     )
 }
 
+    def _extract(payload: dict[str, Any]) -> dict[str, Any]:
+        """必填字段缺失属于可重试的格式问题，在校验器里抛错才会触发重试。"""
+        missing = [f for f in ("validation_passed", "feedback") if f not in payload]
+        if missing:
+            raise ValueError(f"响应缺少字段: {{missing}}")
+        return payload
+
     result = invoke_json_with_retry(
         chain,
-        inputs
+        inputs,
+        validate=_extract
     )
-
     return result

@@ -4,6 +4,7 @@ import json
 from typing import Any
 
 from langchain_core.output_parsers import JsonOutputParser
+from langchain_core.language_models import BaseChatModel
 from langchain_core.prompts import PromptTemplate
 
 from core.llm import create_llm
@@ -76,6 +77,8 @@ VISUALIZATION_PROMPT = """
 
 只返回合法 JSON，不要输出其他文字。
 
+{retry_hint}
+
 返回格式：
 
 {{
@@ -98,10 +101,15 @@ VISUALIZATION_PROMPT = """
 def create_visualization_plan(
     analysis_plan: list[AnalysisTask],
     execution_results: list[ExecutionResult],
-    failed_tasks: list[dict[str, Any]]
+    failed_tasks: list[dict[str, Any]],
+    llm: BaseChatModel | None = None,
 ) -> list[VisualizationTask]:
 
-    llm = create_llm()
+    if llm is None:
+
+        from core.llm import create_default_llm
+
+        llm = create_default_llm()
 
     prompt = PromptTemplate.from_template(
         VISUALIZATION_PROMPT
@@ -132,9 +140,17 @@ def create_visualization_plan(
     )
 }
 
+    def _extract(payload: dict[str, Any]):
+        """必填字段缺失或类型不对属于可重试的格式问题，必须在校验器里抛错，
+        否则会在重试范围之外变成 KeyError，或把 None 当作图表计划继续执行。"""
+        charts = payload.get("charts")
+        if not isinstance(charts, list):
+            raise ValueError("响应缺少图表列表: charts")
+        return charts
+
     result = invoke_json_with_retry(
         chain,
-        inputs
+        inputs,
+        validate=_extract
     )
-
-    return result["charts"]
+    return result

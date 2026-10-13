@@ -8,6 +8,7 @@ from agents.router import route_analysis_task
 from agents.executor import generate_execution_code
 from tools.python_tool import create_python_tool
 from tools.sql_tool import create_sql_tool
+from tools.tool_registry import available_tools, invoke_tool
 from agents.repair import repair_execution_code
 from agents.critic import review_execution_result
 from agents.refine import refine_execution_code
@@ -18,6 +19,7 @@ from agents.plotter import generate_plot_code
 from tools.plot_tool import create_plot_tool
 from agents.plot_repair import repair_plot_code
 from pathlib import Path
+from core.inference import model_for
 from utils.run_logger import log_event
 from time import perf_counter
 from rag.knowledge_service import build_and_retrieve_knowledge
@@ -105,7 +107,8 @@ def planner_node(
         analysis_focus=state.get(
             "analysis_focus"
         ),
-        retrieved_knowledge=retrieved_knowledge
+        retrieved_knowledge=retrieved_knowledge,
+    llm=model_for(state, "planner")
     )
 
     run_id = state.get("run_id")
@@ -128,9 +131,19 @@ def planner_node(
             }
         )
 
+    if not plan:
+        # 空计划意味着"没有可分析的产出"，不是成功。这里显式标注原因，
+        # 否则下游只能看到 failed_tasks == [] 而误判为分析完成。
+        return {
+            "analysis_plan": [],
+            "current_task_index": 0,
+            "analysis_status": "no_tasks",
+            "status_reason": "Planner 未产出任何分析任务",
+        }
+
     return {
         "analysis_plan": plan,
-        "current_task_index": 0
+        "current_task_index": 0,
     }
 
 
@@ -198,7 +211,8 @@ def execution_node(
         task=task,
         data_context=data_context,
         route=tool,
-        retrieved_knowledge=retrieved_knowledge
+        retrieved_knowledge=retrieved_knowledge,
+    llm=model_for(state, "executor")
     )
 
     duration_ms = (
@@ -233,8 +247,6 @@ def tool_execution_node(
     state: InsightFlowState
 ) -> dict:
 
-
-
     index = state["current_task_index"]
     task = state["analysis_plan"][index]
 
@@ -247,32 +259,20 @@ def tool_execution_node(
     if code is None:
         raise ValueError("Current code is missing.")
 
-    if tool == "python":
-        python_tool = create_python_tool(
-            state["tables"]
-        )
-
-
-        execution = python_tool.invoke({
-            "table_names": task["target_tables"],
-            "code": code
-        })
-
-    elif tool == "sql":
-
-        sql_tool = create_sql_tool(
-            state["tables"]
-        )
-
-        execution = sql_tool.invoke({
-            "table_names": task["target_tables"],
-            "query": code
-        })
-
-    else:
+    if tool not in available_tools():
         raise ValueError(
             f"Unsupported tool: {tool}"
         )
+
+    # 参数校验失败与执行失败都从 invoke_tool 以错误字典返回，
+    # 交给 route_after_execution 走修复循环，而不是在这里抛异常终止工作流。
+    arguments = (
+        {"table_names": task["target_tables"], "code": code}
+        if tool == "python"
+        else {"table_names": task["target_tables"], "query": code}
+    )
+
+    execution = invoke_tool(tool, state["tables"], arguments)
 
     execution_result = {
         "task_id": task["task_id"],
@@ -362,7 +362,8 @@ def repair_node(
         route=tool,
         code=code,
         error=error,
-        retrieved_knowledge=retrieved_knowledge
+        retrieved_knowledge=retrieved_knowledge,
+    llm=model_for(state, "repair")
     )
 
     retry_count = state.get(
@@ -495,7 +496,8 @@ def critic_node(
         task=task,
         data_context=data_context,
         execution_result=execution_result,
-        retrieved_knowledge=retrieved_knowledge
+        retrieved_knowledge=retrieved_knowledge,
+    llm=model_for(state, "critic")
     )
 
     run_id = state.get("run_id")
@@ -583,7 +585,8 @@ def refine_node(
         code=code,
         execution_result=execution_result,
         critic_feedback=critic_feedback,
-        retrieved_knowledge=retrieved_knowledge
+        retrieved_knowledge=retrieved_knowledge,
+    llm=model_for(state, "refine")
     )
 
     refine_count = state.get(
@@ -766,7 +769,8 @@ def report_node(
             "visualization_plan",
             []
         ),
-        visualization_results=report_visualizations
+        visualization_results=report_visualizations,
+    llm=model_for(state, "reporter")
     )
 
     run_id = state.get("run_id")
@@ -874,8 +878,37 @@ def artifact_node(
         []
     )
 
+    # 收尾时确定结果语义。空计划不算成功，因此 planner 标注的 no_tasks 需要保留；
+    # 有计划但有任务失败则记为 partial。
+    plan = state.get("analysis_plan", [])
+
+    if not plan:
+        analysis_status = "no_tasks"
+        status_reason = state.get("status_reason") or "Planner 未产出任何分析任务"
+    elif state.get("failed_tasks"):
+        failed_count = len(state["failed_tasks"])
+        analysis_status = "partial"
+        status_reason = f"{failed_count} 个分析任务最终失败"
+    else:
+        analysis_status = "completed"
+        status_reason = None
+
+    log_event(
+        run_id=run_id,
+        node="artifact",
+        event="analysis_finished",
+        status=analysis_status,
+        details={
+            "tasks_planned": len(plan),
+            "tasks_failed": len(state.get("failed_tasks", [])),
+            "reason": status_reason
+        }
+    )
+
     return {
         "report_path": markdown_path,
+        "analysis_status": analysis_status,
+        "status_reason": status_reason,
         "artifacts": (
             previous_artifacts
             + [
@@ -906,7 +939,8 @@ def visualization_planner_node(
         failed_tasks=state.get(
             "failed_tasks",
             []
-        )
+        ),
+        llm=model_for(state, "visualizer")
     )
 
     run_id = state.get("run_id")
@@ -991,7 +1025,8 @@ def plot_generation_node(
     generation = generate_plot_code(
         visualization_task=visualization_task,
         data_context=data_context,
-        execution_result=source_execution_result
+        execution_result=source_execution_result,
+    llm=model_for(state, "plotter")
     )
 
     code = generation["code"]
@@ -1327,7 +1362,8 @@ def plot_repair_node(
         data_context=data_context,
         execution_result=source_execution_result,
         code=code,
-        error=error
+        error=error,
+    llm=model_for(state, "plot_repair")
     )
 
     plot_retry_count = state.get(

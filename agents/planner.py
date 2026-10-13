@@ -4,6 +4,7 @@ import json
 from typing import Any
 
 from langchain_core.output_parsers import JsonOutputParser
+from langchain_core.language_models import BaseChatModel
 from langchain_core.prompts import PromptTemplate
 
 from core.llm import create_llm
@@ -70,6 +71,8 @@ PLANNER_PROMPT = """
 
 只返回合法 JSON，不要输出其他文字。
 
+{retry_hint}
+
 返回格式：
 
 {{
@@ -88,7 +91,8 @@ PLANNER_PROMPT = """
 def create_analysis_plan(
     contexts: dict[str, dict[str, Any]],
     analysis_focus: str | None = None,
-    retrieved_knowledge: list[str] | None = None
+    retrieved_knowledge: list[str] | None = None,
+    llm: BaseChatModel | None = None,
 ) -> list[AnalysisTask]:
 
     knowledge_text = (
@@ -97,7 +101,11 @@ def create_analysis_plan(
         else "未提供与当前分析相关的额外业务知识。"
     )
 
-    llm = create_llm()
+    if llm is None:
+
+        from core.llm import create_default_llm
+
+        llm = create_default_llm()
 
     prompt = PromptTemplate.from_template(
         PLANNER_PROMPT
@@ -120,9 +128,16 @@ def create_analysis_plan(
         "retrieved_knowledge": knowledge_text
     }
 
+    def _extract(payload: dict[str, Any]):
+        """必填字段缺失属于可重试的格式问题，必须在校验器里抛错，
+        否则会在重试范围之外变成 KeyError，直接终止整条工作流。"""
+        if "tasks" not in payload:
+            raise ValueError("响应缺少字段: tasks")
+        return payload["tasks"]
+
     result = invoke_json_with_retry(
         chain,
-        inputs
+        inputs,
+        validate=_extract
     )
-
-    return result["tasks"]
+    return result

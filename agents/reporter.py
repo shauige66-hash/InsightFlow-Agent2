@@ -3,10 +3,10 @@
 import json
 from typing import Any
 
+from langchain_core.language_models import BaseChatModel
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import PromptTemplate
 
-from core.llm import create_llm
 from state import (
     AnalysisTask,
     ExecutionResult,
@@ -14,6 +14,7 @@ from state import (
     VisualizationTask,
     VisualizationResult,
 )
+from utils.llm_retry import invoke_report_with_retry
 
 
 REPORT_PROMPT = """
@@ -74,10 +75,18 @@ def generate_analysis_report(
     execution_results: list[ExecutionResult],
     failed_tasks: list[TaskFailure],
     visualization_plan: list[VisualizationTask],
-    visualization_results: list[VisualizationResult]
+    visualization_results: list[VisualizationResult],
+    llm: BaseChatModel | None = None,
 ) -> str:
+    """生成最终报告。
 
-    llm = create_llm()
+    报告是唯一的交付物，因此这里也做一次重试：空输出对下游没有意义，
+    重试成本远低于交付一份空报告。
+    """
+    if llm is None:
+        from core.llm import create_default_llm
+
+        llm = create_default_llm()
 
     prompt = PromptTemplate.from_template(
         REPORT_PROMPT
@@ -87,7 +96,7 @@ def generate_analysis_report(
 
     chain = prompt | llm | parser
 
-    report = chain.invoke({
+    inputs = {
         "analysis_plan": json.dumps(
             analysis_plan,
             ensure_ascii=False,
@@ -118,6 +127,11 @@ def generate_analysis_report(
             indent=2,
             default=str
         )
-    })
+    }
 
-    return report
+    def _require_text(text: object) -> str:
+        if not isinstance(text, str) or not text.strip():
+            raise ValueError("报告内容为空")
+        return text
+
+    return invoke_report_with_retry(chain, inputs, validate=_require_text)

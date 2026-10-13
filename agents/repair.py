@@ -4,6 +4,7 @@ import json
 from typing import Any, Literal
 
 from langchain_core.output_parsers import JsonOutputParser
+from langchain_core.language_models import BaseChatModel
 from langchain_core.prompts import PromptTemplate
 
 from core.llm import create_llm
@@ -137,6 +138,8 @@ REPAIR_PROMPT = """
 
 只返回合法 JSON，不要输出其他文字。
 
+{retry_hint}
+
 返回格式：
 
 {{
@@ -151,7 +154,8 @@ def repair_execution_code(
     route: Literal["python", "sql"],
     code: str,
     error: str,
-    retrieved_knowledge: list[str] | None = None
+    retrieved_knowledge: list[str] | None = None,
+    llm: BaseChatModel | None = None,
 ) -> str:
     
     knowledge_text = (
@@ -160,7 +164,11 @@ def repair_execution_code(
     else "未提供与当前分析相关的额外业务知识。"
 )
 
-    llm = create_llm()
+    if llm is None:
+
+        from core.llm import create_default_llm
+
+        llm = create_default_llm()
 
     prompt = PromptTemplate.from_template(
         REPAIR_PROMPT
@@ -188,9 +196,16 @@ def repair_execution_code(
     "error": error
 }
 
+    def _extract(payload: dict[str, Any]):
+        """必填字段缺失属于可重试的格式问题，必须在校验器里抛错，
+        否则会在重试范围之外变成 KeyError，直接终止整条工作流。"""
+        if "code" not in payload:
+            raise ValueError("响应缺少字段: code")
+        return payload["code"]
+
     result = invoke_json_with_retry(
         chain,
-        inputs
+        inputs,
+        validate=_extract
     )
-
-    return result["code"]
+    return result
