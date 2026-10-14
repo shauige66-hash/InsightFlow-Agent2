@@ -16,7 +16,7 @@
   },
   "runs": [
     {
-      "run_id": "ok-a2b8d2a77baf",
+      "run_id": "ok-512bdd4b464e",
       "agents_invoked": [
         "planner"
       ],
@@ -28,7 +28,7 @@
         "completion_tokens": 8,
         "total_tokens": 20,
         "estimated_cost_usd": "0",
-        "avg_latency_ms": 11
+        "avg_latency_ms": 8
       },
       "by_agent": [
         {
@@ -40,7 +40,7 @@
           "completion_tokens": 8,
           "total_tokens": 20,
           "estimated_cost_usd": "0",
-          "avg_latency_ms": 11
+          "avg_latency_ms": 8
         }
       ],
       "data_quality": {
@@ -51,7 +51,7 @@
       }
     },
     {
-      "run_id": "tokens-3e9d18bfaad0",
+      "run_id": "tokens-bcad79c8bc12",
       "agents_invoked": [
         "executor"
       ],
@@ -63,7 +63,7 @@
         "completion_tokens": 8,
         "total_tokens": 20,
         "estimated_cost_usd": "0",
-        "avg_latency_ms": 2
+        "avg_latency_ms": 3
       },
       "by_agent": [
         {
@@ -75,7 +75,7 @@
           "completion_tokens": 8,
           "total_tokens": 20,
           "estimated_cost_usd": "0",
-          "avg_latency_ms": 2
+          "avg_latency_ms": 3
         }
       ],
       "data_quality": {
@@ -86,7 +86,7 @@
       }
     },
     {
-      "run_id": "multiagent-17f12808613c",
+      "run_id": "multiagent-4f334c1c5cab",
       "agents_invoked": [
         "planner",
         "executor"
@@ -99,7 +99,7 @@
         "completion_tokens": 16,
         "total_tokens": 40,
         "estimated_cost_usd": "0",
-        "avg_latency_ms": 4
+        "avg_latency_ms": 3
       },
       "by_agent": [
         {
@@ -111,7 +111,7 @@
           "completion_tokens": 8,
           "total_tokens": 20,
           "estimated_cost_usd": "0",
-          "avg_latency_ms": 5
+          "avg_latency_ms": 2
         },
         {
           "key": "planner",
@@ -133,7 +133,7 @@
       }
     },
     {
-      "run_id": "listed-099e0b18b10f",
+      "run_id": "listed-91360f15fad5",
       "agents_invoked": [
         "critic"
       ],
@@ -145,7 +145,7 @@
         "completion_tokens": 8,
         "total_tokens": 20,
         "estimated_cost_usd": "0",
-        "avg_latency_ms": 3
+        "avg_latency_ms": 2
       },
       "by_agent": [
         {
@@ -157,7 +157,7 @@
           "completion_tokens": 8,
           "total_tokens": 20,
           "estimated_cost_usd": "0",
-          "avg_latency_ms": 3
+          "avg_latency_ms": 2
         }
       ],
       "data_quality": {
@@ -168,7 +168,7 @@
       }
     },
     {
-      "run_id": "apptag-9b87ee09933e",
+      "run_id": "apptag-68e9baad999d",
       "agents_invoked": [
         "reporter"
       ],

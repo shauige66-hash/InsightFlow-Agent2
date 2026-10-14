@@ -155,6 +155,95 @@ def plan_payload():
     return _build
 
 
+@pytest.fixture(autouse=True)
+def bound_runtime(tmp_path_factory):
+    """为每个测试绑定一个运行期上下文。
+
+    P2-A 起，Python/Plot 工具的执行必须发生在沙箱里，而确定沙箱的输入输出位置
+    需要运行期上下文（`current_runtime().output_dir()`）。没有上下文时工具会
+    明确失败——这是刻意的，避免产物落到进程当前目录。
+
+    **不修改进程工作目录**：多个既有测试依赖"相对仓库根"的路径语义
+    （例如读取 tools/sql_tool.py 做静态断言），切目录会破坏它们。
+    需要"产物正好落在某个目录"的测试自己显式指定 output_root。
+    """
+    from core.llm import build_model_factory
+    from core.runtime import RunRuntime, use_runtime
+    from ingestion.resources import ResourceResolver
+
+    workroot = tmp_path_factory.mktemp("runroot")
+    run_id = "test-run"
+    (workroot / run_id).mkdir(parents=True, exist_ok=True)
+
+    runtime = RunRuntime(
+        run_id=run_id,
+        model_factory=build_model_factory(run_id),
+        resolver=ResourceResolver(),
+        output_root=workroot,
+    )
+
+    with use_runtime(runtime):
+        yield runtime
+
+
+# --- 沙箱测试分类（P2-A 补验收要求 5）-------------------------------------
+#
+# 要求区分三类，不能把所有 sandbox marker 用例都说成"实际进入容器"：
+#   1. 真实启动容器的用例
+#   2. Docker 不可用 / 镜像缺失 / 超时 / OOM 等故障路径，实际没起容器
+#   3. 只做源码、缓存键或参数结构断言，与 Docker 无关
+#
+# 分类**不靠人工标注**：由 hook 观测 executor 的容器启动计数增量，避免标注
+# 与实际行为脱节。统计报告见 scripts/sandbox_report.py。
+
+_SANDBOX_CLASSIFICATION: dict[str, dict[str, Any]] = {}
+_SPAWN_BASELINE: dict[str, int] = {}
+
+
+def pytest_runtest_setup(item) -> None:
+    from sandbox.executor import containers_spawned
+
+    _SPAWN_BASELINE[item.nodeid] = containers_spawned()
+    _SANDBOX_CLASSIFICATION[item.nodeid] = {
+        "spawned": 0,
+        "skipped": False,
+        "failed": False,
+    }
+
+
+@pytest.hookimpl(hookwrapper=True)
+def pytest_runtest_makereport(item, call):
+    outcome = yield
+    report = outcome.get_result()
+
+    record = _SANDBOX_CLASSIFICATION.get(item.nodeid)
+    if record is None:
+        return
+
+    if report.when == "call":
+        from sandbox.executor import containers_spawned
+
+        record["spawned"] = containers_spawned() - _SPAWN_BASELINE.get(item.nodeid, 0)
+        record["failed"] = report.outcome == "failed"
+    if report.outcome == "skipped":
+        record["skipped"] = True
+
+
+def pytest_sessionfinish(session, exitstatus) -> None:
+    """把分类结果落到文件，供 scripts/sandbox_report.py 汇总。"""
+    import json as _json
+
+    target = PROJECT_ROOT / "tests" / ".sandbox_classification.json"
+    try:
+        target.write_text(
+            _json.dumps(_SANDBOX_CLASSIFICATION, ensure_ascii=False, indent=1),
+            encoding="utf-8",
+        )
+    except OSError:
+        # 统计信息写不出来不应影响测试结论
+        pass
+
+
 __all__ = [
     "BUSINESS_RULES_MD",
     "CUSTOMERS_CSV",

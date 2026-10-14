@@ -211,6 +211,7 @@ def _build_from_snapshot(snapshot: TableSnapshot) -> TableResource:
             source_type="csv",
             source_path=str(path),
             dataframe=frame,
+            content_hash=snapshot.content_hash,
         )
 
     if snapshot.source_type == "excel":
@@ -224,6 +225,7 @@ def _build_from_snapshot(snapshot: TableSnapshot) -> TableResource:
             source_type="excel",
             source_path=str(path),
             dataframe=sheets[snapshot.locator],
+            content_hash=snapshot.content_hash,
         )
 
     if snapshot.source_type == "sqlite":
@@ -238,6 +240,7 @@ def _build_from_snapshot(snapshot: TableSnapshot) -> TableResource:
             source_type="sqlite",
             source_path=str(path),
             database_table=snapshot.database_table,
+            content_hash=snapshot.content_hash,
         )
 
     raise ResourceUnavailableError(

@@ -81,10 +81,12 @@ def create_sql_tool(
         try:
             ensure_read_only(cleaned_query)
         except SqlNotReadOnly as error:
+            # 非只读 SQL 属于调用方写错了查询：可修复，不是环境问题
             return {
                 "success": False,
                 "result": None,
-                "error": str(error)
+                "error": str(error),
+                "error_kind": "execution_error"
             }
 
         try:
@@ -105,14 +107,16 @@ def create_sql_tool(
                 "result": result_df.to_dict(
                     orient="records"
                 ),
-                "error": None
+                "error": None,
+                "error_kind": None
             }
 
         except Exception as error:
             return {
                 "success": False,
                 "result": None,
-                "error": str(error)
+                "error": str(error),
+                "error_kind": "execution_error"
             }
 
     return run_sql_query

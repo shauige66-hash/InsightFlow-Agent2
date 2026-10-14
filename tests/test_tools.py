@@ -219,16 +219,30 @@ class TestSqlTool:
 
 
 class TestToolRegistry:
-    def test_available_tools_are_python_and_sql(self) -> None:
-        assert set(available_tools()) == {"python", "sql"}
+    def test_available_tools_cover_python_sql_and_plot(self) -> None:
+        # P2-A 起绘图也纳入注册表：三条执行路径都经统一入口，
+        # 不再有节点直接构造绘图工具的旁路。
+        assert set(available_tools()) == {"python", "sql", "plot"}
 
     def test_unknown_tool_returns_error_not_exception(self, frame_tables) -> None:
         outcome = invoke_tool(
-            "plot", frame_tables, {"table_names": ["customers"], "code": "pass"}
+            "ruby", frame_tables, {"table_names": ["customers"], "code": "pass"}
         )
 
         assert outcome["success"] is False
         assert "Unsupported tool" in outcome["error"]
+
+    def test_plot_tool_is_reachable_through_registry(self, frame_tables) -> None:
+        """绘图必须能从注册表调用，且缺少必填参数时返回结构化错误。"""
+        outcome = invoke_tool(
+            "plot", frame_tables, {"table_names": ["customers"], "code": "pass"}
+        )
+
+        # 契约固定为四个键：error_kind 用于路由，不靠解析错误文案
+        assert set(outcome) == {"success", "result", "error", "error_kind"}
+        assert outcome["success"] is False
+        # 缺 chart_id：参数校验错误，而不是未注册工具
+        assert "Unsupported tool" not in outcome["error"]
 
     def test_result_shape_is_always_the_same(self, frame_tables) -> None:
         success = invoke_tool(
@@ -239,7 +253,7 @@ class TestToolRegistry:
         )
 
         for outcome in (success, failure):
-            assert set(outcome) == {"success", "result", "error"}
+            assert set(outcome) == {"success", "result", "error", "error_kind"}
 
     def test_tool_instance_is_reused_for_same_tables(self, frame_tables) -> None:
         arguments = {"table_names": ["customers"], "code": "result = 1"}

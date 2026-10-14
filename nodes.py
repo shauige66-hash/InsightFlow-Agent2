@@ -26,7 +26,6 @@ from agents.reporter import generate_analysis_report
 from utils.artifacts import save_markdown_report,save_html_report,save_pdf_report
 from agents.visualizer import create_visualization_plan
 from agents.plotter import generate_plot_code
-from tools.plot_tool import create_plot_tool
 from agents.plot_repair import repair_plot_code
 from pathlib import Path
 from core.inference import model_for, resolve_snapshots, resolve_tables
@@ -458,7 +457,10 @@ def tool_execution_node(
         "execution_results": deduped + [
             execution_result
         ],
-        "execution_error": execution["error"]
+        "execution_error": execution["error"],
+        # 分类随错误一起进 state：路由据此判断是否值得进入修复循环，
+        # 而不是去解析错误文案。
+        "execution_error_kind": execution.get("error_kind"),
     }
 
 
@@ -610,6 +612,7 @@ def advance_task_node(
         "current_tool": None,
         "current_code": None,
         "execution_error": None,
+        "execution_error_kind": None,
         "retry_count": 0,
         "refine_count": 0,
         "critic_feedback": None,
@@ -801,6 +804,8 @@ def failed_task_node(
         "task_id": task["task_id"],
         "stage": stage,
         "reason": reason,
+        # 保留分类，便于事后区分"代码错了"与"沙箱没起来"
+        "error_kind": state.get("execution_error_kind") if stage == "execution" else None,
         "code": state.get("current_code"),
         "retry_count": state.get(
             "retry_count",
@@ -824,6 +829,7 @@ def failed_task_node(
                 "task_id": task["task_id"],
                 "stage": stage,
                 "reason": reason,
+                "error_kind": failure["error_kind"],
                 "retry_count": state.get(
                     "retry_count",
                     0
@@ -1525,19 +1531,6 @@ def plot_execution_node(
             "Run ID is missing."
         )
 
-    # 必须用运行期的 output_root，而不是硬编码的相对 "outputs"：
-    # 后者会让产物落到进程当前目录，绕过调用方指定的隔离目录
-    # （测试与多环境部署下都会把文件写错位置）。
-    output_dir = (
-        current_runtime().output_root
-        / run_id
-    )
-
-    plot_tool = create_plot_tool(
-        resolve_tables(state),
-        output_dir=str(output_dir)
-    )
-
     # 绘图有副作用（写 PNG），而 visualization_results 是按 chart_id 追加的列表。
     # 重放该节点会重复追加，因此这里做两件事：
     #   1) 用 chart 级别的幂等键跳过已完成的执行；
@@ -1556,7 +1549,9 @@ def plot_execution_node(
             "completed_operations": completed_operations(state),
         }
 
-    execution = plot_tool.invoke({
+    # 绘图走与 Python 分析同一个执行后端：一次性 Docker 容器。
+    # 产物路径由工具内部按运行期 output_root 决定，不再在这里拼路径。
+    execution = invoke_tool("plot", resolve_tables(state), {
         "table_names": target_tables,
         "chart_id": chart_id,
         "code": code,

@@ -2,6 +2,7 @@
 
 from typing import Literal
 
+from sandbox.protocol import ENVIRONMENT_ERROR_KINDS
 from state import InsightFlowState
 
 
@@ -64,6 +65,12 @@ def route_after_execution(
 
     if error is None:
         return "critic"
+
+    # 环境类失败（沙箱不可用、超时、OOM）重发同样的代码不会好转：
+    # 让模型去"修"一个根本没跑起来的沙箱只会浪费调用并掩盖真实原因。
+    # 这类失败直接进入失败记录，不占用有界修复循环的额度。
+    if state.get("execution_error_kind") in ENVIRONMENT_ERROR_KINDS:
+        return "failed"
 
     if retry_count < MAX_RETRIES:
         return "repair"

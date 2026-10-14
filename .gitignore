@@ -226,3 +226,6 @@ outputs/
 
 # InsightFlow uploaded data
 uploads/
+
+# 沙箱测试分类的临时产物（每次 pytest 运行重写，供 scripts/sandbox_report.py 汇总）
+tests/.sandbox_classification.json

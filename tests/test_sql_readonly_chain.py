@@ -264,7 +264,11 @@ class TestConnectionIsActuallyReadOnly:
 class TestGuardIsWiredIntoTheChain:
     def test_sql_tool_module_uses_the_guard(self) -> None:
         """确认 sql_tool 真的调用了只读校验，而不是只有独立测试通过。"""
-        source = Path("tools/sql_tool.py").read_text(encoding="utf-8")
+        from pathlib import Path as _Path
+
+        source = (
+            _Path(__file__).resolve().parent.parent / "tools" / "sql_tool.py"
+        ).read_text(encoding="utf-8")
 
         assert "ensure_read_only" in source
         assert "mode=ro" in source
@@ -275,5 +279,6 @@ class TestGuardIsWiredIntoTheChain:
         """参数与安全类错误都应以结果字典返回，便于修复循环处理。"""
         outcome = run_sql(tables, "DELETE FROM orders")
 
-        assert set(outcome) == {"success", "result", "error"}
+        # sql_tool 现在与其他工具一致，显式给出 error_kind
+        assert set(outcome) == {"success", "result", "error", "error_kind"}
         assert outcome["success"] is False

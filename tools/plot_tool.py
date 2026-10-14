@@ -1,98 +1,26 @@
-# 执行 Matplotlib 绘图代码，并将生成的图表保存到 outputs 目录。
+# 执行 Matplotlib 绘图代码，并将生成的图表保存到本次 Run 的目录。
+#
+# P2-A：绘图代码同样在一次性 Docker 容器中执行，本进程不再 exec 任何模型代码。
+# 容器内已安装 fonts-noto-cjk，并把 Noto Sans CJK SC 置于字体首选，
+# 因此中文标题与图例能正常渲染（宿主 Windows 字体在容器内并不存在）。
 
+import re
 from pathlib import Path
 from typing import Any
-import re
-import matplotlib
-
-matplotlib.use("Agg")
-
-import matplotlib.pyplot as plt
-import pandas as pd
 
 from langchain_core.tools import tool
 
+from core.runtime import RuntimeContextMissing, current_runtime
 from ingestion.models import TableResource
+from sandbox.protocol import SandboxErrorKind, SandboxJob, classify_exception
+from tools.python_tool import execute_in_sandbox
 
-
-def build_result_dataframe(
-    analysis_result: Any
-) -> pd.DataFrame | None:
-
-    if isinstance(
-        analysis_result,
-        pd.DataFrame
-    ):
-        return analysis_result.copy()
-
-    if isinstance(
-        analysis_result,
-        list
-    ):
-        if all(
-            isinstance(item, dict)
-            for item in analysis_result
-        ):
-            return pd.DataFrame(
-                analysis_result
-            )
-
-    if isinstance(
-        analysis_result,
-        dict
-    ):
-
-        dataframe_candidates = []
-
-        for value in analysis_result.values():
-
-            if isinstance(
-                value,
-                pd.DataFrame
-            ):
-                dataframe_candidates.append(
-                    value.copy()
-                )
-
-            elif (
-                isinstance(value, list)
-                and all(
-                    isinstance(item, dict)
-                    for item in value
-                )
-            ):
-                dataframe_candidates.append(
-                    pd.DataFrame(value)
-                )
-
-        if len(dataframe_candidates) == 1:
-            return dataframe_candidates[0]
-
-        if all(
-            not isinstance(
-                value,
-                (
-                    dict,
-                    list,
-                    tuple,
-                    set,
-                    pd.DataFrame
-                )
-            )
-            for value in analysis_result.values()
-        ):
-            return pd.DataFrame([
-                analysis_result
-            ])
-
-    return None
+CHART_ID_PATTERN = re.compile(r"[A-Za-z0-9\_-]+")
 
 
 def create_plot_tool(
     tables: dict[str, TableResource],
-    output_dir: str
 ):
-
     @tool
     def run_plot(
         table_names: list[str],
@@ -107,8 +35,6 @@ def create_plot_tool(
                 "At least one table is required."
             )
 
-        dfs = {}
-
         for table_name in table_names:
 
             if table_name not in tables:
@@ -116,162 +42,83 @@ def create_plot_tool(
                     f"Table not found: {table_name}"
                 )
 
-            resource = tables[
-                table_name
-            ]
+            resource = tables[table_name]
 
-            if resource.dataframe is not None:
-                dfs[table_name] = (
-                    resource.dataframe.copy()
-                )
-
-            elif resource.source_type != "sqlite":
+            if resource.dataframe is None and resource.source_type != "sqlite":
                 raise ValueError(
-                    f"Unsupported table resource: "
-                    f"{table_name}"
+                    f"Unsupported table resource: {table_name}"
                 )
 
-        if not re.fullmatch(
-            r"[A-Za-z0-9\_-]+",
-            chart_id
-        ):
+        # chart_id 会参与容器内的输出文件名，必须严格限制字符集；
+        # 宿主与容器两侧都校验，避免任一侧被绕过。
+        if not CHART_ID_PATTERN.fullmatch(chart_id):
             raise ValueError(
                 f"Invalid chart id: {chart_id}"
             )
 
-        result_df = build_result_dataframe(
-            analysis_result
-        )
-
-        plt.rcdefaults()
-
-        plt.rcParams[
-            "font.family"
-        ] = "sans-serif"
-
-        plt.rcParams[
-            "font.sans-serif"
-        ] = [
-            "Microsoft YaHei",
-            "SimHei",
-            "DejaVu Sans",
-        ]
-
-        plt.rcParams[
-            "axes.unicode_minus"
-        ] = False
-
-        plot_output_dir = Path(
-        output_dir
-        )
-
-        plot_output_dir.mkdir(
-            parents=True,
-            exist_ok=True
-        )
-
-        output_path = (
-            plot_output_dir
-            / f"{chart_id}.png"
-        )
-        safe_builtins = {
-            "abs": abs,
-            "all": all,
-            "any": any,
-            "bool": bool,
-            "dict": dict,
-            "enumerate": enumerate,
-            "float": float,
-            "int": int,
-            "len": len,
-            "list": list,
-            "max": max,
-            "min": min,
-            "range": range,
-            "round": round,
-            "set": set,
-            "sorted": sorted,
-            "str": str,
-            "sum": sum,
-            "tuple": tuple,
-            "zip": zip,
-        }
-
-        execution_scope = {
-            "analysis_result": analysis_result,
-            "result_df": result_df,
-            "dfs": dfs,
-            "plt": plt,
-            "output_path": str(
-                output_path
-            ),
-            "__builtins__": safe_builtins,
-        }
-
-        if (
-            len(table_names) == 1
-            and table_names[0] in dfs
-        ):
-            execution_scope["df"] = dfs[
-                table_names[0]
-            ]
-
-        forbidden_patterns = [
-            "plt.rcParams",
-            "matplotlib.rcParams",
-            "font_manager",
-            
-        ]
-
-        for pattern in forbidden_patterns:
-
-            if pattern in code:
-                return {
-                    "success": False,
-                    "result": None,
-                    "error": (
-                        f"Plot code contains forbidden "
-                        f"pattern: {pattern}"
-                    )
-                }
+        output_filename = f"{chart_id}.png"
 
         try:
-
-            exec(
-                code,
-                execution_scope,
-                execution_scope
-            )
-
-            if "result" not in execution_scope:
-                raise ValueError(
-                    "Plot code must store its final "
-                    "output in 'result'."
-                )
-
-            if not output_path.exists():
-                raise ValueError(
-                    "Plot code did not create the "
-                    "expected image file."
-                )
-
-            return {
-                "success": True,
-                "result": str(
-                    output_path
-                ),
-                "error": None
-            }
-
-        except Exception as error:
-
+            runtime = current_runtime()
+        except RuntimeContextMissing:
+            # 没有运行期上下文就无法确定本次 Run 的输出目录。
+            # 归类为 unavailable：这是接线问题，重试模型代码没有意义。
             return {
                 "success": False,
                 "result": None,
-                "error": str(error)
+                "error": "plot execution requires a bound runtime context",
+                "error_kind": SandboxErrorKind.UNAVAILABLE,
             }
 
-        finally:
-            plt.close("all")
+        # 绘图只需要 DataFrame 形态的表；sqlite 表由 SQL 工具负责取数
+        sandbox_tables = {
+            name: tables[name]
+            for name in table_names
+            if tables[name].dataframe is not None
+        }
+
+        job = SandboxJob(
+            mode="plot",
+            table_names=list(sandbox_tables),
+            code=code,
+            analysis_result=analysis_result,
+            output_filename=output_filename,
+            op_label=f"plot:{chart_id}",
+        )
+
+        try:
+            outcome = execute_in_sandbox(
+                job=job,
+                tables=sandbox_tables,
+                run_id=runtime.run_id,
+                run_dir=runtime.output_dir(),
+            )
+        except Exception as error:  # noqa: BLE001 - 统一转成结果字典
+            return {
+                "success": False,
+                "result": None,
+                "error": str(error),
+                "error_kind": classify_exception(error),
+            }
+
+        if not outcome.success:
+            return outcome.to_tool_result()
+
+        # 返回宿主路径：下游的 artifact / report / 幂等登记都用宿主路径，
+        # 容器内的 /out/... 不能泄漏到 state。
+        host_path = Path(runtime.output_dir()) / output_filename
+
+        if not host_path.exists():
+            return {
+                "success": False,
+                "result": None,
+                "error": "Plot code did not create the expected image file.",
+            }
+
+        return {
+            "success": True,
+            "result": str(host_path),
+            "error": None,
+        }
 
     return run_plot

@@ -47,6 +47,7 @@ class TaskFailure(TypedDict):
     task_id: str
     stage: Literal["execution", "validation"]
     reason: str
+    error_kind: str | None  # execution 阶段的错误分类，便于事后归因
     code: str | None
     retry_count: int
     refine_count: int
@@ -86,6 +87,11 @@ class InsightFlowState(TypedDict, total=False):
     execution_results: list[ExecutionResult]  # 执行分析结果
 
     execution_error: str | None  # 执行错误
+
+    # 执行错误的分类（来自沙箱契约）。路由据此区分"模型代码写错了"（可进入
+    # 有界修复循环）与"沙箱环境不可用"（重试无意义）。
+    # 取值见 sandbox/protocol.py 的 SandboxErrorKind。
+    execution_error_kind: str | None
 
     retry_count: int  # 重试次数
 
