@@ -1,6 +1,9 @@
 # 定义各个 Agent 在工作流中共享的数据状态结构。
+#
+# 这里是 Checkpoint 的输入契约：所有值都必须可 JSON 编码。
+# 表数据与模型客户端都不在 state 中——前者按 `table_snapshot` 读回，
+# 后者由运行期注入（见 core/runtime.py）。
 from typing import Any, Literal, TypedDict
-from ingestion.models import TableResource
 
 
 class AnalysisTask(TypedDict):
@@ -34,7 +37,9 @@ class ExecutionResult(TypedDict):
     tool_used: Literal["python", "sql"]
     code: str
     success: bool
+    # 小结果内联；大结果只留摘要，完整内容在 `result_artifact` 指向的文件里
     result: Any
+    result_artifact: dict[str, Any] | None
     error: str | None
 
 
@@ -53,15 +58,14 @@ class TaskFailure(TypedDict):
 class InsightFlowState(TypedDict, total=False):
     run_id: str  # 每次workflow唯一编号
 
-    # 本次运行的模型注入点，携带 run_id 与各 Agent 身份。
-    # 运行期资源句柄、不可序列化，P1 引入 Checkpoint 时必须移出 state。
-    model_factory: Any
-
     analysis_focus: str | None  # 提供分析重点（可选）
 
     data_sources: list[str]  # 文件数据
 
-    tables: dict[str, TableResource]  # 数据表
+    # 表资源的可序列化身份（来源路径、内容指纹、sheet/表名）。
+    # 真实 DataFrame 由 ResourceResolver 按快照按需读回，不进 state：
+    # 它无法 JSON 编码，也不该跨进程恢复。
+    table_snapshot: dict[str, dict[str, Any]]
 
     knowledge_sources: list[str]    #用户提供业务知识文件
 
@@ -104,6 +108,31 @@ class InsightFlowState(TypedDict, total=False):
 
     status_reason: str | None  # analysis_status 不是 completed 时的原因说明
 
+    # 运行生命周期。与 analysis_status 是两件事：前者描述"这次执行走到哪一步"，
+    # 后者描述"分析本身产出了什么"。例如等待审批时 run_status=waiting_approval
+    # 而 analysis_status 尚未产生。
+    run_status: Literal[
+        "pending",
+        "running",
+        "waiting_approval",
+        "completed",
+        "failed",
+        "interrupted",
+    ]
+
+    # 待审批请求（由 interrupt 产生）。恢复后据此重建审批界面，
+    # 因此必须是可序列化的普通结构。
+    pending_approval: dict[str, Any] | None
+
+    # 是否要求执行前人工审批。显式开关，未开启时保持全自动路径。
+    require_plan_approval: bool
+
+    # 最近一次执行前审批的归档结果（路由依据）
+    plan_approval: dict[str, Any] | None
+
+    # 已处理的审批决定，按审批 ID 归档，用于重复审批保护与审计
+    approvals: list[dict[str, Any]]
+
     report_path: str | None  # 报告路径
 
     report_content: str | None  # 最终生成的 Markdown 分析报告
@@ -113,4 +142,16 @@ class InsightFlowState(TypedDict, total=False):
     current_plot_code: str | None  # 当前生成并准备执行的绘图代码
     visualization_results: list[VisualizationResult]  # 图表生成结果
     plot_error: str | None  # 当前图表执行错误
-    plot_retry_count: int  # 绘图失败后的修复次数c
+    plot_retry_count: int  # 绘图失败后的修复次数
+
+    # 副作用幂等登记：操作 ID -> 完成记录。恢复时据此判断某个副作用
+    # 是否已经执行过，避免重复写文件或重复调用工具。
+    completed_operations: dict[str, dict[str, Any]]
+
+    # 可能已发出但未确认结果的模型调用（由账本在恢复时比对得出）。
+    # 必须在 state 中声明：未声明的键会被 LangGraph 直接丢弃，
+    # 那样恢复时就发现不了"请求已发出、节点未提交"的重复风险。
+    pending_llm_calls: list[str]
+
+    # 人工对未确认调用的决定（"retry" 表示获准重发）
+    llm_retry_granted: str | None

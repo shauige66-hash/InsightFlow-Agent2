@@ -13,6 +13,7 @@ from langchain_core.prompts import ChatPromptTemplate
 from agents.critic import review_execution_result
 from agents.executor import generate_execution_code
 from agents.planner import create_analysis_plan
+from agents.plotter import generate_plot_code
 from agents.repair import repair_execution_code
 from agents.visualizer import create_visualization_plan
 from utils.llm_retry import StructuredOutputError, invoke_json_with_retry
@@ -247,6 +248,99 @@ class TestVisualizer:
 
         assert charts == []
         assert len(calls) == 2
+
+
+    def test_missing_feedback_field_is_retried(self, scripted_model) -> None:
+        """缺字段属于可重试的格式问题，错误信息里要能看出缺了什么。"""
+        model, calls = scripted_model(
+            [{"validation_passed": True}, {"validation_passed": True, "feedback": "ok"}]
+        )
+
+        review = review_execution_result(
+            task=TASK,
+            data_context={},
+            execution_result={"task_id": "task_1", "result": 1, "success": True},
+            llm=model,
+        )
+
+        assert review["feedback"] == "ok"
+        assert len(calls) == 2
+
+    def test_missing_field_error_names_the_field(self, scripted_model) -> None:
+        """校验器抛出的原因必须真的带上字段名。
+
+        这里曾写成 f"...{{missing}}"，渲染出来是字面量 {missing}，
+        使重试提示失去信息——因此单独断言一次。
+        """
+        model, calls = scripted_model(
+            [
+                {"feedback": "ok"},
+                {"validation_passed": True, "feedback": "ok"},
+            ]
+        )
+
+        review = review_execution_result(
+            task=TASK,
+            data_context={},
+            execution_result={"task_id": "task_1", "result": 1, "success": True},
+            llm=model,
+        )
+
+        assert review["validation_passed"] is True
+
+        # 重试提示应包含缺失的字段名，而不是未格式化的占位符
+        retry_prompt = calls[1][0].content
+        assert "validation_passed" in retry_prompt
+        assert "{missing}" not in retry_prompt
+
+
+class TestPlotter:
+    """绘图代码生成。
+
+    这个 Agent 自成一套重试循环（不走 invoke_json_with_retry），
+    而它的 prompt 里含 {retry_hint} 占位符——漏传会直接抛
+    PromptTemplate 缺变量错误，使任何"有图表的计划"整体失败。
+    """
+
+    CHART = {
+        "chart_id": "chart_1",
+        "source_task_id": "task_1",
+        "chart_type": "bar",
+        "title": "客户数",
+        "description": "客户总数",
+        "target_tables": ["customers"],
+    }
+
+    def test_prompt_receives_retry_hint(self, scripted_model) -> None:
+        """首次调用也必须提供 retry_hint，否则 PromptTemplate 直接失败。"""
+        model, calls = scripted_model([{"code": "result = fig"}])
+
+        generation = generate_plot_code(
+            visualization_task=self.CHART,
+            data_context={"customers": {"rows": 5}},
+            execution_result={"task_id": "task_1", "result": 5, "success": True},
+            llm=model,
+        )
+
+        assert generation["code"] == "result = fig"
+        assert len(calls) == 1
+
+    def test_missing_code_is_retried_with_hint(self, scripted_model) -> None:
+        model, calls = scripted_model([{"code": ""}, {"code": "result = fig"}])
+
+        generation = generate_plot_code(
+            visualization_task=self.CHART,
+            data_context={"customers": {"rows": 5}},
+            execution_result={"task_id": "task_1", "result": 5, "success": True},
+            llm=model,
+        )
+
+        assert generation["code"] == "result = fig"
+        assert len(calls) == 2, "空代码应触发重试"
+
+        first_prompt = calls[0][0].content
+        second_prompt = calls[1][0].content
+        assert len(second_prompt) > len(first_prompt), "重试未携带失败原因"
 
 
 class TestRetryWrapper:

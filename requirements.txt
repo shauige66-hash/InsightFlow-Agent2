@@ -1,5 +1,8 @@
 langchain
 langgraph
+# Checkpoint 持久化。固定版本以保证恢复行为可复现：
+# langgraph-checkpoint 4.3.0 要求 langgraph-checkpoint-sqlite >= 3.1
+langgraph-checkpoint-sqlite==3.1.2
 langchain-openai
 pandas
 openpyxl

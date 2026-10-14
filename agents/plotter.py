@@ -8,7 +8,6 @@ from langchain_core.output_parsers import JsonOutputParser
 from langchain_core.language_models import BaseChatModel
 from langchain_core.prompts import PromptTemplate
 
-from core.llm import create_llm
 from state import ExecutionResult, VisualizationTask
 from langchain_core.exceptions import OutputParserException
 
@@ -174,6 +173,11 @@ def generate_plot_code(
         )
     }
 
+    # prompt 里有 {retry_hint} 占位符，必须提供，否则 PromptTemplate 会直接报
+    # 缺少变量。首次尝试留空，重试时把上一次的失败原因回传——temperature 为 0 时
+    # 重发完全相同的 prompt 只会得到同样的错误。
+    current_inputs = {**inputs, "retry_hint": ""}
+
     last_error = None
     retry_errors = []
     for attempt in range(
@@ -181,7 +185,7 @@ def generate_plot_code(
         MAX_GENERATION_ATTEMPTS + 1
     ):
         try:
-            result = chain.invoke(inputs)
+            result = chain.invoke(current_inputs)
 
             if (
                 not isinstance(result, dict)
@@ -213,6 +217,14 @@ def generate_plot_code(
         )
             if attempt == MAX_GENERATION_ATTEMPTS:
                 raise
+
+            current_inputs = {
+                **inputs,
+                "retry_hint": (
+                    "上一次尝试失败，原因："
+                    f"{str(error)[:300]}\n请修正后重新生成。"
+                ),
+            }
 
     raise RuntimeError(
         "Plot code generation failed."

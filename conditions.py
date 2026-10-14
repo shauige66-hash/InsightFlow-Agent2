@@ -21,6 +21,40 @@ def route_after_planner(
     return "router" if state.get("analysis_plan") else "complete"
 
 
+def route_to_approval(
+    state: InsightFlowState
+) -> Literal["approval_gate", "router", "complete"]:
+    """决定计划产出后是进入人工审批、直接执行，还是收尾。
+
+    空计划优先：没有任务可分析时不需要打扰审批人。
+    `require_plan_approval` 让 HITL 成为显式选择，未开启时保持原有
+    全自动路径，避免所有调用方都被迫处理中断。
+    """
+    if not state.get("analysis_plan"):
+        return "complete"
+
+    if state.get("require_plan_approval"):
+        return "approval_gate"
+
+    return "router"
+
+
+def route_after_approval(
+    state: InsightFlowState
+) -> Literal["router", "complete"]:
+    """审批被拒绝时不再进入执行阶段。
+
+    该分支只在 resume 之后才会被求值：中断期间图停在审批节点，
+    不会走到这里。因此"拒绝"能真正阻止后续的执行与报告生成。
+    """
+    decision = state.get("plan_approval") or {}
+
+    if decision.get("decision") == "approve":
+        return "router"
+
+    return "complete"
+
+
 def route_after_execution(
     state: InsightFlowState
 ) -> Literal["repair", "critic", "failed"]:

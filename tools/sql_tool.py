@@ -8,6 +8,18 @@ import pandas as pd
 from langchain_core.tools import tool
 
 from ingestion.models import TableResource
+from utils.sql_guard import SqlNotReadOnly, ensure_read_only
+
+
+def _read_only_uri(database_path: str) -> str:
+    """构造 SQLite 只读 URI。
+
+    用 URI 形式而不是直接传路径：`sqlite3.connect(path)` 以读写模式打开，
+    这是"只读"承诺与其实现不一致的常见来源。
+    """
+    path = Path(database_path).resolve()
+    # as_posix 保证 Windows 反斜杠不会破坏 URI
+    return f"file:{path.as_posix()}?mode=ro"
 
 
 def create_sql_tool(
@@ -63,21 +75,24 @@ def create_sql_tool(
 
         cleaned_query = query.strip()
 
-        if not cleaned_query.lower().startswith(
-            ("select", "with")
-        ):
+        # 词法只读校验：拒绝非 SELECT/WITH、多语句、注释绕过与写关键字。
+        # 这是第一道闸门，但词法判定本身不是权限隔离——真正的边界是下面
+        # 以 mode=ro 打开连接（第二道闸门）。两者必须同时生效。
+        try:
+            ensure_read_only(cleaned_query)
+        except SqlNotReadOnly as error:
             return {
                 "success": False,
                 "result": None,
-                "error": (
-                    "Only SELECT or WITH queries "
-                    "are allowed."
-                )
+                "error": str(error)
             }
 
         try:
+            # 只读 URI 打开：即使词法校验被绕过，SQLite 也会拒绝任何写入。
+            # 注意两点：不能只用 `sqlite3.connect(path)`（读写模式），
+            # 且 URI 形式必须显式传 uri=True，否则字符串会被当成文件名。
             with sqlite3.connect(
-                database_path
+                _read_only_uri(database_path), uri=True
             ) as connection:
 
                 result_df = pd.read_sql_query(

@@ -187,7 +187,8 @@ class TestSqlTool:
         )
 
         assert outcome["success"] is False
-        assert "Only SELECT or WITH" in outcome["error"]
+        # 拒绝原因来自只读校验（utils/sql_guard），不再依赖旧的前缀判断文案
+        assert "只读" in outcome["error"]
 
     def test_leading_whitespace_is_tolerated(self, sqlite_tables) -> None:
         outcome = create_sql_tool(sqlite_tables).invoke(

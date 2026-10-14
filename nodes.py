@@ -1,13 +1,23 @@
 # 定义 LangGraph 工作流节点，负责读取和更新共享 State。
 
+import contextvars
+import functools
+import os
+import time
+from typing import Any, Callable
+
+from langgraph.types import interrupt
+
 from state import InsightFlowState
-from ingestion.loader import load_data_sources
+from ingestion.resources import (
+    build_snapshots,
+    snapshots_to_state,
+    verify_recorded_sources,
+)
 from context.context_builder import build_all_contexts
 from agents.planner import create_analysis_plan
 from agents.router import route_analysis_task
 from agents.executor import generate_execution_code
-from tools.python_tool import create_python_tool
-from tools.sql_tool import create_sql_tool
 from tools.tool_registry import available_tools, invoke_tool
 from agents.repair import repair_execution_code
 from agents.critic import review_execution_result
@@ -19,7 +29,74 @@ from agents.plotter import generate_plot_code
 from tools.plot_tool import create_plot_tool
 from agents.plot_repair import repair_plot_code
 from pathlib import Path
-from core.inference import model_for
+from core.inference import model_for, resolve_snapshots, resolve_tables
+from core.runtime import current_runtime
+from utils.idempotency import (
+    artifact_operation,
+    chart_operation,
+    completed_operations,
+    plan_approval_id,
+    record,
+    replay_guard,
+    report_approval_id,
+    run_agent_call,
+)
+from utils.result_artifacts import store_result
+
+
+def _crash_point(name: str) -> None:
+    """故障注入点，仅供测试使用。
+
+    通过环境变量 INSIGHTFLOW_CRASH_AT 指定：在文件已经写入、但本节点的
+    state 增量尚未提交（Checkpoint 未落盘）的瞬间强杀进程。
+    用于验证"文件系统与 SQLite 不属于同一个事务"时会发生什么。
+    """
+    if os.environ.get("INSIGHTFLOW_CRASH_AT") == name:
+        import os as _os
+
+        _os._exit(17)
+
+
+def _agent_call(
+    agent: str, subject: str, invoke: Callable[[], Any]
+) -> tuple[Any, dict, dict]:
+    """执行一次 Agent 调用，并取回该次调用的幂等登记与额外 state 增量。
+
+    节点在返回 state 增量时必须一并带上 `completed_operations` 与额外增量
+    （例如清空 `pending_llm_calls`），否则这些记录不会进入 Checkpoint：
+    "已完成"没落盘会导致恢复时重复执行，
+    "未确认清单"没清空会导致每次恢复都重新询问同一件事。
+    """
+    return run_agent_call(
+        _CURRENT_STATE.get() or {},
+        node=agent,
+        subject=subject,
+        call=invoke,
+    )
+
+
+# 当前节点正在处理的 state。节点函数签名不能带额外参数（LangGraph 会把
+# 参数名当成状态通道），因此这里用 ContextVar 传递，避免改动 19 个节点签名。
+_CURRENT_STATE: contextvars.ContextVar[dict | None] = contextvars.ContextVar(
+    "insightflow_current_state", default=None
+)
+
+
+def _with_state(func: Callable) -> Callable:
+    """把 state 放进 ContextVar，供 `_agent_call` 读取。
+
+    只包装实际调用 Agent 的节点；其余节点不受影响。
+    """
+
+    @functools.wraps(func)
+    def wrapper(state: InsightFlowState) -> dict:
+        token = _CURRENT_STATE.set(state)
+        try:
+            return func(state)
+        finally:
+            _CURRENT_STATE.reset(token)
+
+    return wrapper
 from utils.run_logger import log_event
 from time import perf_counter
 from rag.knowledge_service import build_and_retrieve_knowledge
@@ -28,12 +105,20 @@ def loader_node(
     state: InsightFlowState
 ) -> dict:
 
-    tables = load_data_sources(
-        state["data_sources"]
-    )
+    # 只把表的身份写进 state（可序列化），真实 DataFrame 由 resolver 按需读回。
+    #
+    # 先校验已有快照：恢复或重放时若来源已被修改/删除，必须在这里失败。
+    # 不能只靠下面的 build_snapshots —— 它会重新计算指纹，
+    # 于是"数据变了"会被静默当成一份新快照，历史 Run 就用了新数据。
+    recorded = state.get("table_snapshot") or {}
+    if recorded:
+        verify_recorded_sources(recorded)
+
+    snapshots = build_snapshots(state["data_sources"])
+    resolve_snapshots(snapshots_to_state(snapshots))
 
     return {
-        "tables": tables
+        "table_snapshot": snapshots_to_state(snapshots)
     }
 
 
@@ -42,7 +127,7 @@ def context_node(
 ) -> dict:
 
     contexts = build_all_contexts(
-        state["tables"]
+        resolve_tables(state)
     )
 
     return {
@@ -93,6 +178,7 @@ def knowledge_retrieval_node(
     }
 
 
+@_with_state
 def planner_node(
     state: InsightFlowState
 ) -> dict:
@@ -102,13 +188,17 @@ def planner_node(
         []
     )
 
-    plan = create_analysis_plan(
-        contexts=state["data_context"],
-        analysis_focus=state.get(
-            "analysis_focus"
+    plan, _ops, _extra = _agent_call(
+        "planner",
+        "plan",
+        lambda: create_analysis_plan(
+            contexts=state["data_context"],
+            analysis_focus=state.get(
+                "analysis_focus"
+            ),
+            retrieved_knowledge=retrieved_knowledge,
+            llm=model_for("planner"),
         ),
-        retrieved_knowledge=retrieved_knowledge,
-    llm=model_for(state, "planner")
     )
 
     run_id = state.get("run_id")
@@ -139,11 +229,15 @@ def planner_node(
             "current_task_index": 0,
             "analysis_status": "no_tasks",
             "status_reason": "Planner 未产出任何分析任务",
+            "completed_operations": _ops,
+            **_extra,
         }
 
     return {
         "analysis_plan": plan,
         "current_task_index": 0,
+        "completed_operations": _ops,
+        **_extra,
     }
 
 
@@ -158,7 +252,7 @@ def router_node(
 
     tool = route_analysis_task(
         task,
-        state["tables"]
+        resolve_tables(state)
     )
     run_id = state.get("run_id")
 
@@ -182,6 +276,7 @@ def router_node(
     }
 
 
+@_with_state
 def execution_node(
     state: InsightFlowState
 ) -> dict:
@@ -207,12 +302,16 @@ def execution_node(
     []
     )
 
-    code = generate_execution_code(
-        task=task,
-        data_context=data_context,
-        route=tool,
-        retrieved_knowledge=retrieved_knowledge,
-    llm=model_for(state, "executor")
+    code, _ops, _extra = _agent_call(
+        "executor",
+        task["task_id"],
+        lambda: generate_execution_code(
+            task=task,
+            data_context=data_context,
+            route=tool,
+            retrieved_knowledge=retrieved_knowledge,
+            llm=model_for("executor"),
+        ),
     )
 
     duration_ms = (
@@ -238,7 +337,9 @@ def execution_node(
         )
 
     return {
-        "current_code": code
+        "current_code": code,
+        "completed_operations": _ops,
+        **_extra,
     }
 
 
@@ -272,18 +373,33 @@ def tool_execution_node(
         else {"table_names": task["target_tables"], "query": code}
     )
 
-    execution = invoke_tool(tool, state["tables"], arguments)
+    execution = invoke_tool(tool, resolve_tables(state), arguments)
+
+    run_id = state.get("run_id")
+
+    # 结果可能含 DataFrame / ndarray，直接放进 state 会让 Checkpoint 序列化失败。
+    # 小结果内联，大结果落成带指纹的产物，state 只保留摘要与引用。
+    inline_result, result_artifact = (None, None)
+    if execution["success"]:
+        inline_result, result_artifact = store_result(
+            execution["result"],
+            run_id=run_id or "no-run",
+            task_id=task["task_id"],
+            output_root=current_runtime().output_root,
+        )
 
     execution_result = {
         "task_id": task["task_id"],
         "tool_used": tool,
         "code": code,
         "success": execution["success"],
-        "result": execution["result"],
-        "error": execution["error"]
+        "result": inline_result,
+        "result_artifact": result_artifact,
+        "error": execution["error"],
+        # 记录产生这条结果的尝试序号，供下面的去重与审计使用
+        "retry_count": state.get("retry_count", 0),
+        "refine_count": state.get("refine_count", 0),
     }
-
-    run_id = state.get("run_id")
 
     if run_id is not None:
         log_event(
@@ -318,14 +434,35 @@ def tool_execution_node(
         []
     )
 
+    # 与绘图结果同样的道理：execution_results 是追加列表，重放该节点会重复追加。
+    # 按 (task_id, retry_count, refine_count) 去重——同一次尝试的重放应替换，
+    # 而修复循环里的新尝试（计数变化）会作为新记录保留。
+    attempt_key = (
+        task["task_id"],
+        state.get("retry_count", 0),
+        state.get("refine_count", 0),
+    )
+
+    deduped = [
+        existing
+        for existing in previous_results
+        if (
+            existing.get("task_id"),
+            existing.get("retry_count", 0),
+            existing.get("refine_count", 0),
+        )
+        != attempt_key
+    ]
+
     return {
-        "execution_results": previous_results + [
+        "execution_results": deduped + [
             execution_result
         ],
         "execution_error": execution["error"]
     }
 
 
+@_with_state
 def repair_node(
     state: InsightFlowState
 ) -> dict:
@@ -356,14 +493,18 @@ def repair_node(
     if error is None:
         raise ValueError("Execution error is missing.")
 
-    repaired_code = repair_execution_code(
-        task=task,
-        data_context=data_context,
-        route=tool,
-        code=code,
-        error=error,
-        retrieved_knowledge=retrieved_knowledge,
-    llm=model_for(state, "repair")
+    repaired_code, _ops, _extra = _agent_call(
+        "repair",
+        task["task_id"],
+        lambda: repair_execution_code(
+            task=task,
+            data_context=data_context,
+            route=tool,
+            code=code,
+            error=error,
+            retrieved_knowledge=retrieved_knowledge,
+            llm=model_for("repair"),
+        ),
     )
 
     retry_count = state.get(
@@ -389,7 +530,9 @@ def repair_node(
 
     return {
         "current_code": repaired_code,
-        "retry_count": retry_count
+        "retry_count": retry_count,
+        "completed_operations": _ops,
+        **_extra,
     }
 
 
@@ -475,6 +618,7 @@ def advance_task_node(
 
 
 
+@_with_state
 def critic_node(
     state: InsightFlowState
 ) -> dict:
@@ -492,12 +636,16 @@ def critic_node(
 
     execution_result = state["execution_results"][-1]
 
-    review = review_execution_result(
-        task=task,
-        data_context=data_context,
-        execution_result=execution_result,
-        retrieved_knowledge=retrieved_knowledge,
-    llm=model_for(state, "critic")
+    review, _ops, _extra = _agent_call(
+        "critic",
+        task["task_id"],
+        lambda: review_execution_result(
+            task=task,
+            data_context=data_context,
+            execution_result=execution_result,
+            retrieved_knowledge=retrieved_knowledge,
+            llm=model_for("critic"),
+        ),
     )
 
     run_id = state.get("run_id")
@@ -529,11 +677,14 @@ def critic_node(
 
     return {
         "validation_passed": review["validation_passed"],
-        "critic_feedback": review["feedback"]
+        "critic_feedback": review["feedback"],
+        "completed_operations": _ops,
+        **_extra,
     }
 
 
 
+@_with_state
 def refine_node(
     state: InsightFlowState
 ) -> dict:
@@ -578,15 +729,19 @@ def refine_node(
             "Critic feedback is missing."
         )
 
-    refined_code = refine_execution_code(
-        task=task,
-        data_context=data_context,
-        route=tool,
-        code=code,
-        execution_result=execution_result,
-        critic_feedback=critic_feedback,
-        retrieved_knowledge=retrieved_knowledge,
-    llm=model_for(state, "refine")
+    refined_code, _ops, _extra = _agent_call(
+        "refine",
+        task["task_id"],
+        lambda: refine_execution_code(
+            task=task,
+            data_context=data_context,
+            route=tool,
+            code=code,
+            execution_result=execution_result,
+            critic_feedback=critic_feedback,
+            retrieved_knowledge=retrieved_knowledge,
+            llm=model_for("refine"),
+        ),
     )
 
     refine_count = state.get(
@@ -612,7 +767,9 @@ def refine_node(
 
     return {
         "current_code": refined_code,
-        "refine_count": refine_count
+        "refine_count": refine_count,
+        "completed_operations": _ops,
+        **_extra,
     }
 
 
@@ -690,6 +847,7 @@ def failed_task_node(
         ]
     }
 
+@_with_state
 def report_node(
     state: InsightFlowState
 ) -> dict:
@@ -758,19 +916,23 @@ def report_node(
             result_item
         )
 
-    report = generate_analysis_report(
-        analysis_plan=state["analysis_plan"],
-        execution_results=final_execution_results,
-        failed_tasks=state.get(
-            "failed_tasks",
-            []
+    report, _ops, _extra = _agent_call(
+        "reporter",
+        "report",
+        lambda: generate_analysis_report(
+            analysis_plan=state["analysis_plan"],
+            execution_results=final_execution_results,
+            failed_tasks=state.get(
+                "failed_tasks",
+                []
+            ),
+            visualization_plan=state.get(
+                "visualization_plan",
+                []
+            ),
+            visualization_results=report_visualizations,
+            llm=model_for("reporter"),
         ),
-        visualization_plan=state.get(
-            "visualization_plan",
-            []
-        ),
-        visualization_results=report_visualizations,
-    llm=model_for(state, "reporter")
     )
 
     run_id = state.get("run_id")
@@ -801,7 +963,9 @@ def report_node(
         )
 
     return {
-        "report_content": report
+        "report_content": report,
+        "completed_operations": _ops,
+        **_extra,
     }
 
 
@@ -827,8 +991,23 @@ def artifact_node(
             "Run ID is missing."
         )
 
+    # 写文件是副作用：恢复时若该节点被重放，直接复用已登记的产物，
+    # 不重新生成 Markdown/HTML/PDF（PDF 需要启动浏览器，代价明显）。
+    op_id = artifact_operation(run_id)
+    done = replay_guard(state, op_id, what="报告产物生成")
+
+    if done is not None and done.detail:
+        return {
+            "report_path": done.detail.get("markdown_path"),
+            "analysis_status": done.detail.get("analysis_status"),
+            "status_reason": done.detail.get("status_reason"),
+            "run_status": done.detail.get("run_status"),
+            "artifacts": done.detail.get("artifacts", state.get("artifacts", [])),
+            "completed_operations": completed_operations(state),
+        }
+
     output_dir = (
-        Path("outputs")
+        current_runtime().output_root
         / run_id
     )
 
@@ -860,6 +1039,10 @@ def artifact_node(
             / "analysis_report.pdf"
         )
     )
+
+    # 文件已全部落盘，但"已完成"登记还没提交到 Checkpoint。
+    # 这一刻崩溃即可验证文件与 Checkpoint 的一致性边界。
+    _crash_point("artifact_files_written")
 
     log_event(
         run_id=run_id,
@@ -905,21 +1088,223 @@ def artifact_node(
         }
     )
 
+    artifacts = (
+        previous_artifacts
+        + [
+            markdown_path,
+            html_path,
+            pdf_path
+        ]
+    )
+
+    # 生命周期与产物登记一起写入同一个 state 增量，保证"完成"与"已登记"一致
+    run_status = "completed" if analysis_status in ("completed", "partial") else "failed"
+
     return {
         "report_path": markdown_path,
         "analysis_status": analysis_status,
         "status_reason": status_reason,
-        "artifacts": (
-            previous_artifacts
-            + [
-                markdown_path,
-                html_path,
-                pdf_path
-            ]
-        )
+        "run_status": run_status,
+        "artifacts": artifacts,
+        "completed_operations": record(
+            state,
+            op_id,
+            detail={
+                "markdown_path": markdown_path,
+                "html_path": html_path,
+                "pdf_path": pdf_path,
+                "analysis_status": analysis_status,
+                "status_reason": status_reason,
+                "run_status": run_status,
+                "artifacts": artifacts,
+            },
+        ),
     }
 
 
+def approval_gate_node(
+    state: InsightFlowState
+) -> dict:
+    """执行前的人工审批关口。
+
+    放在 planner 之后、router 之前：此时还没有任何副作用（未执行工具、
+    未写产物），因此中断是安全可重放的。interrupt() 之前不做任何不可重放的
+    动作，恢复时这个节点会从头执行，只是这次能拿到审批结果。
+
+    非只读 SQL 不在这里放行：只读约束由 utils/sql_guard.py 独立强制，
+    审批只回答"要不要做这项分析"。
+    """
+    run_id = state.get("run_id") or "unknown"
+
+    plan = state.get("analysis_plan", [])
+    sql_task_ids = [
+        task["task_id"]
+        for task in plan
+        if task.get("target_tables") and _task_is_sql(state, task)
+    ]
+
+    approval_id = plan_approval_id(run_id)
+
+    # 已审批过（例如恢复后重放本节点）时不再中断
+    existing = _find_approval(state, approval_id)
+    if existing is not None:
+        return {
+            "plan_approval": existing,
+            "run_status": "running",
+        }
+
+    request = {
+        "approval_id": approval_id,
+        "run_id": run_id,
+        "node": "approval_gate",
+        "kind": "plan_review",
+        "summary": {
+            "task_count": len(plan),
+            "tasks": [
+                {
+                    "task_id": task["task_id"],
+                    "description": task["description"],
+                    "target_tables": task["target_tables"],
+                }
+                for task in plan
+            ],
+            # 明确告知：含 SQL 的任务同样只读，审批不会提升权限
+            "contains_sql_tasks": bool(sql_task_ids),
+            "sql_read_only_enforced": True,
+        },
+        "created_at": time.time(),
+    }
+
+    log_event(
+        run_id=run_id,
+        node="approval_gate",
+        event="approval_requested",
+        status="waiting_approval",
+        details={"approval_id": approval_id, "kind": "plan_review"},
+    )
+
+    # 真正的中断：resume 时 interrupt() 返回 Command(resume=...) 携带的值
+    decision = interrupt(request)
+
+    return _apply_decision(state, request, decision)
+
+
+def _task_is_sql(
+    state: InsightFlowState, task: dict
+) -> bool:
+    """判断任务是否走 SQL。
+
+    只看快照里的资源类型，不读真实数据：审批摘要不需要 DataFrame，
+    而按来源类型判定与确定性路由的结论一致（DataFrame→python，SQLite→sql）。
+    """
+    snapshots = state.get("table_snapshot") or {}
+
+    source_types = [
+        snapshots.get(name, {}).get("source_type")
+        for name in task.get("target_tables", [])
+    ]
+
+    return bool(source_types) and all(
+        source_type == "sqlite" for source_type in source_types
+    )
+
+
+def _find_approval(
+    state: InsightFlowState, approval_id: str
+) -> dict | None:
+    for item in state.get("approvals") or []:
+        if item.get("approval_id") == approval_id:
+            return item
+    return None
+
+
+def _apply_decision(
+    state: InsightFlowState, request: dict, decision: Any
+) -> dict:
+    """把审批结果归档，并给出后续路由依据。
+
+    重复提交同一个审批 ID 时直接复用已归档的决定，不再触发第二次中断，
+    避免同一次操作被批准两次。
+    """
+    payload = decision if isinstance(decision, dict) else {}
+    verdict = str(payload.get("decision", "")).lower()
+
+    if verdict not in ("approve", "reject"):
+        raise ValueError(
+            f"审批决定必须是 approve 或 reject，收到：{payload.get('decision')!r}"
+        )
+
+    record_entry = {
+        "approval_id": request["approval_id"],
+        "run_id": request["run_id"],
+        "node": request["node"],
+        "kind": request["kind"],
+        "decision": verdict,
+        "comment": payload.get("comment"),
+        "decided_at": time.time(),
+    }
+
+    log_event(
+        run_id=request["run_id"],
+        node="approval_gate",
+        event="approval_decided",
+        status=verdict,
+        details=record_entry,
+    )
+
+    approvals = list(state.get("approvals") or [])
+    approvals.append(record_entry)
+
+    return {
+        "plan_approval": record_entry,
+        "approvals": approvals,
+        "pending_approval": None,
+        "run_status": "completed" if verdict == "approve" else "failed",
+        "analysis_status": None if verdict == "approve" else "failed",
+        "status_reason": None if verdict == "approve" else "分析计划未获批准",
+    }
+
+
+def report_publish_gate_node(
+    state: InsightFlowState
+) -> dict:
+    """报告发布前的人工确认。
+
+    放在 artifact 之前：报告文件尚未写出，中断恢复不会产生半成品文件。
+    """
+    run_id = state.get("run_id") or "unknown"
+    approval_id = report_approval_id(run_id)
+
+    existing = _find_approval(state, approval_id)
+    if existing is not None:
+        return {"report_approval": existing, "run_status": "running"}
+
+    request = {
+        "approval_id": approval_id,
+        "run_id": run_id,
+        "node": "report_publish_gate",
+        "kind": "report_publish",
+        "summary": {
+            "report_chars": len(state.get("report_content") or ""),
+            "analysis_status": state.get("analysis_status"),
+            "failed_tasks": len(state.get("failed_tasks") or []),
+        },
+        "created_at": time.time(),
+    }
+
+    log_event(
+        run_id=run_id,
+        node="report_publish_gate",
+        event="approval_requested",
+        status="waiting_approval",
+        details={"approval_id": approval_id, "kind": "report_publish"},
+    )
+
+    decision = interrupt(request)
+    return _apply_decision(state, request, decision)
+
+
+@_with_state
 def visualization_planner_node(
     state: InsightFlowState
 ) -> dict:
@@ -933,14 +1318,18 @@ def visualization_planner_node(
         )
     )
 
-    visualization_plan = create_visualization_plan(
-        analysis_plan=state["analysis_plan"],
-        execution_results=final_execution_results,
-        failed_tasks=state.get(
-            "failed_tasks",
-            []
+    visualization_plan, _ops, _extra = _agent_call(
+        "visualizer",
+        "plan",
+        lambda: create_visualization_plan(
+            analysis_plan=state["analysis_plan"],
+            execution_results=final_execution_results,
+            failed_tasks=state.get(
+                "failed_tasks",
+                []
+            ),
+            llm=model_for("visualizer"),
         ),
-        llm=model_for(state, "visualizer")
     )
 
     run_id = state.get("run_id")
@@ -972,10 +1361,13 @@ def visualization_planner_node(
 
     return {
         "visualization_plan": visualization_plan,
-        "current_chart_index": 0
+        "current_chart_index": 0,
+        "completed_operations": _ops,
+        **_extra,
     }
 
 
+@_with_state
 def plot_generation_node(
     state: InsightFlowState
 ) -> dict:
@@ -1001,6 +1393,10 @@ def plot_generation_node(
         "source_task_id"
     ]
 
+    chart_id = visualization_task[
+        "chart_id"
+    ]
+
     source_execution_result = next(
         (
             result
@@ -1022,11 +1418,15 @@ def plot_generation_node(
             f"for source task: {source_task_id}"
         )
 
-    generation = generate_plot_code(
-        visualization_task=visualization_task,
-        data_context=data_context,
-        execution_result=source_execution_result,
-    llm=model_for(state, "plotter")
+    generation, _ops, _extra = _agent_call(
+        "plotter",
+        chart_id,
+        lambda: generate_plot_code(
+            visualization_task=visualization_task,
+            data_context=data_context,
+            execution_result=source_execution_result,
+            llm=model_for("plotter"),
+        ),
     )
 
     code = generation["code"]
@@ -1059,7 +1459,9 @@ def plot_generation_node(
 
     return {
         "current_plot_code": code,
-        "plot_error": None
+        "plot_error": None,
+        "completed_operations": _ops,
+        **_extra,
     }
 
 
@@ -1123,15 +1525,36 @@ def plot_execution_node(
             "Run ID is missing."
         )
 
+    # 必须用运行期的 output_root，而不是硬编码的相对 "outputs"：
+    # 后者会让产物落到进程当前目录，绕过调用方指定的隔离目录
+    # （测试与多环境部署下都会把文件写错位置）。
     output_dir = (
-        Path("outputs")
+        current_runtime().output_root
         / run_id
     )
 
     plot_tool = create_plot_tool(
-        state["tables"],
+        resolve_tables(state),
         output_dir=str(output_dir)
     )
+
+    # 绘图有副作用（写 PNG），而 visualization_results 是按 chart_id 追加的列表。
+    # 重放该节点会重复追加，因此这里做两件事：
+    #   1) 用 chart 级别的幂等键跳过已完成的执行；
+    #   2) 写入时按 chart_id 去重，使重放得到与首次一致的列表。
+    # 修复循环里的多次尝试保留最后一条（last-wins），不产生重复的图表记录。
+    run_id = state.get("run_id") or "unknown"
+    op_id = chart_operation(run_id, chart_id)
+    done = replay_guard(state, op_id, what=f"图表 {chart_id} 的生成")
+
+    if done is not None and done.detail:
+        return {
+            "visualization_results": done.detail.get(
+                "visualization_results", state.get("visualization_results", [])
+            ),
+            "plot_error": done.detail.get("plot_error"),
+            "completed_operations": completed_operations(state),
+        }
 
     execution = plot_tool.invoke({
         "table_names": target_tables,
@@ -1149,8 +1572,6 @@ def plot_execution_node(
         "path": execution["result"],
         "error": execution["error"]
     }
-
-    run_id = state.get("run_id")
 
     if run_id is not None:
         log_event(
@@ -1177,10 +1598,11 @@ def plot_execution_node(
             }
         )
 
-    previous_results = state.get(
-        "visualization_results",
-        []
-    )
+    previous_results = [
+        result
+        for result in state.get("visualization_results", [])
+        if result.get("chart_id") != chart_id
+    ]
 
     updates = {
         "visualization_results": (
@@ -1201,6 +1623,19 @@ def plot_execution_node(
             previous_artifacts
             + [execution["result"]]
         )
+
+    # PNG 已写入，但登记尚未提交到 Checkpoint
+    _crash_point("plot_file_written")
+
+    # 与副作用同一次写入登记，保证"已生成"与"已登记"不会分叉
+    updates["completed_operations"] = record(
+        state,
+        op_id,
+        detail={
+            "visualization_results": updates["visualization_results"],
+            "plot_error": execution["error"],
+        },
+    )
 
     return updates
 
@@ -1297,6 +1732,7 @@ def advance_chart_node(
     }
 
 
+@_with_state
 def plot_repair_node(
     state: InsightFlowState
 ) -> dict:
@@ -1357,13 +1793,21 @@ def plot_repair_node(
             "Plot error is missing."
         )
 
-    repaired_code = repair_plot_code(
-        visualization_task=visualization_task,
-        data_context=data_context,
-        execution_result=source_execution_result,
-        code=code,
-        error=error,
-    llm=model_for(state, "plot_repair")
+    chart_id = visualization_task[
+        "chart_id"
+    ]
+
+    repaired_code, _ops, _extra = _agent_call(
+        "plot_repair",
+        chart_id,
+        lambda: repair_plot_code(
+            visualization_task=visualization_task,
+            data_context=data_context,
+            execution_result=source_execution_result,
+            code=code,
+            error=error,
+            llm=model_for("plot_repair"),
+        ),
     )
 
     plot_retry_count = state.get(
@@ -1391,5 +1835,7 @@ def plot_repair_node(
 
     return {
         "current_plot_code": repaired_code,
-        "plot_retry_count": plot_retry_count
+        "plot_retry_count": plot_retry_count,
+        "completed_operations": _ops,
+        **_extra,
     }

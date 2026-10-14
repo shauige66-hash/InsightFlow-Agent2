@@ -8,6 +8,8 @@ from fastapi import (
     UploadFile as FastAPIUploadFile,
 )
 from services.analysis_service import run_analysis
+from core.llm import build_model_factory
+from api_runs import register_run_routes
 from pathlib import Path
 import shutil
 from utils.run_logger import create_run_id
@@ -51,6 +53,9 @@ app = FastAPI(
     ),
     version="0.1.0"
 )
+
+# 持久化 Run 生命周期接口（创建 / 查询 / 恢复 / 审批）
+register_run_routes(app)
 
 # 把 Agent 执行结果转换为 FastAPI 可以返回的 JSON 数据。
 def make_json_safe(
@@ -243,7 +248,9 @@ def analyze_upload(
             data_sources=data_sources,
             analysis_focus=analysis_focus,
             knowledge_sources=knowledge_sources,
-            run_id=run_id
+            run_id=run_id,
+            # 兼容路径同样显式注入模型工厂：run_id 会作为追踪头传给 ModelGate
+            model_factory=build_model_factory(run_id)
         )
 
     except Exception as error:

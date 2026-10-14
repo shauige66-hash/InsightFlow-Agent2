@@ -5,7 +5,6 @@ from typing import Any, Literal
 from langchain_core.output_parsers import JsonOutputParser
 from langchain_core.language_models import BaseChatModel
 from langchain_core.prompts import PromptTemplate
-from core.llm import create_llm
 from state import AnalysisTask
 from utils.llm_retry import invoke_json_with_retry
 

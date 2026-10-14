@@ -7,6 +7,7 @@ from nodes import (
     knowledge_retrieval_node,
     context_node,
     planner_node,
+    approval_gate_node,
     router_node,
     execution_node,
     tool_execution_node,
@@ -29,14 +30,15 @@ from conditions import (
     route_after_execution,
     route_after_critic,
     route_after_advance,
-    route_after_planner,
+    route_after_approval,
+    route_to_approval,
     route_after_plot_execution,
     route_after_chart_advance,
     route_after_visualization_plan,
 )
 
 
-def create_workflow():
+def create_workflow(checkpointer=None):
 
     graph = StateGraph(
         InsightFlowState
@@ -60,6 +62,11 @@ def create_workflow():
     graph.add_node(
         "planner",
         planner_node
+    )
+
+    graph.add_node(
+        "approval_gate",
+        approval_gate_node
     )
 
     graph.add_node(
@@ -163,10 +170,23 @@ def create_workflow():
 
     graph.add_conditional_edges(
         "planner",
-        route_after_planner,
+        route_to_approval,
         {
+            "approval_gate": "approval_gate",
             "router": "router",
             "complete": "visualization_planner",
+        }
+    )
+
+    # 审批关口在 router 之前：此时尚无任何副作用，中断可安全重放。
+    # 拒绝时直接结束，不再生成报告——被拒绝的分析不该产出交付物，
+    # 否则"拒绝"只阻止了执行却仍然留下一份报告。
+    graph.add_conditional_edges(
+        "approval_gate",
+        route_after_approval,
+        {
+            "router": "router",
+            "complete": END,
         }
     )
 
@@ -273,4 +293,6 @@ def create_workflow():
         END
     )
 
-    return graph.compile()
+    # checkpointer 为 None 时退化为无持久化执行（单次脚本调用）；
+    # 传入 SqliteSaver 等实现后，同一 thread_id 可跨进程恢复。
+    return graph.compile(checkpointer=checkpointer)
