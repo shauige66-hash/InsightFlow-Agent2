@@ -19,6 +19,7 @@ RunnableConfig 的字段名（configurable / callbacks / tags …）当成图通
 from __future__ import annotations
 
 import contextvars
+import os
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -27,9 +28,70 @@ from typing import Any, Iterator
 from core.llm import ModelFactory
 from ingestion.resources import ResourceResolver
 
+# 私有配置根目录相对 output_root 的后缀。
+# 用后缀而不是固定子目录名：与 output_root 平级，任何 run_id 都无法与它重叠。
+PRIVATE_ROOT_SUFFIX = ".mcp_private"
+
 
 class RuntimeContextMissing(RuntimeError):
     """节点在缺少运行期上下文时被调用。"""
+
+
+class PrivatePathConflict(ValueError):
+    """私有配置路径落在了会被挂载进沙箱的目录树之内。"""
+
+
+def _normalized(path: Path) -> str:
+    """用于目录归属比较的规范化路径。
+
+    Windows 上路径大小写不敏感，`is_relative_to` 却是按字符串比较的，
+    因此必须统一大小写；`resolve()` 负责把符号链接与 `..` 展开，
+    避免用别名绕过归属检查。
+    """
+    return os.path.normcase(str(Path(path).resolve()))
+
+
+def _is_inside(candidate: Path, parent: Path) -> bool:
+    """candidate 是否位于 parent 之内（含两者相同）。"""
+    normalized_candidate = _normalized(candidate)
+    normalized_parent = _normalized(parent)
+
+    if normalized_candidate == normalized_parent:
+        return True
+    return normalized_candidate.startswith(
+        normalized_parent.rstrip("\\/") + os.sep
+    )
+
+
+def _reject_if_inside(candidate: Path, parent: Path, *, what: str) -> None:
+    if _is_inside(candidate, parent):
+        raise PrivatePathConflict(
+            f"{what}不能位于 {parent} 之内（当前为 {candidate}）："
+            "该目录树会被只读挂载进执行沙箱，"
+            "且 run_id 与子目录名重叠时会造成跨 Run 配置泄漏。"
+        )
+
+
+@dataclass
+class McpSettings:
+    """MCP 后端配置。属于**可信运行期配置**，不由模型控制。
+
+    `mode` 只有 `direct` 与 `mcp` 两种，且必须显式指定：
+    没有"自动挑一个"的默认值，因为那会在通道不通时把失败悄悄变成另一种执行路径。
+    """
+
+    mode: str = "direct"
+    # 用于定位 Server 配置与 workspace 边界；不指定时由 RunRuntime.output_root 推导
+    workspace_root: Path | None = None
+    # 私有配置根目录；不指定时为 `<output_root>/mcp_private`（在任何 Run 目录之外）
+    private_root: Path | None = None
+    startup_timeout: float = 60.0
+    call_timeout: float = 60.0
+    server_module: str = "mcp_bridge.server"
+
+    def __post_init__(self) -> None:
+        if self.mode not in ("direct", "mcp"):
+            raise ValueError(f"不支持的 MCP 后端模式：{self.mode}")
 
 
 @dataclass
@@ -46,8 +108,52 @@ class RunRuntime:
     # 因此放在运行期依赖里而不是 state。
     unconfirmed_llm_calls: list[str] = field(default_factory=list)
 
+    # MCP 后端配置。Client / Session / 子进程句柄不放在这里，
+    # 由每次工具调用按需创建并立即回收——会话不能跨越 Checkpoint 存活。
+    mcp: McpSettings = field(default_factory=McpSettings)
+
     def output_dir(self) -> Path:
         return self.output_root / self.run_id
+
+    def workspace_root(self) -> Path:
+        """Server 允许触达的目录边界。"""
+        if self.mcp.workspace_root is not None:
+            return Path(self.mcp.workspace_root)
+        return Path(self.output_root)
+
+    def mcp_private_root(self) -> Path:
+        """MCP 私有配置的根目录。
+
+        刻意**不放在** `<output_root>` 之内，理由有两层：
+
+        1. P2-A 的 `DockerSandboxExecutor` 把 `<output_root>/<run_id>` 只读挂载为
+           `/history`。放在 output_root 里就等于把 Server 配置交给沙箱里的模型代码
+           （实测用 pandas 就能读到宿主绝对路径）。
+        2. 更要紧的是**目录重叠**：`run_id` 由调用方指定，而 `api_runs` 的
+           `RUN_ID_PATTERN` 合法接受 `mcp_private` 这个名字。一旦某个 Run 的 id
+           就叫 `mcp_private`，它的 run 目录就**等于**私有根目录，
+           `/history` 会列出**所有** Run 的私有配置——这是实测可复现的跨 Run 泄漏。
+
+        因此默认取 `<output_root>.mcp_private`：与 output_root **平级**，
+        既不在 output_root 之内，也不在任何 Run 的挂载范围内。
+        """
+        if self.mcp.private_root is not None:
+            root = Path(self.mcp.private_root)
+        else:
+            root = Path(str(self.output_root) + PRIVATE_ROOT_SUFFIX)
+
+        # 显式配置也必须守规矩：落到 output_root 之内就拒绝。
+        # 不这样做的话，`private_root=<output_root>/mcp_private` 这类写法会
+        # 把上面第 2 条的重叠问题原样带回来。
+        _reject_if_inside(
+            root,
+            Path(self.output_root),
+            what="MCP 私有配置根目录",
+        )
+        return root
+
+    def mcp_config_path(self) -> Path:
+        return self.mcp_private_root() / self.run_id / "authorizations.json"
 
 
 _current_runtime: contextvars.ContextVar[RunRuntime | None] = contextvars.ContextVar(

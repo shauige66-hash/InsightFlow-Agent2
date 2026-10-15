@@ -56,9 +56,54 @@ def available_tools() -> tuple[str, ...]:
     return tuple(TOOL_BUILDERS)
 
 
-def _get_tool(tool_name: str, tables: dict[str, TableResource]) -> Any:
+def resolve_backend(tool_name: str) -> str:
+    """决定这个工具本次走哪个后端。
+
+    只有 SQL 有后端之分：Python/Plot 一律走 Docker 沙箱（P2-A 已定）。
+    后端来自**可信运行期配置**，不是模型参数——模型无法通过输入把 SQL
+    从 mcp 切回 direct，也无法反过来。
+
+    取不到运行期上下文时按 direct 处理：那是"没有配置"而不是"配置失败"，
+    单元测试与离线调用都属于这种情况。
+    """
+    if tool_name != "sql":
+        return "sandbox"
+
+    from core.runtime import RuntimeContextMissing, current_runtime
+
+    try:
+        return current_runtime().mcp.mode
+    except RuntimeContextMissing:
+        return "direct"
+
+
+def _sql_builder_for(backend: str) -> Callable[[dict[str, TableResource]], Any]:
+    if backend == "mcp":
+        from tools.mcp_sql_tool import create_mcp_sql_tool
+
+        return create_mcp_sql_tool
+    return create_sql_tool
+
+
+def _get_tool(
+    tool_name: str,
+    tables: dict[str, TableResource],
+    snapshots: dict[str, Any] | None = None,
+) -> Any:
+    backend = resolve_backend(tool_name)
+
+    if tool_name == "sql" and backend == "mcp":
+        from tools.mcp_sql_tool import create_mcp_sql_tool
+
+        # MCP 后端的授权来自 P1 的权威快照，因此它按 Run 的 state 构造，
+        # 不参与按数据集指纹的缓存：快照变化必须带来新的授权。
+        return create_mcp_sql_tool(tables, snapshots=snapshots)
+
     builder = TOOL_BUILDERS[tool_name]
-    key = (tool_name, _tables_fingerprint(tables))
+
+    # 后端要进缓存键：否则同一批数据在 direct/mcp 之间切换时会拿到旧工具，
+    # 实际执行路径与配置不一致。
+    key = (tool_name, backend, _tables_fingerprint(tables))
 
     tool = _TOOL_CACHE.get(key)
     if tool is None:
@@ -101,17 +146,22 @@ def invoke_tool(
     tool_name: str,
     tables: dict[str, TableResource],
     arguments: dict[str, Any],
+    *,
+    snapshots: dict[str, Any] | None = None,
 ) -> Result:
     """调用工具并保证不抛异常。
 
     参数校验失败与执行失败在调用方看来都是 `success=False`，
     但 `error_kind` 保留了"是否值得重试"的信息。
+
+    `snapshots` 是本次 Run 的权威数据快照（state 里的 `table_snapshot`），
+    MCP 后端用它确定授权集合；direct 后端忽略它。
     """
     if tool_name not in TOOL_BUILDERS:
         return _failure(ValueError(f"Unsupported tool: {tool_name}"), "unsupported_tool")
 
     try:
-        return _normalize(_get_tool(tool_name, tables).invoke(arguments))
+        return _normalize(_get_tool(tool_name, tables, snapshots).invoke(arguments))
     except Exception as error:  # noqa: BLE001 - 工具失败统一转为结果
         return _failure(error)
 

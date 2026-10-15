@@ -391,7 +391,15 @@ def tool_execution_node(
         else {"table_names": task["target_tables"], "query": code}
     )
 
-    execution = invoke_tool(tool, resolve_tables(state), arguments)
+    # 权威数据快照一并传入：MCP 后端据此确定授权集合（哪些 dataset_id 可见），
+    # direct 后端忽略它。不传的话 MCP 只能按本次点名的表临时授权，
+    # 与 P1 的"数据源变化必须失败"语义脱节。
+    execution = invoke_tool(
+        tool,
+        resolve_tables(state),
+        arguments,
+        snapshots=state.get("table_snapshot") or {},
+    )
 
     run_id = state.get("run_id")
 

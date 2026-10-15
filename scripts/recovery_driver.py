@@ -34,6 +34,7 @@ from langgraph.types import Command  # noqa: E402
 
 from core.config import Settings  # noqa: E402
 from core.llm import CallContext, ModelFactory  # noqa: E402
+from core.runtime import McpSettings  # noqa: E402
 from ingestion.resources import ResourceResolver  # noqa: E402
 from services.analysis_service import read_run_state, run_analysis  # noqa: E402
 
@@ -48,6 +49,10 @@ _PLOT_CODE = (
     "fig.savefig(output_path)\n"
     "result = output_path\n"
 )
+
+# 执行 SQL 任务的代码（走 SQL 工具，用于验证 SQL 与 MCP 链路）。
+# 查 orders 表而不是 customers：SQLite 测试库里的物理表名是 orders。
+_SQL_CODE = "SELECT COUNT(*) AS n FROM orders"
 
 REPLIES: dict[str, Any] = {
     "planner": {
@@ -255,6 +260,23 @@ def main() -> int:
     )
     parser.add_argument("--decision", default="approve")
     parser.add_argument(
+        "--target-table",
+        default="customers",
+        help="planner 里 task 的目标表名；SQLite 资源的键是 <文件名>.<表名>",
+    )
+    parser.add_argument(
+        "--sql-task",
+        action="store_true",
+        default=False,
+        help="把目标任务改成 SQL 查询，用于验证 SQL / MCP 链路",
+    )
+    parser.add_argument(
+        "--mcp-mode",
+        choices=("direct", "mcp"),
+        default="direct",
+        help="SQL 后端模式；恢复时必须与首次运行一致",
+    )
+    parser.add_argument(
         "--grant-llm-retry",
         action="store_true",
         default=False,
@@ -265,6 +287,17 @@ def main() -> int:
     workdir = Path(args.workdir).resolve()
     workdir.mkdir(parents=True, exist_ok=True)
     checkpoint_db = workdir / "checkpoints.sqlite"
+
+    # 目标表名随数据源形态变化：CSV 是文件名，SQLite 是 <文件名>.<表名>
+    REPLIES["planner"]["tasks"][0]["target_tables"] = [args.target_table]
+    REPLIES["visualizer"]["charts"][0]["target_tables"] = [args.target_table]
+
+    if args.sql_task:
+        # 换成 SQL 任务：router 按 source_type 选 sql 工具，
+        # 因此这条路径会经过 SQL 后端（direct 或 mcp）
+        REPLIES["executor"] = {"code": _SQL_CODE}
+        REPLIES["repair"] = {"code": _SQL_CODE}
+        REPLIES["refine"] = {"code": _SQL_CODE}
 
     if args.fail_first_execution:
         # 首次生成的代码抛错 → 路由到 repair；修复给出的代码可正常执行。
@@ -301,6 +334,7 @@ def main() -> int:
                 resolver=ResourceResolver(),
                 output_root=workdir,
                 require_plan_approval=args.require_approval,
+                mcp=McpSettings(mode=args.mcp_mode),
             )
             print(json.dumps(_summarize(result), ensure_ascii=False, default=str))
             return 0
@@ -321,6 +355,7 @@ def main() -> int:
                 output_root=workdir,
                 continue_from_checkpoint=True,
                 resume_value=grants,
+                mcp=McpSettings(mode=args.mcp_mode),
             )
             print(json.dumps(_summarize(result), ensure_ascii=False, default=str))
             return 0
@@ -335,6 +370,7 @@ def main() -> int:
                 output_root=workdir,
                 resume=Command(resume={"decision": args.decision}),
                 require_plan_approval=True,
+                mcp=McpSettings(mode=args.mcp_mode),
             )
             print(json.dumps(_summarize(result), ensure_ascii=False, default=str))
             return 0

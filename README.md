@@ -20,6 +20,7 @@ InsightFlow 是一个基于 LangGraph 和 LangChain 构建的 Agentic 数据分�
 - 自动代码生成与执行
 - Python 与绘图代码在一次性 Docker 容器中执行（只读根、无网络、资源受限）
 - 只读 SQL 查询（词法校验 + SQLite Authorizer + 只读连接 + 时间与结果上限）
+- SQL 可按运行期配置选择 direct 或经 MCP Server（stdio）执行，两者共用同一套防护
 - 执行失败自动 Repair 与 Retry
 - 基于 Critic Agent 的分析逻辑验证
 - 分析结果自动 Refine
@@ -178,6 +179,7 @@ insightflow-agent/
 ├── ingestion/     # CSV / Excel / SQLite 数据加载
 ├── knowledge/     # 示例业务知识
 ├── rag/           # Business Knowledge RAG
+├── mcp_bridge/    # MCP Server / Client（stdio）与 Run 级数据授权
 ├── sandbox/       # Docker 执行沙箱（镜像、宿主执行器、容器入口）
 ├── services/      # 分析服务层
 ├── tools/         # Python / SQL / Plot 工具
@@ -213,6 +215,7 @@ insightflow-agent/
 ├── ingestion/     # CSV / Excel / SQLite 数据加载
 ├── knowledge/     # 示例业务知识
 ├── rag/           # Business Knowledge RAG
+├── mcp_bridge/    # MCP Server / Client（stdio）与 Run 级数据授权
 ├── sandbox/       # Docker 执行沙箱（镜像、宿主执行器、容器入口）
 ├── services/      # 分析服务层
 ├── tools/         # Python / SQL / Plot 工具
@@ -338,6 +341,11 @@ http://127.0.0.1:8000/docs
 - SQL 查询已增加纵深防护（词法校验、SQLite Authorizer、只读连接、
   查询超时与结果行数/字节上限），但**仍在宿主进程内执行**，
   隔离强度低于 Python / Plot 的容器沙箱。
+- MCP 已支持：SQL 可经独立 MCP Server 子进程（stdio）执行。
+  该 Server 是宿主上的普通进程，**不是安全沙箱**；当前只暴露只读工具，
+  传输未实现 HTTP/SSE。
+- MCP 模式目前**只能程序化使用**（`run_analysis(mcp=...)`）；
+  FastAPI 的 `/runs` 尚未暴露后端选择，API 发起的 Run 一律使用 direct。
 - 上传文件和生成的分析产物目前保存在本地文件系统。
 - 当前 API 暂未实现用户认证、权限控制和多用户隔离。
 - RAG 检索阈值目前基于实验结果设定，还没有经过大规模 Benchmark 验证。
@@ -349,7 +357,7 @@ http://127.0.0.1:8000/docs
 - 把 SQL 执行迁入受限容器或独立进程
 - 持久化向量数据库
 - LangSmith 工作流追踪与可观测性
-- MCP（Model Context Protocol）工具接入
+- 把 MCP 后端选择接入 FastAPI /runs（当前仅支持程序化调用）
 - RAG 与 Agent 分析质量 Benchmark
 - 异步分析任务和后台执行
 - 实时工作流进度推送
@@ -496,7 +504,8 @@ Users can upload structured datasets and optional business knowledge documents. 
 - Python and plotting code executed in one-shot Docker containers
   (read-only root, no network, resource-limited)
 - Read-only SQL queries (lexical guard, SQLite authorizer, read-only connection,
-  query timeout and result row/byte limits)
+  query timeout and result row/byte limits), runnable through a direct host path or
+  through an MCP server subprocess over stdio, sharing the same protections
 - Automatic execution repair and retry
 - Critic-based analytical validation
 - Automatic result refinement
@@ -781,6 +790,12 @@ insightflow-agent/
 │   ├── retriever.py
 │   └── vector_store.py
 │
+├── mcp_bridge/
+│   ├── contract.py
+│   ├── server.py
+│   ├── client.py
+│   └── registry.py
+│
 ├── sandbox/
 │   ├── Dockerfile
 │   ├── requirements.lock
@@ -808,6 +823,7 @@ insightflow-agent/
 │   ├── p1-delivery.md
 │   ├── p2a-delivery.md
 │   ├── p2b-delivery.md
+│   ├── p2c-delivery.md
 │   └── assets/
 │       ├── insightflow-architecture.png
 │       └── insightflow-architecture-zh.png
@@ -936,6 +952,11 @@ Current limitations include:
 - SQL queries are hardened (lexical guard, SQLite authorizer, read-only connection,
   query timeout and result row/byte limits) but still execute **inside the host process**,
   with weaker isolation than the Python/Plot container sandbox.
+- MCP is supported: SQL can run through a separate MCP server subprocess over stdio.
+  That server is an ordinary host process and is **not a security sandbox**; it currently
+  exposes read-only tools only, and HTTP/SSE transports are not implemented.
+- MCP mode is currently **programmatic only** (`run_analysis(mcp=...)`); the FastAPI
+  `/runs` endpoint does not yet expose backend selection and always uses direct.
 - Uploaded files and generated artifacts are stored on the local filesystem.
 - The current API does not include authentication, authorization, or multi-user isolation.
 - Retrieval thresholds are currently based on empirical testing rather than a large-scale retrieval benchmark.
@@ -947,7 +968,7 @@ Planned improvements include:
 - moving SQL execution into a restricted container or a separate process
 - persistent vector database support
 - LangSmith tracing and workflow observability
-- MCP (Model Context Protocol) tool integration
+- expose MCP backend selection through the FastAPI /runs endpoint
 - retrieval and agent-quality benchmarks
 - asynchronous analysis jobs and background execution
 - real-time workflow progress streaming

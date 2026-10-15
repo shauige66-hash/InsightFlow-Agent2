@@ -9,7 +9,12 @@ from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.types import Command
 
 from core.llm import ModelFactory
-from core.runtime import RunRuntime, build_thread_config, use_runtime
+from core.runtime import (
+    McpSettings,
+    RunRuntime,
+    build_thread_config,
+    use_runtime,
+)
 from ingestion.resources import ResourceResolver
 from utils.idempotency import LlmCallAbandoned
 from utils.run_logger import create_run_id, log_event
@@ -65,6 +70,7 @@ def run_analysis(
     require_plan_approval: bool = False,
     continue_from_checkpoint: bool = False,
     resume_value: Any | None = None,
+    mcp: McpSettings | None = None,
 ) -> dict[str, Any]:
     """执行（或恢复）一次完整分析。
 
@@ -89,6 +95,9 @@ def run_analysis(
         resolver=resolver or ResourceResolver(),
         output_root=Path(output_root),
         unconfirmed_llm_calls=_unconfirmed_llm_calls(run_id, Path(output_root)),
+        # MCP 后端属于可信运行期配置：默认 direct，只有调用方显式指定才走 MCP。
+        # 它不进 state，因此恢复时会重新构造，不会把上次的进程状态带过来。
+        mcp=mcp or McpSettings(),
     )
 
     workflow = create_workflow(checkpointer=checkpointer)

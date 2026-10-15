@@ -220,14 +220,14 @@ class TestAuthorizerBlocksDangerousOperations:
         连接刻意不用 mode=ro：这样"写入被拒绝"只可能来自 Authorizer，
         而不是只读文件系统兜底。
         """
-        from tools.sql_tool import _make_authorizer
+        from utils.sql_policy import make_authorizer
 
         path = tmp_path / "writable.sqlite"
         build_database(path)
         before = database_fingerprint(path)
 
         connection = sqlite3.connect(path)  # 读写模式
-        authorizer, denials = _make_authorizer(ALLOWED)
+        authorizer, denials = make_authorizer(ALLOWED)
         connection.set_authorizer(authorizer)
         try:
             with pytest.raises(sqlite3.DatabaseError):
@@ -263,9 +263,9 @@ class TestAuthorizerBlocksDangerousOperations:
     )
     def test_authorizer_denies_every_write_related_action(self, action: str) -> None:
         """逐个操作码验证：写、DDL、ATTACH/DETACH、PRAGMA、事务一律 DENY。"""
-        from tools.sql_tool import _make_authorizer
+        from utils.sql_policy import make_authorizer
 
-        authorizer, denials = _make_authorizer(ALLOWED)
+        authorizer, denials = make_authorizer(ALLOWED)
         code = getattr(sqlite3, action)
 
         result = authorizer(code, "orders", None, "main", None)
@@ -279,18 +279,18 @@ class TestAuthorizerBlocksDangerousOperations:
     )
     def test_authorizer_allows_the_read_actions(self, action: str) -> None:
         """只读查询必需的操作码必须放行，否则正常查询会被挡掉。"""
-        from tools.sql_tool import _make_authorizer
+        from utils.sql_policy import make_authorizer
 
-        authorizer, _denials = _make_authorizer(ALLOWED)
+        authorizer, _denials = make_authorizer(ALLOWED)
 
         assert authorizer(getattr(sqlite3, action), "orders", None, "main", None) == (
             sqlite3.SQLITE_OK
         )
 
     def test_authorizer_denies_unauthorized_table_read(self) -> None:
-        from tools.sql_tool import _make_authorizer
+        from utils.sql_policy import make_authorizer
 
-        authorizer, denials = _make_authorizer(ALLOWED)
+        authorizer, denials = make_authorizer(ALLOWED)
 
         result = authorizer(sqlite3.SQLITE_READ, "secrets", "value", "main", None)
 
@@ -298,9 +298,9 @@ class TestAuthorizerBlocksDangerousOperations:
         assert any("secrets" in reason for reason in denials)
 
     def test_authorizer_denies_metadata_table_read(self) -> None:
-        from tools.sql_tool import _make_authorizer
+        from utils.sql_policy import make_authorizer
 
-        authorizer, denials = _make_authorizer(ALLOWED)
+        authorizer, denials = make_authorizer(ALLOWED)
 
         result = authorizer(sqlite3.SQLITE_READ, "sqlite_master", "name", "main", None)
 
@@ -308,9 +308,9 @@ class TestAuthorizerBlocksDangerousOperations:
         assert any("元数据" in reason for reason in denials)
 
     def test_authorizer_allows_authorized_table_read(self) -> None:
-        from tools.sql_tool import _make_authorizer
+        from utils.sql_policy import make_authorizer
 
-        authorizer, denials = _make_authorizer(ALLOWED)
+        authorizer, denials = make_authorizer(ALLOWED)
 
         result = authorizer(sqlite3.SQLITE_READ, "orders", "amount", "main", None)
 

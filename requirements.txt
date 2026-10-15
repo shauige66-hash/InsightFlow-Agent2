@@ -19,3 +19,6 @@ langchain-text-splitters
 langchain-huggingface
 sentence-transformers
 numpy
+# MCP SDK（P2-C：SQL 可经独立 MCP Server 子进程执行）。
+# 固定 1.x 线：2.x 把 FastMCP 改名为 MCPServer，迁移需单独评估。
+mcp==1.30.0

@@ -224,6 +224,10 @@ __pycache__/
 # InsightFlow generated outputs
 outputs/
 
+# MCP 私有配置目录（与 output_root 平级，如 outputs.mcp_private/）。
+# 里面是宿主绝对路径与数据集指纹，绝不能进版本控制。
+*.mcp_private/
+
 # InsightFlow uploaded data
 uploads/
 

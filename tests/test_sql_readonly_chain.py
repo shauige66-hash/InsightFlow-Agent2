@@ -228,9 +228,9 @@ class TestConnectionIsActuallyReadOnly:
     """第二层防护：即使绕过词法校验，连接本身也必须拒绝写入。"""
 
     def test_read_only_uri_rejects_writes(self, sqlite_db: Path) -> None:
-        from tools.sql_tool import _read_only_uri
+        from utils.sql_policy import read_only_uri
 
-        uri = _read_only_uri(str(sqlite_db))
+        uri = read_only_uri(str(sqlite_db))
         assert "mode=ro" in uri
 
         with sqlite3.connect(uri, uri=True) as connection:
@@ -263,22 +263,32 @@ class TestConnectionIsActuallyReadOnly:
 
 class TestGuardIsWiredIntoTheChain:
     def test_sql_tool_module_uses_the_guard(self) -> None:
-        """确认 sql_tool 真的调用了只读校验，而不是只有独立测试通过。"""
+        """确认只读校验确实接在执行链路上，而不是只有独立测试通过。
+
+        P2-C 把策略本体抽到 `utils/sql_policy.py`（MCP Server 必须复用同一份），
+        因此这里分两处核对：工具侧必须调用共享策略入口，
+        策略侧必须真的装上 Authorizer、超时与有界读取。
+        """
         from pathlib import Path as _Path
 
-        source = (
-            _Path(__file__).resolve().parent.parent / "tools" / "sql_tool.py"
-        ).read_text(encoding="utf-8")
+        root = _Path(__file__).resolve().parent.parent
+        tool_source = (root / "tools" / "sql_tool.py").read_text(encoding="utf-8")
+        policy_source = (root / "utils" / "sql_policy.py").read_text(encoding="utf-8")
 
-        assert "ensure_read_only" in source
-        assert "mode=ro" in source
-        # P2-B2 增加的第二层：Authorizer 与查询时间预算必须真的接在工具里，
-        # 而不只是存在于独立测试中
-        assert "set_authorizer" in source
-        assert "set_progress_handler" in source
-        assert "fetchmany" in source
+        # 工具侧：走共享策略，且不自行实现只读判定
+        assert "execute_readonly_sql" in tool_source
+        assert "SqlNotReadOnly" in tool_source
+
+        # 策略侧：三层硬防护 + 有界读取必须真的实现
+        assert "ensure_read_only" in policy_source
+        assert "mode=ro" in policy_source
+        assert "set_authorizer" in policy_source
+        assert "set_progress_handler" in policy_source
+        assert "fetchmany" in policy_source
+
         # 旧的弱校验（仅前缀判断）不应再作为唯一防线
-        assert 'startswith(\n            ("select", "with")' not in source
+        assert 'startswith(\n            ("select", "with")' not in tool_source
+        assert 'startswith(\n            ("select", "with")' not in policy_source
 
     def test_registry_reports_rejection_not_exception(self, tables) -> None:
         """参数与安全类错误都应以结果字典返回，便于修复循环处理。"""
