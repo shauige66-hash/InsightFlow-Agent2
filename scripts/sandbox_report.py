@@ -55,6 +55,8 @@ def main() -> int:
         "tests/test_sandbox_integration.py",
         "tests/test_sandbox_write_restriction.py",
         "tests/test_error_classification.py",
+        # P2-B3：大结果经沙箱绘图，其中一项真实启动容器
+        "tests/test_large_result_consumers.py",
     }
 
     buckets: dict[str, list[str]] = defaultdict(list)

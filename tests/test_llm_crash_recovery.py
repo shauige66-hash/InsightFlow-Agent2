@@ -25,6 +25,16 @@ DRIVER = PROJECT_ROOT / "scripts" / "recovery_driver.py"
 PYTHON = sys.executable
 
 
+def plotter_operation(run_id: str, chart_id: str, chart_index: int = 0) -> str:
+    """绘图 Agent 的模型调用操作 ID。
+
+    P2-B1 起 subject 带上逻辑尝试序号：绘图节点用图表序号作区分
+    （`attempt_subject(chart_id, index)`），因此 ID 末尾是 `#<index>`。
+    这里集中构造，避免测试里散落拼接字符串。
+    """
+    return f"{run_id}:llm:plotter:{chart_id}#{chart_index}"
+
+
 def run_phase(
     phase: str,
     *,
@@ -136,7 +146,7 @@ class TestScenario1CrashBeforeRequest:
 
         # 账本仍记录了"已开始"——这正是它优于 Checkpoint 的地方
         summary = ledger_summary(workdir, run_id)
-        assert f"{run_id}:llm:plotter:chart_1" in summary["unconfirmed_operations"]
+        assert plotter_operation(run_id, "chart_1") in summary["unconfirmed_operations"]
 
     def test_resume_pauses_instead_of_resending(self, workspace) -> None:
         """未确认的调用默认不重发：暂停等人工决定。"""
@@ -160,7 +170,7 @@ class TestScenario1CrashBeforeRequest:
         assert resumed.get("interrupted") is True, "未确认的调用应当暂停等待决定"
         pending = resumed["pending_approval"]
         assert pending["kind"] == "llm_replay"
-        assert f"{run_id}:llm:plotter:chart_1" in pending["summary"]["operations"]
+        assert plotter_operation(run_id, "chart_1") in pending["summary"]["operations"]
 
         # 关键：没有向上游重发任何请求
         assert upstream_calls(workdir) == before_total
@@ -261,7 +271,7 @@ class TestScenario2CrashAfterRequestBeforePersist:
         summary = ledger_summary(workdir, run_id)
 
         assert summary["total_started"] == summary["total_completed"] + 1
-        assert f"{run_id}:llm:plotter:chart_1" in summary["unconfirmed_operations"]
+        assert plotter_operation(run_id, "chart_1") in summary["unconfirmed_operations"]
 
     def test_works_for_executor_too(self, workspace) -> None:
         """Executor 同样被覆盖，不只是 Plotter。"""

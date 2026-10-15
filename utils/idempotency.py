@@ -86,10 +86,36 @@ def report_approval_id(run_id: str) -> str:
 def llm_operation(run_id: str, node: str, subject: str) -> str:
     """一次模型调用的逻辑身份。
 
-    subject 用来区分同一节点针对不同任务/图表的调用；
-    不包含尝试序号——重试属于同一次逻辑调用，由 Agent 内部处理。
+    subject 用来区分同一节点针对不同任务/图表的调用，也必须包含**逻辑尝试
+    序号**：修复/精修/绘图修复都会在同一节点里反复调用同一个 Agent，若 subject
+    只有 task_id / chart_id，第二次尝试会算出与第一次相同的操作 ID，被
+    `already_done` 当成同一次调用而直接复用旧结果——即"修复循环空转"。
+
+    拼接请用 `attempt_subject()`，避免各处自行拼出不一致的格式。
     """
     return operation_id(run_id, "llm", node, subject)
+
+
+# 逻辑尝试标识的前缀。放在 subject 里而不是只传给账本，是为了让
+# operation_id 本身就能区分尝试：声明式幂等登记、账本核对、日志都看同一个值。
+_ATTEMPT_MARK = "#"
+
+
+def attempt_subject(base: str, *counters: int | None) -> str:
+    """把逻辑尝试序号编进 subject。
+
+    例如 `attempt_subject("task_1", 0, 1)` → `"task_1#r0f1"`。
+
+    为什么不用时间戳或随机数：恢复是从上一张 Checkpoint 重算操作 ID 的，
+    ID 必须可复现，否则幂等失效（见模块开头的说明）。
+    为什么把计数器写进字符串而不是只加一个数字：不同的循环用不同的计数器
+    （retry_count / refine_count / plot_retry_count），只写一个裸数字会让
+    "第 1 轮精修"与"第 1 轮修复"撞成同一个 ID。
+    """
+    if not counters or all(count is None for count in counters):
+        return base
+    token = "".join("_" if count is None else str(count) for count in counters)
+    return f"{base}{_ATTEMPT_MARK}{token}"
 
 
 class LlmCallAbandoned(RuntimeError):
@@ -170,8 +196,13 @@ def run_agent_call(
     node: str,
     subject: str,
     call: Any,
+    attempt: int = 1,
 ) -> tuple[Any, dict[str, dict[str, Any]], dict[str, Any]]:
     """执行一次 Agent 调用，并把它记入账本与幂等登记。
+
+    `subject` 必须已经用 `attempt_subject()` 带上逻辑尝试序号（对会重复调用的
+    节点而言），`attempt` 只用于账本上的人读标注——真正的幂等身份来自
+    `operation_id`。两者分开是因为账本的 attempt 字段不参与去重计算。
 
     返回 `(结果, 幂等登记, 额外 state 增量)`。第三个返回值不能省：
     获准重试时必须把 `pending_llm_calls` 清空写回 state，
@@ -199,13 +230,13 @@ def run_agent_call(
 
     ledger_root = _ledger_root()
     llm_ledger.record_started(
-        run_id=run_id, operation_id=op_id, node=node, attempt=1, root=ledger_root
+        run_id=run_id, operation_id=op_id, node=node, attempt=attempt, root=ledger_root
     )
 
     payload = call()
 
     llm_ledger.record_completed(
-        run_id=run_id, operation_id=op_id, node=node, attempt=1, root=ledger_root
+        run_id=run_id, operation_id=op_id, node=node, attempt=attempt, root=ledger_root
     )
 
     merged = completed_operations(state)

@@ -38,9 +38,16 @@ from utils.idempotency import (
     record,
     replay_guard,
     report_approval_id,
+    attempt_subject,
     run_agent_call,
 )
-from utils.result_artifacts import store_result
+from utils.result_artifacts import (
+    ResultArtifactError,
+    build_preview,
+    load_result,
+    store_result,
+    unwrap_records,
+)
 
 
 def _crash_point(name: str) -> None:
@@ -57,9 +64,17 @@ def _crash_point(name: str) -> None:
 
 
 def _agent_call(
-    agent: str, subject: str, invoke: Callable[[], Any]
+    agent: str,
+    subject: str,
+    invoke: Callable[[], Any],
+    *,
+    attempt: int = 1,
 ) -> tuple[Any, dict, dict]:
     """执行一次 Agent 调用，并取回该次调用的幂等登记与额外 state 增量。
+
+    `subject` 必须已经用 `attempt_subject()` 带上逻辑尝试序号（会重复调用的
+    节点），`attempt` 用于账本上的人读标注。两者分开的原因见
+    `utils/idempotency.run_agent_call`。
 
     节点在返回 state 增量时必须一并带上 `completed_operations` 与额外增量
     （例如清空 `pending_llm_calls`），否则这些记录不会进入 Checkpoint：
@@ -71,6 +86,7 @@ def _agent_call(
         node=agent,
         subject=subject,
         call=invoke,
+        attempt=attempt,
     )
 
 
@@ -301,6 +317,9 @@ def execution_node(
     []
     )
 
+    # execution_node 每个任务只进入一次：之后的代码由 repair / refine 产出
+    # （图上是 repair→tool_execution、refine→tool_execution，不再回到这里）。
+    # 因此这里保持 task_id 作为身份就足够，不需要尝试序号。
     code, _ops, _extra = _agent_call(
         "executor",
         task["task_id"],
@@ -495,9 +514,14 @@ def repair_node(
     if error is None:
         raise ValueError("Execution error is missing.")
 
+    # 本次修复的身份由**入站** retry_count 决定（首轮修复为 0）。
+    # 下面的 retry_count+1 是已修复几次的记账，不能拿来做操作 ID：
+    # 同一轮修复被 Checkpoint 重放时，入站值相同才算同一次逻辑调用。
+    repair_attempt = state.get("retry_count", 0)
+
     repaired_code, _ops, _extra = _agent_call(
         "repair",
-        task["task_id"],
+        attempt_subject(task["task_id"], repair_attempt),
         lambda: repair_execution_code(
             task=task,
             data_context=data_context,
@@ -507,6 +531,7 @@ def repair_node(
             retrieved_knowledge=retrieved_knowledge,
             llm=model_for("repair"),
         ),
+        attempt=repair_attempt + 1,
     )
 
     retry_count = state.get(
@@ -563,6 +588,48 @@ def get_final_visualization_results(
         final_results[item["chart_id"]] = item
 
     return list(final_results.values())
+
+
+def build_report_execution_previews(
+    execution_results: list[dict],
+    *,
+    run_id: str | None,
+    output_root: Path,
+) -> list[dict]:
+    """把执行结果转成报告 Agent 看得懂的**有界预览**。
+
+    报告只由 LLM 撰写，它需要的是"列名、行数、几条样本"，
+    而不是两万行记录。大结果在 state 里本来就只有摘要，这里把摘要与
+    （有界的）样本一起给它，并明确标注这是预览——
+    既避免把整份数据塞进 Prompt，也不让它误以为看到了全部数据。
+    """
+    previews: list[dict] = []
+
+    for item in execution_results:
+        preview = {
+            "task_id": item.get("task_id"),
+            "tool_used": item.get("tool_used"),
+            "success": item.get("success"),
+            "error": item.get("error"),
+            "attempt": {
+                "retry_count": item.get("retry_count"),
+                "refine_count": item.get("refine_count"),
+            },
+        }
+
+        if item.get("success"):
+            preview["result"] = build_preview(
+                item.get("result"),
+                item.get("result_artifact"),
+                run_id=run_id,
+                output_root=output_root,
+            )
+        else:
+            preview["result"] = None
+
+        previews.append(preview)
+
+    return previews
 
     
 
@@ -639,9 +706,13 @@ def critic_node(
 
     execution_result = state["execution_results"][-1]
 
+    # 每轮精修后都会重新评审同一个任务，因此评审身份必须带 refine_count：
+    # 否则第二轮评审会复用第一轮的结论，精修循环等于没有校验。
+    review_round = state.get("refine_count", 0)
+
     review, _ops, _extra = _agent_call(
         "critic",
-        task["task_id"],
+        attempt_subject(task["task_id"], review_round),
         lambda: review_execution_result(
             task=task,
             data_context=data_context,
@@ -649,6 +720,7 @@ def critic_node(
             retrieved_knowledge=retrieved_knowledge,
             llm=model_for("critic"),
         ),
+        attempt=review_round + 1,
     )
 
     run_id = state.get("run_id")
@@ -732,9 +804,11 @@ def refine_node(
             "Critic feedback is missing."
         )
 
+    refine_attempt = state.get("refine_count", 0)
+
     refined_code, _ops, _extra = _agent_call(
         "refine",
-        task["task_id"],
+        attempt_subject(task["task_id"], refine_attempt),
         lambda: refine_execution_code(
             task=task,
             data_context=data_context,
@@ -745,6 +819,7 @@ def refine_node(
             retrieved_knowledge=retrieved_knowledge,
             llm=model_for("refine"),
         ),
+        attempt=refine_attempt + 1,
     )
 
     refine_count = state.get(
@@ -927,7 +1002,13 @@ def report_node(
         "report",
         lambda: generate_analysis_report(
             analysis_plan=state["analysis_plan"],
-            execution_results=final_execution_results,
+            # 传给报告 Agent 的是**有界预览**而不是完整结果：
+            # 完整结果可能有两万行，塞进 Prompt 既超预算也误导模型。
+            execution_results=build_report_execution_previews(
+                final_execution_results,
+                run_id=state.get("run_id"),
+                output_root=current_runtime().output_root,
+            ),
             failed_tasks=state.get(
                 "failed_tasks",
                 []
@@ -1426,7 +1507,7 @@ def plot_generation_node(
 
     generation, _ops, _extra = _agent_call(
         "plotter",
-        chart_id,
+        attempt_subject(chart_id, index),
         lambda: generate_plot_code(
             visualization_task=visualization_task,
             data_context=data_context,
@@ -1551,13 +1632,31 @@ def plot_execution_node(
 
     # 绘图走与 Python 分析同一个执行后端：一次性 Docker 容器。
     # 产物路径由工具内部按运行期 output_root 决定，不再在这里拼路径。
+    # 绘图需要**真实数据**，而大结果在 state 里只留了摘要。
+    # 这里按产物引用把完整结果读回来，并校验归属、路径与 sha256：
+    # 直接把 `{"__kind__": "externalized"}` 摘要送进容器会画出一张空图，
+    # 而工作流不会报错——这正是 P2-B3 要修掉的静默错误。
+    # 读回的是 JSON 记录，仍不把完整内容写回 state。
+    try:
+        analysis_result = load_result(
+            source_execution_result.get("result"),
+            source_execution_result.get("result_artifact"),
+            run_id=state.get("run_id"),
+            output_root=current_runtime().output_root,
+        )
+    except ResultArtifactError as error:
+        return {
+            "plot_error": f"绘图所需的分析结果不可用：{error}",
+            "visualization_results": state.get("visualization_results", []),
+            "completed_operations": completed_operations(state),
+        }
+
+    # 绘图的 result_df 需要记录序列，而不是带 __kind__ 的信封。
     execution = invoke_tool("plot", resolve_tables(state), {
         "table_names": target_tables,
         "chart_id": chart_id,
         "code": code,
-        "analysis_result": (
-            source_execution_result["result"]
-        )
+        "analysis_result": unwrap_records(analysis_result),
     })
 
     visualization_result = {
@@ -1792,9 +1891,12 @@ def plot_repair_node(
         "chart_id"
     ]
 
+    # 与 repair 同理：本次绘图修复的身份由入站 plot_retry_count 决定。
+    plot_repair_attempt = state.get("plot_retry_count", 0)
+
     repaired_code, _ops, _extra = _agent_call(
         "plot_repair",
-        chart_id,
+        attempt_subject(chart_id, plot_repair_attempt),
         lambda: repair_plot_code(
             visualization_task=visualization_task,
             data_context=data_context,
@@ -1803,6 +1905,7 @@ def plot_repair_node(
             error=error,
             llm=model_for("plot_repair"),
         ),
+        attempt=plot_repair_attempt + 1,
     )
 
     plot_retry_count = state.get(

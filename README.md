@@ -18,11 +18,14 @@ InsightFlow 是一个基于 LangGraph 和 LangChain 构建的 Agentic 数据分�
 - 自动分析任务规划
 - Python / SQL 动态工具路由
 - 自动代码生成与执行
+- Python 与绘图代码在一次性 Docker 容器中执行（只读根、无网络、资源受限）
+- 只读 SQL 查询（词法校验 + SQLite Authorizer + 只读连接 + 时间与结果上限）
 - 执行失败自动 Repair 与 Retry
 - 基于 Critic Agent 的分析逻辑验证
 - 分析结果自动 Refine
 - 基于任务执行结果生成可视化
 - 绘图失败自动修复与重试
+- 大结果外置到产物文件，按引用安全恢复
 - 自动生成 Markdown、HTML 和 PDF 报告
 - 基于 FastAPI 的数据与知识文件上传接口
 - 按 Run 保存分析产物与运行日志
@@ -175,10 +178,11 @@ insightflow-agent/
 ├── ingestion/     # CSV / Excel / SQLite 数据加载
 ├── knowledge/     # 示例业务知识
 ├── rag/           # Business Knowledge RAG
+├── sandbox/       # Docker 执行沙箱（镜像、宿主执行器、容器入口）
 ├── services/      # 分析服务层
 ├── tools/         # Python / SQL / Plot 工具
 ├── utils/         # 报告、重试等通用工具
-├── docs/assets/   # README 架构图等资源
+├── docs/          # 架构说明与各阶段交付文档
 ├── data/          # 示例数据
 ├── api.py         # FastAPI 入口
 ├── main.py        # CLI Demo 入口
@@ -193,7 +197,8 @@ insightflow-agent/
 - `ingestion/`：负责加载 CSV、Excel 和 SQLite 数据
 - `context/`：负责生成适合 Agent 使用的数据上下文
 - `rag/`：负责业务知识文档加载、切分、Embedding、检索、相关性过滤和缓存
-- `tools/`：负责 Python、SQL 和绘图代码的实际执行
+- `tools/`：负责 Python、SQL 和绘图代码的调用与结果归一化
+- `sandbox/`：负责 Python 与绘图代码的容器化执行（镜像构建、宿主侧执行器、容器入口）
 - `services/`：封装完整分析流程，供 CLI 和 FastAPI 共同调用
 - `nodes.py`：定义 LangGraph 工作流中的节点逻辑
 - `workflow.py`：负责节点连接、条件路由和工作流构建
@@ -208,10 +213,11 @@ insightflow-agent/
 ├── ingestion/     # CSV / Excel / SQLite 数据加载
 ├── knowledge/     # 示例业务知识
 ├── rag/           # Business Knowledge RAG
+├── sandbox/       # Docker 执行沙箱（镜像、宿主执行器、容器入口）
 ├── services/      # 分析服务层
 ├── tools/         # Python / SQL / Plot 工具
 ├── utils/         # 报告、重试等通用工具
-├── docs/assets/   # README 架构图等资源
+├── docs/          # 架构说明与各阶段交付文档
 ├── data/          # 示例数据
 ├── api.py         # FastAPI 入口
 ├── main.py        # CLI Demo 入口
@@ -226,7 +232,8 @@ insightflow-agent/
 - `ingestion/`：负责加载 CSV、Excel 和 SQLite 数据
 - `context/`：负责生成适合 Agent 使用的数据上下文
 - `rag/`：负责业务知识文档加载、切分、Embedding、检索、相关性过滤和缓存
-- `tools/`：负责 Python、SQL 和绘图代码的实际执行
+- `tools/`：负责 Python、SQL 和绘图代码的调用与结果归一化
+- `sandbox/`：负责 Python 与绘图代码的容器化执行（镜像构建、宿主侧执行器、容器入口）
 - `services/`：封装完整分析流程，供 CLI 和 FastAPI 共同调用
 - `nodes.py`：定义 LangGraph 工作流中的节点逻辑
 - `workflow.py`：负责节点连接、条件路由和工作流构建
@@ -325,7 +332,12 @@ http://127.0.0.1:8000/docs
 
 - Vector Store 和缓存目前保存在进程内存中，服务重启后不会持久化。
 - 分析请求目前采用同步执行方式，复杂任务需要等待完整工作流结束后才能返回。
-- Python 执行虽然限制了部分内置能力，但还不是生产级安全沙箱。
+- Python 与绘图代码已在一次性 Docker 容器中执行（只读根、无网络、
+  资源与并发上限），但容器与宿主共享内核，**不是绝对安全保证**，
+  也受限于本机 Docker Desktop 的隔离能力。
+- SQL 查询已增加纵深防护（词法校验、SQLite Authorizer、只读连接、
+  查询超时与结果行数/字节上限），但**仍在宿主进程内执行**，
+  隔离强度低于 Python / Plot 的容器沙箱。
 - 上传文件和生成的分析产物目前保存在本地文件系统。
 - 当前 API 暂未实现用户认证、权限控制和多用户隔离。
 - RAG 检索阈值目前基于实验结果设定，还没有经过大规模 Benchmark 验证。
@@ -334,9 +346,10 @@ http://127.0.0.1:8000/docs
 
 未来可以进一步扩展：
 
-- 安全的 Python Sandbox 执行环境
+- 把 SQL 执行迁入受限容器或独立进程
 - 持久化向量数据库
 - LangSmith 工作流追踪与可观测性
+- MCP（Model Context Protocol）工具接入
 - RAG 与 Agent 分析质量 Benchmark
 - 异步分析任务和后台执行
 - 实时工作流进度推送
@@ -480,11 +493,16 @@ Users can upload structured datasets and optional business knowledge documents. 
 - Autonomous analysis planning
 - Dynamic Python and SQL tool routing
 - Code generation and execution
+- Python and plotting code executed in one-shot Docker containers
+  (read-only root, no network, resource-limited)
+- Read-only SQL queries (lexical guard, SQLite authorizer, read-only connection,
+  query timeout and result row/byte limits)
 - Automatic execution repair and retry
 - Critic-based analytical validation
 - Automatic result refinement
 - Result-grounded visualization generation
 - Plot repair and retry
+- Large results externalized into artifacts and safely reloaded by reference
 - Markdown, HTML, and PDF report generation
 - FastAPI interface with dataset and knowledge-file upload
 - Per-run artifacts and execution observability
@@ -763,6 +781,15 @@ insightflow-agent/
 │   ├── retriever.py
 │   └── vector_store.py
 │
+├── sandbox/
+│   ├── Dockerfile
+│   ├── requirements.lock
+│   ├── build_image.py
+│   ├── executor.py
+│   ├── protocol.py
+│   ├── bootstrap.py
+│   └── run.py
+│
 ├── services/
 │   └── analysis_service.py
 │
@@ -777,6 +804,10 @@ insightflow-agent/
 │   └── ...
 │
 ├── docs/
+│   ├── p0-delivery.md
+│   ├── p1-delivery.md
+│   ├── p2a-delivery.md
+│   ├── p2b-delivery.md
 │   └── assets/
 │       ├── insightflow-architecture.png
 │       └── insightflow-architecture-zh.png
@@ -800,7 +831,8 @@ Key modules:
 - `ingestion/` — CSV, Excel, and SQLite data loading
 - `context/` — adaptive dataset context generation
 - `rag/` — business knowledge loading, chunking, embedding, retrieval, filtering, and caching
-- `tools/` — Python, SQL, and plotting execution tools
+- `tools/` — Python, SQL, and plotting tool invocation and result normalization
+- `sandbox/` — containerized execution of Python and plotting code (image build, host executor, container entry point)
 - `services/` — reusable analysis service used by CLI and API entry points
 - `nodes.py` — LangGraph node implementations
 - `workflow.py` — LangGraph workflow construction and routing
@@ -898,7 +930,12 @@ Current limitations include:
 
 - Vector stores and caches are maintained in process memory and are not persisted across service restarts.
 - Analysis requests are executed synchronously, so long-running workflows block the request until completion.
-- Python execution uses restricted built-ins but is not a production-grade security sandbox.
+- Python and plotting code now run in one-shot Docker containers (read-only root, no network,
+  resource and concurrency limits), but containers share the host kernel, so this is
+  **not an absolute security guarantee** and is bounded by the local Docker Desktop.
+- SQL queries are hardened (lexical guard, SQLite authorizer, read-only connection,
+  query timeout and result row/byte limits) but still execute **inside the host process**,
+  with weaker isolation than the Python/Plot container sandbox.
 - Uploaded files and generated artifacts are stored on the local filesystem.
 - The current API does not include authentication, authorization, or multi-user isolation.
 - Retrieval thresholds are currently based on empirical testing rather than a large-scale retrieval benchmark.
@@ -907,9 +944,10 @@ Current limitations include:
 
 Planned improvements include:
 
-- secure sandboxed Python execution
+- moving SQL execution into a restricted container or a separate process
 - persistent vector database support
 - LangSmith tracing and workflow observability
+- MCP (Model Context Protocol) tool integration
 - retrieval and agent-quality benchmarks
 - asynchronous analysis jobs and background execution
 - real-time workflow progress streaming

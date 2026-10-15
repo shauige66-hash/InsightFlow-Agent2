@@ -203,13 +203,13 @@ class TestExecutionErrorsStillRepair:
     """模型代码本身的错误仍应进入有界修复循环。"""
 
     def test_code_error_triggers_bounded_repair(self, tmp_path: Path) -> None:
-        """执行异常：进入有界修复循环，且次数被 MAX_RETRIES 限定。
+        """执行异常：进入有界修复循环，每轮都真正请求模型，且被 MAX_RETRIES 限定。
 
-        实测到的两个数字（都断言，避免把机制说错）：
-          - 修复循环**执行**了 MAX_RETRIES 次（execution_results 有 retry_count 0..3）；
-          - 修复 Agent 的**模型调用**只有 1 次。
-        后者是既有幂等设计的直接结果：`llm_operation` 的 subject 不含尝试序号，
-        因此第 2、3 次尝试复用了第 1 次生成的代码（详见交付报告中的遗留问题）。
+        **P2-B1 更新说明**：本用例原先断言 `repair` 的模型调用次数为 1。
+        那锁定的是当时的缺陷——`llm_operation` 的 subject 不含逻辑尝试序号，
+        第 2、3 次修复被 `already_done` 误判为同一次操作而直接复用第 1 次的代码。
+        P2-B1 修复后每轮修复都是独立的逻辑尝试，因此调用次数应为 MAX_RETRIES。
+        详细的逐轮身份断言见 tests/test_llm_attempt_identity.py。
         """
         from conditions import MAX_RETRIES
 
@@ -227,8 +227,8 @@ class TestExecutionErrorsStillRepair:
         calls = agent_calls("err-code")
         attempts = [item["retry_count"] for item in result["execution_results"]]
 
-        # 代码错误必须触发修复（与"环境错误零修复"形成对照）
-        assert calls.count("repair") == 1, f"修复 Agent 调用次数: {calls}"
+        # 代码错误必须触发修复（与"环境错误零修复"形成对照），且每轮各问一次模型
+        assert calls.count("repair") == MAX_RETRIES, f"修复 Agent 调用次数: {calls}"
         # 修复循环跑到上限：retry_count 依次为 0,1,2,3
         assert attempts == [0, 1, 2, 3], f"尝试序列: {attempts}"
         assert max(attempts) == MAX_RETRIES

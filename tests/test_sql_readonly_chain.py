@@ -92,7 +92,7 @@ class TestReadOnlyStatementsWork:
         outcome = run_sql(tables, "SELECT * FROM orders ORDER BY order_id")
 
         assert outcome["success"] is True
-        assert len(outcome["result"]) == 3
+        assert outcome["result"]["row_count"] == 3
 
     def test_aggregate_query_works(self, tables) -> None:
         outcome = run_sql(
@@ -100,7 +100,7 @@ class TestReadOnlyStatementsWork:
         )
 
         assert outcome["success"] is True
-        assert len(outcome["result"]) == 2
+        assert outcome["result"]["row_count"] == 2
 
     def test_cte_select_works(self, tables) -> None:
         outcome = run_sql(
@@ -109,7 +109,7 @@ class TestReadOnlyStatementsWork:
         )
 
         assert outcome["success"] is True
-        assert outcome["result"][0]["n"] == 2
+        assert outcome["result"]["rows"][0]["n"] == 2
 
     def test_join_across_tables_works(self, tables) -> None:
         outcome = run_sql(
@@ -119,7 +119,7 @@ class TestReadOnlyStatementsWork:
         )
 
         assert outcome["success"] is True
-        assert len(outcome["result"]) == 2
+        assert outcome["result"]["row_count"] == 2
 
 
 class TestWriteStatementsAreRefused:
@@ -272,6 +272,11 @@ class TestGuardIsWiredIntoTheChain:
 
         assert "ensure_read_only" in source
         assert "mode=ro" in source
+        # P2-B2 增加的第二层：Authorizer 与查询时间预算必须真的接在工具里，
+        # 而不只是存在于独立测试中
+        assert "set_authorizer" in source
+        assert "set_progress_handler" in source
+        assert "fetchmany" in source
         # 旧的弱校验（仅前缀判断）不应再作为唯一防线
         assert 'startswith(\n            ("select", "with")' not in source
 

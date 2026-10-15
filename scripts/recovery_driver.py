@@ -63,8 +63,7 @@ REPLIES: dict[str, Any] = {
     "executor": {"code": "result = len(df)"},
     "repair": {"code": "result = len(df)"},
     "refine": {"code": "result = len(df)"},
-    "critic": {"validation_passed": True, "feedback": "ok"},
-    # 一张图，用于验证绘图链路。字段需与 VisualizationTask 一致（含 expected_output）
+    "critic": {"validation_passed": True, "feedback": "ok"},    # 一张图，用于验证绘图链路。字段需与 VisualizationTask 一致（含 expected_output）
     "visualizer": {
         "charts": [
             {
@@ -83,6 +82,20 @@ REPLIES: dict[str, Any] = {
     "reporter": "# Analysis Report\n\n## Overview\n共 5 位客户。\n",
 }
 
+# 某个 Agent 的回复按调用次序变化时用它：列表按序消费，用完后固定停在最后一项。
+# 用途是构造"首次执行失败 → 修复救回"这类需要跨轮次变化的场景。
+_REPLY_SEQUENCES: dict[str, list[Any]] = {}
+_REPLY_INDEX: dict[str, int] = {}
+
+
+def _reply_for(agent_name: str) -> Any:
+    items = _REPLY_SEQUENCES.get(agent_name)
+    if not items:
+        return REPLIES[agent_name]
+    index = _REPLY_INDEX.get(agent_name, 0)
+    _REPLY_INDEX[agent_name] = index + 1
+    return items[min(index, len(items) - 1)]
+
 # 崩溃开关：在某次 Agent 调用上调用 os._exit 模拟进程被强杀
 _CRASH_ON_AGENT = {"value": None}
 
@@ -94,6 +107,10 @@ class _Scripted(BaseChatModel):
     # 崩溃时点：before_request（请求尚未发出）/ after_request（上游已收到并返回，
     # 但节点还没把结果写进 state）
     crash_at: str = "after_request"
+    # 只在该 Agent 的第 N 次调用上崩溃（1 基）。None 表示每次调用都崩溃。
+    # 用于区分"第一次修复"与"第二次修复"这类多轮场景。
+    crash_on_sequence: int | None = None
+    call_sequence: int = 0
 
     @property
     def _llm_type(self) -> str:
@@ -105,6 +122,13 @@ class _Scripted(BaseChatModel):
 
         os._exit(17)
 
+    def _should_crash(self) -> bool:
+        if self.crash_on != self.agent_name:
+            return False
+        if self.crash_on_sequence is None:
+            return True
+        return self.call_sequence == self.crash_on_sequence
+
     def _generate(
         self,
         messages: list[BaseMessage],
@@ -114,7 +138,11 @@ class _Scripted(BaseChatModel):
     ) -> ChatResult:
         path = Path(self.record_path)
 
-        if self.crash_on == self.agent_name and self.crash_at == "before_request":
+        # 该 Agent 的第几次调用（本进程内计数）
+        if self.crash_on == self.agent_name:
+            self.call_sequence += 1
+
+        if self._should_crash() and self.crash_at == "before_request":
             # 请求尚未发出：上游不会收到任何东西
             self._crash()
 
@@ -126,13 +154,13 @@ class _Scripted(BaseChatModel):
 
             _os.fsync(handle.fileno())
 
-        if self.crash_on and self.agent_name == self.crash_on:
+        if self._should_crash():
             # 硬退出：不执行任何清理，模拟真实崩溃
             import os
 
             os._exit(17)
 
-        reply = REPLIES[self.agent_name]
+        reply = _reply_for(self.agent_name)
         content = (
             reply if isinstance(reply, str) else json.dumps(reply, ensure_ascii=False)
         )
@@ -144,6 +172,7 @@ def _factory(
     workdir: Path,
     crash_on: str | None,
     crash_at: str = "after_request",
+    crash_on_sequence: int | None = None,
 ) -> ModelFactory:
     record_path = workdir / "llm_calls.txt"
 
@@ -153,6 +182,7 @@ def _factory(
             record_path=str(record_path),
             crash_on=crash_on,
             crash_at=crash_at,
+            crash_on_sequence=crash_on_sequence,
         )
 
     return ModelFactory(
@@ -197,6 +227,24 @@ def main() -> int:
     )
     parser.add_argument("--crash-on", default=None)
     parser.add_argument(
+        "--fail-first-execution",
+        action="store_true",
+        default=False,
+        help="让首次执行代码抛错，从而进入修复循环（用于验证修复相关的恢复语义）",
+    )
+    parser.add_argument(
+        "--repair-sequence-fails",
+        action="store_true",
+        default=False,
+        help="第一轮修复给出的代码仍然抛错，用于逼出第二轮修复",
+    )
+    parser.add_argument(
+        "--crash-on-sequence",
+        type=int,
+        default=None,
+        help="只在该 Agent 的第 N 次调用上崩溃（1 基）；缺省则每次调用都崩",
+    )
+    parser.add_argument(
         "--crash-at",
         default="after_request",
         choices=("before_request", "after_request"),
@@ -218,6 +266,20 @@ def main() -> int:
     workdir.mkdir(parents=True, exist_ok=True)
     checkpoint_db = workdir / "checkpoints.sqlite"
 
+    if args.fail_first_execution:
+        # 首次生成的代码抛错 → 路由到 repair；修复给出的代码可正常执行。
+        _REPLY_SEQUENCES["executor"] = [
+            {"code": "raise ValueError('first-execution-fails')"},
+            {"code": "result = len(df)"},
+        ]
+
+    if args.repair_sequence_fails:
+        # 第一轮修复仍抛错 → 必然进入第二轮修复，用于验证两轮的逻辑身份不同。
+        _REPLY_SEQUENCES["repair"] = [
+            {"code": "raise ValueError('repair-round-1-fails')"},
+            {"code": "result = len(df)"},
+        ]
+
     with SqliteSaver.from_conn_string(str(checkpoint_db)) as saver:
         if args.phase == "inspect":
             state = read_run_state(args.run_id, checkpointer=saver)
@@ -228,7 +290,13 @@ def main() -> int:
             result = run_analysis(
                 run_id=args.run_id,
                 data_sources=[args.data_source],
-                model_factory=_factory(args.run_id, workdir, args.crash_on, args.crash_at),
+                model_factory=_factory(
+                    args.run_id,
+                    workdir,
+                    args.crash_on,
+                    args.crash_at,
+                    args.crash_on_sequence,
+                ),
                 checkpointer=saver,
                 resolver=ResourceResolver(),
                 output_root=workdir,

@@ -156,7 +156,10 @@ class TestSqlTool:
         )
 
         assert outcome["success"] is True
-        assert len(outcome["result"]) == 3
+        # P2-B2 起结果带上截断元数据（行数/字节数/是否截断），不再是裸列表
+        assert outcome["result"]["row_count"] == 3
+        assert outcome["result"]["truncated"] is False
+        assert len(outcome["result"]["rows"]) == 3
 
     def test_with_clause_is_allowed(self, sqlite_tables) -> None:
         outcome = create_sql_tool(sqlite_tables).invoke(
