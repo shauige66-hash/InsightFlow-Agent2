@@ -1100,16 +1100,25 @@ Current limitations include:
 - The current API does not include authentication, authorization, or multi-user isolation,
   so it is intended for **local demo/development use only** and must not be exposed publicly.
 - Retrieval thresholds are currently based on empirical testing rather than a large-scale retrieval benchmark.
-- Agent execution is bounded by a per-run budget (rounds, tool calls, model calls and
-  wall-clock time) held in workflow state. The budget survives a checkpoint resume
+- Agent execution is bounded by a per-run budget (rounds, tool calls, model requests
+  and execution time) held in workflow state. The budget survives a checkpoint resume
   rather than resetting. Exhausting it is classified as an environment failure, so it
-  converges to a safe failure instead of entering repair. This is governance over the
-  existing bounded loops, not a new dynamic agent loop.
+  converges to a safe failure instead of entering repair, and the plotting path is
+  governed by the same entry point as the Python and SQL tools — a zero tool budget
+  means no chart container is started. This is governance over the existing bounded
+  loops, not a new dynamic agent loop.
+- The time budget counts **execution**, not elapsed wall-clock: time spent waiting for
+  a human approval is not charged, and the accumulated figure is carried across a
+  resume. `max_llm_calls` counts **upstream model requests**, so retries caused by
+  unparsable structured output consume it too; a request is only counted once the
+  budget check ahead of it has passed and the ledger has recorded its `started` entry.
 - Context passed to each model call is bounded by a **per-node character budget**.
   Fields that carry failure feedback or task constraints (error text, task definitions,
   schema, approvals) are never truncated, which means a payload consisting only of such
   fields can still exceed its budget — a deliberate trade that is covered by tests.
   Token figures are estimates, not metered usage (see the evaluation section).
+  Per-call measurements are held per execution context, so concurrently running runs
+  cannot attribute one run's figures to another.
 - The evaluation harness runs on a scripted mock model. Real-model quality metrics are
   not measured, and provider access is gated behind explicit authorisation.
 

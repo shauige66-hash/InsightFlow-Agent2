@@ -23,20 +23,40 @@
 预算必须**跨进程恢复后不重置**。放在进程内存里的话，崩溃重启就归零，
 "有界"就名不副实。因此计数进 `InsightFlowState`，随 Checkpoint 一起持久化。
 
-时间预算是个例外：它是**墙上时钟**，不能持久化"已用秒数"（那会在
-暂停等待人工审批时把审批时间也算进去）。因此记的是**首次开始的时刻**，
-恢复后按它重算剩余时间；没有开始时刻就现场补一个。
+时间预算**不能**直接用"墙上时钟减去开始时刻"：那样等待人工审批的时间也会
+被算作执行消耗（文档说"等待不计入"，而实现会把它计入，属于文档与行为不符）。
+现在的做法是累计 `active_seconds`——只在**真实操作发生**时推进：
+
+    capture_active_time()  操作开始，时钟开始走
+    settle_active_time()   操作结束，时钟停住
+
+停在等人审批时没有任何操作、时钟也不走，因此等待不进预算；
+恢复后沿用已累计的 `active_seconds`，不重置。`clock_open` 记录时钟是否在走：
+没有它就只能用"距上次操作多久"并封顶来近似，等待越久误差越大。
+
+## 模型请求的判定与计数
+
+`max_llm_calls` 的口径是**真实上游请求数**，不是 Agent 逻辑调用次数：
+一次逻辑调用如果因为结构化输出解析失败而在内部重试，那几次请求都要计数、
+也要受上限约束。因此判定与计数接在 `chain.invoke` 之前
+（见 `utils/llm_retry` 的 `before_request` / `on_request` 回调）。
+
+判定位置有个硬要求：必须在**幂等复用之后、账本写 `started` 之前**。
+复用不该消耗额度；而超预算时若已经写了 `started`，就会留下一条永远等不到
+`completed` 的记录，恢复时被当成"未确认的模型调用"要求人工裁决——
+一个纯粹的预算问题会变成人工工单。
 
 ## 与既有机制的关系
 
 - 不新建幂等或重试系统：逻辑尝试 ID 仍来自 `utils/idempotency`；
 - 不取代 `MAX_RETRIES` 等局部上限：它们是更细的闸门，两者同时生效；
 - 失败是**收敛**而不是崩溃：超预算时抛出 `BudgetExceeded`，
-  节点捕获后转成正常的失败记录，让工作流按既有路径收尾。
+  节点包装器捕获后转成正常的失败记录，让工作流按既有路径收尾。
 """
 
 from __future__ import annotations
 
+import contextvars
 import time
 from dataclasses import dataclass
 from typing import Any
@@ -48,6 +68,17 @@ BUDGET_FIELD = "execution_budget"
 # 预算耗尽不是"代码写错了"，重试同样的代码不会好转，
 # 因此不该进入 Repair——这与 P2-B 对环境类错误的处理一致。
 BUDGET_ERROR_KIND = "unavailable"
+
+#: 两次真实操作之间最多计入的墙上时钟。
+#:
+#: 时间预算需要区分"在执行"与"在等人"。做法是：只在**真实操作发生时**
+#: 把距上次操作的时间累加进 `active_seconds`，且单次间隔不超过这个上限。
+#: 等待人工审批期间没有任何真实操作，因此不计入；而在执行期间，
+#: 操作（工具调用、模型调用、轮次）会持续发生，间隔远小于该上限。
+#:
+#: 取值依据：它必须明显大于单次工具/模型调用的正常耗时（否则正常执行会被少计），
+#: 又要明显小于人工审批的等待时间（否则等待会被误计）。60 秒对两者都有余量。
+MAX_ACTIVE_GAP_SECONDS = 60.0
 
 
 class BudgetExceeded(RuntimeError):
@@ -137,10 +168,24 @@ def new_usage() -> dict[str, Any]:
     return {
         "rounds": 0,
         "tool_calls": 0,
+        # **真实上游模型请求数**（含结构化输出解析失败导致的内部重试），
+        # 不是 Agent 逻辑调用次数：一次逻辑调用可能发出多次请求。
+        # 字段名沿用 llm_calls，但语义以这里为准。
         "llm_calls": 0,
-        # 首次开始时刻。墙上时钟不能持久化"已用秒数"：
-        # 等待人工审批的时间不属于执行消耗，恢复时按开始时刻重算。
+        # 首次开始时刻：仅用于展示与迁移，**不再**直接决定时间预算。
         "started_at": None,
+        # 累计"正在执行"的秒数。等待人工审批的时间不计入。
+        "active_seconds": 0.0,
+        # 上一次真实操作的时刻，用于把两段执行之间的时间累加进 active_seconds。
+        "last_active_at": None,
+        # 执行时钟是否**正在走**：一次真实操作开始时置 True，
+        # 该操作结束时（settle）置 False。
+        #
+        # 这个标志是"等待不计入"的关键。没有它就只能用"距上次操作多久"
+        # 加一段带上限的尾巴，于是**停在等人时也会缓慢累积**（每次 +60 秒上限），
+        # 等待越久越接近上限——只是把误差从"精确计入"变成"封顶计入"。
+        # 有了它，时钟在结算后就真的停住，等待期间 elapsed 保持不变。
+        "clock_open": False,
     }
 
 
@@ -171,6 +216,12 @@ def initialize(state: dict[str, Any]) -> dict[str, Any]:
 
     返回要写回 state 的增量。已经存在时不重置任何计数——这正是
     "恢复后不重置预算"的实现点。
+
+    **老 Checkpoint 的迁移**：P3 早期只持久化 `started_at`，没有
+    `active_seconds`。那种记录里的"已消耗时间"就是 `now - started_at`
+    （当时确实是这么算的）。迁移时把它一次性折成 `active_seconds`，
+    从而**保留已消耗的时间**，并在此之后改为按真实操作累加——
+    也就是说升级不会把已用的时间预算退回去，也不会把历史等待时间继续算下去。
     """
     payload = state.get(BUDGET_FIELD)
 
@@ -178,60 +229,207 @@ def initialize(state: dict[str, Any]) -> dict[str, Any]:
         return {
             BUDGET_FIELD: {
                 "limits": AgentBudget().to_dict(),
-                "usage": {**new_usage(), "started_at": time.time()},
+                "usage": {
+                    **new_usage(),
+                    "started_at": time.time(),
+                    "last_active_at": time.time(),
+                },
             }
         }
 
     usage = usage_of(state)
-    if usage.get("started_at") is None:
-        # 老 Checkpoint（P3 之前）没有这个字段，现场补一个
-        return {
-            BUDGET_FIELD: {
-                "limits": AgentBudget.from_dict(payload.get("limits")).to_dict(),
-                "usage": {**usage, "started_at": time.time()},
-            }
-        }
+    changed = False
 
-    return {}
+    if usage.get("started_at") is None:
+        # 极老的 Checkpoint 连开始时刻都没有，现场补一个
+        usage["started_at"] = time.time()
+        changed = True
+
+    if payload.get("usage", {}).get("active_seconds") is None:
+        # 迁移：旧的"已用时间"按 started_at 折算一次，之后不再用墙钟
+        started = usage.get("started_at")
+        carried = 0.0
+        if isinstance(started, (int, float)):
+            carried = max(0.0, time.time() - float(started))
+        usage["active_seconds"] = carried
+        changed = True
+
+    if usage.get("last_active_at") is None:
+        usage["last_active_at"] = time.time()
+        changed = True
+
+    if not changed:
+        return {}
+
+    return {
+        BUDGET_FIELD: {
+            "limits": AgentBudget.from_dict(payload.get("limits")).to_dict(),
+            "usage": usage,
+        }
+    }
+
+
+def _accumulate(
+    state: dict[str, Any], *, now: float, open_clock: bool
+) -> dict[str, Any]:
+    """把"距上次操作"的时间累加进 `active_seconds`，并设置时钟状态。
+
+    只有在时钟**正在走**（上一次操作尚未结算）时才累加：
+
+    - 一次操作开始时（capture）：上一笔的尾巴先算清，时钟继续走；
+    - 一次操作结束时（settle）：当前这笔算清，时钟停住。
+    """
+    usage = usage_of(state)
+    active = usage.get("active_seconds")
+    active = float(active) if isinstance(active, (int, float)) else 0.0
+
+    last = usage.get("last_active_at")
+    if usage.get("clock_open") and isinstance(last, (int, float)):
+        active += min(MAX_ACTIVE_GAP_SECONDS, max(0.0, now - float(last)))
+
+    usage["active_seconds"] = active
+    usage["last_active_at"] = now
+    usage["clock_open"] = open_clock
+    if usage.get("started_at") is None:
+        usage["started_at"] = now
+
+    payload = state.get(BUDGET_FIELD)
+    limits = (
+        AgentBudget.from_dict(payload.get("limits")).to_dict()
+        if isinstance(payload, dict)
+        else AgentBudget().to_dict()
+    )
+    return {BUDGET_FIELD: {"limits": limits, "usage": usage}}
+
+
+def capture_active_time(
+    state: dict[str, Any], *, now: float | None = None
+) -> dict[str, Any]:
+    """在**开始**一次真实操作时推进执行时钟（时钟保持走动）。
+
+    调用时机是真实操作发生时（工具调用、模型请求、轮次推进）。这些操作
+    分散在若干处，因此"时间前进"与"工作量前进"绑定在一起，不需要额外的
+    生命周期钩子；等待人工审批期间没有任何操作，时间自然就不走。
+    """
+    return _accumulate(
+        state, now=now if now is not None else time.time(), open_clock=True
+    )
+
+
+def settle_active_time(
+    state: dict[str, Any], *, now: float | None = None
+) -> dict[str, Any]:
+    """在**结束**一段工作时结算执行时钟，并让它停住。
+
+    调用点是一次工具调用或一次模型调用返回之后。之后若进入人工审批等待，
+    `elapsed_seconds` 不再增长——这正是"等待不计入有效执行预算"的实现点。
+
+    没有这个函数时只能靠"距上次操作多久"并封顶来近似，于是**停在等人时
+    时间仍会缓慢累积**（每次都加上限），等待越久误差越大。时钟状态显式化
+    之后，等待期间已消耗时间保持不变。
+    """
+    return _accumulate(
+        state, now=now if now is not None else time.time(), open_clock=False
+    )
 
 
 def elapsed_seconds(state: dict[str, Any], *, now: float | None = None) -> float:
+    """已消耗的**执行**时间（不含等待人工审批的时间）。
+
+    时钟停住时就是 `active_seconds` 本身；时钟正在走时再加上"距上次操作"
+    这一小段（一次操作内部的耗时）。两种情况下等待时间都不被计入。
+    """
     usage = usage_of(state)
-    started = usage.get("started_at")
-    if not isinstance(started, (int, float)):
-        return 0.0
-    return max(0.0, (now if now is not None else time.time()) - float(started))
+    active = usage.get("active_seconds")
+    active = float(active) if isinstance(active, (int, float)) else 0.0
+
+    last = usage.get("last_active_at")
+    if usage.get("clock_open") and isinstance(last, (int, float)):
+        current = now if now is not None else time.time()
+        active += min(
+            MAX_ACTIVE_GAP_SECONDS, max(0.0, current - float(last))
+        )
+
+    return active
 
 
-def check(state: dict[str, Any], *, now: float | None = None) -> None:
+#: `check` 能判定的预算范围。
+_ALL_SCOPES = ("rounds", "tool_calls", "llm_calls", "seconds")
+
+
+def check(
+    state: dict[str, Any],
+    *,
+    now: float | None = None,
+    scopes: tuple[str, ...] = _ALL_SCOPES,
+) -> None:
     """预算是否还能继续。超了就抛 `BudgetExceeded`。
 
     只读，不改 state：判定与计数分开，调用方先判定再决定要不要计一次。
+
+    `scopes` 用来只看某几类预算。真实用途是：**进入一次模型请求前**只看
+    `llm_calls`——那次请求只会再消耗一个模型调用额度，不该因为工具调用或
+    时间预算刚好用尽就拒绝它。工具与轮次的入口仍然检查全部分项。
     """
     budget = budget_of(state)
     usage = usage_of(state)
 
-    for scope, used, limit in (
-        ("rounds", usage["rounds"], budget.max_rounds),
-        ("tool_calls", usage["tool_calls"], budget.max_tool_calls),
-        ("llm_calls", usage["llm_calls"], budget.max_llm_calls),
-    ):
+    limits = {
+        "rounds": (usage["rounds"], budget.max_rounds),
+        "tool_calls": (usage["tool_calls"], budget.max_tool_calls),
+        "llm_calls": (usage["llm_calls"], budget.max_llm_calls),
+        "seconds": (None, budget.max_seconds),
+    }
+
+    for scope in scopes:
+        used, limit = limits[scope]
+        if scope == "seconds":
+            spent = elapsed_seconds(state, now=now)
+            if spent >= limit:
+                raise BudgetExceeded("seconds", round(spent, 1), limit)
+            continue
         if used >= limit:
             raise BudgetExceeded(scope, used, limit)
 
-    spent = elapsed_seconds(state, now=now)
-    if spent >= budget.max_seconds:
-        raise BudgetExceeded("seconds", round(spent, 1), budget.max_seconds)
+
+def check_llm_budget(
+    state: dict[str, Any],
+    *,
+    extra_used: int = 0,
+) -> None:
+    """进入一次**真实模型请求**前的判定。
+
+    只看 `llm_calls`：这一次请求额外消耗的是一个模型调用额度，不该因为
+    工具调用或时间预算刚好用尽而被拒绝——那些分项在各自的入口判定
+    （`governed_tool_call` 与 `_round_update` 走完整的 `check`）。
+
+    `extra_used` 用于同一次逻辑调用里的多次请求：`state` 里的计数要等节点
+    返回才更新，而图会为每个节点复制 state，因此同一操作内部必须把已经
+    发出的请求数显式加上——否则带上限 1 时第二次请求仍会通过。
+    """
+    budget = budget_of(state)
+    used = usage_of(state)["llm_calls"] + max(0, int(extra_used))
+    if used >= budget.max_llm_calls:
+        raise BudgetExceeded("llm_calls", used, budget.max_llm_calls)
+
 
 def _bump(state: dict[str, Any], key: str) -> dict[str, Any]:
+    """记一次真实操作，并顺带推进执行时钟。
+
+    "真实操作"就是消耗预算的那些事：轮次、工具调用、模型请求。
+    在这里累加 `active_seconds` 有一个好处——**时间前进与工作量前进绑定**，
+    不需要额外的生命周期钩子；停下来等人审批时没有任何操作，时间自然停住。
+    """
     payload = state.get(BUDGET_FIELD)
     if not isinstance(payload, dict):
         payload = {
             "limits": AgentBudget().to_dict(),
-            "usage": {**new_usage(), "started_at": time.time()},
+            "usage": new_usage(),
         }
 
-    usage = usage_of(state)
+    # 先推进时钟，再递增计数，两者合并成同一份增量返回
+    timed = capture_active_time(state)
+    usage = timed[BUDGET_FIELD]["usage"]
     usage[key] = int(usage.get(key, 0)) + 1
 
     return {
@@ -252,7 +450,137 @@ def consume_tool_call(state: dict[str, Any]) -> dict[str, Any]:
 
 
 def consume_llm_call(state: dict[str, Any]) -> dict[str, Any]:
+    """记一次**真实上游模型请求**。
+
+    保留这个名字是因为既有调用方（节点与测试）都按它理解，
+    语义见 `new_usage()["llm_calls"]` 的说明：真实请求，不是逻辑调用。
+    """
     return _bump(state, "llm_calls")
+
+
+#: `consume_llm_call` 的显式别名。两者是同一个函数，
+#: 别名只是为了让"这里计的是真实请求"在调用点更醒目。
+consume_llm_request = consume_llm_call
+
+
+# ---------------------------------------------------------------------------
+# 模型请求钩子：让 Agent 层能在**每次真实请求**前后判预算与计数
+# ---------------------------------------------------------------------------
+
+#: 请求发出前的判定钩子。由节点层注册（那里的 `_budget_guard` 知道如何
+#: 取当前 state）。用注册表而不是让 Agent 直接 import 节点模块，是为了
+#: 避免 Agent → nodes → Agent 的循环依赖。
+_before_request_hook: Any = None
+_on_request_hook: Any = None
+
+#: 取当前 Run 的 state 的函数，同样由节点层注册。
+_state_provider: Any = None
+
+
+def set_state_provider(provider: Any = None) -> None:
+    """注册"取当前 state"的函数。
+
+    节点层用一个 `ContextVar` 保存正在执行的 state，这里通过它取值，
+    从而让 `utils` 层不必知道节点模块的存在。
+    """
+    global _state_provider
+    _state_provider = provider
+
+
+def current_state() -> dict[str, Any] | None:
+    """当前 Run 的 state；不在节点执行上下文中时返回 None。"""
+    provider = _state_provider
+    if provider is None:
+        return None
+    return provider()
+
+
+#: 当前**逻辑调用**内部已经发出的请求数。
+#:
+#: 为什么需要它：LangGraph 为每个要执行的节点复制一份 state，因此在同一节点
+#: 内部的多次重试之间，节点那份 state 上的就地计数**不会**被观察到——第二次
+#: 判定读到的仍是调用开始时的旧值，于是声明上限 3 时第 3 次重试照样发出
+#: （实测：上限 3、发出 4 次）。
+#:
+#: 因此把"本次逻辑调用已发出的请求数"放在 ContextVar 里：它随执行上下文走，
+#: 不依赖 state 的可见性，也不受线程池或图复制的影响。
+_requests_in_flight: contextvars.ContextVar[int] = contextvars.ContextVar(
+    "insightflow_requests_in_flight", default=0
+)
+
+
+def begin_operation_requests() -> contextvars.Token:
+    """开始一次逻辑调用前调用，返回可用于恢复的 token。"""
+    return _requests_in_flight.set(0)
+
+
+def end_operation_requests(token: contextvars.Token) -> None:
+    """逻辑调用结束后恢复计数。"""
+    _requests_in_flight.reset(token)
+
+
+def requests_in_flight() -> int:
+    """本次逻辑调用已经发出的请求数。"""
+    return _requests_in_flight.get()
+
+
+def note_request_in_flight() -> None:
+    """记一次"本次逻辑调用又发出了一个请求"。
+
+    与 `consume_llm_call` 的区别：后者累加的是**落盘的总量**（state 里的
+    `llm_calls`），本函数累加的是**本次逻辑调用内部**的计数，用于同一节点
+    内部重试之间的判定——图会为每个节点复制 state，所以后者不能靠 state 传递。
+    """
+    _requests_in_flight.set(_requests_in_flight.get() + 1)
+
+
+def set_request_hooks(
+    *,
+    before: Any = None,
+    after: Any = None,
+) -> None:
+    """注册模型请求前后的钩子（测试可用于隔离或观测）。
+
+    传 `None` 表示清除。清成 `None` 之后 `before_model_request()` 变成空操作——
+    这正是"节点层不在场"时应有的行为，例如单独调用某个 Agent 的单元测试。
+    """
+    global _before_request_hook, _on_request_hook
+    _before_request_hook = before
+    _on_request_hook = after
+
+
+def before_model_request(attempt: int) -> None:
+    """在一次**真实上游模型请求**发出前判定预算。
+
+    **每一次尝试都要判**，包括第 1 次。
+
+    这里曾经跳过第 1 次（理由是"`run_agent_call` 的 `before_request` 已经判过"），
+    那是错的：`run_agent_call` 只在**逻辑调用开始时**判一次，而同一逻辑调用内部
+    的解析失败重试会让计数在操作过程中增长。跳过第 1 次意味着 `after_model_request`
+    计数、但第 2 次尝试的判定发生在**上一次计数之前**——实测结果是声明上限 3
+    却发出了 4 次请求。
+
+    `check_llm_budget` 只看 `llm_calls`，不涉及轮次/工具/时间，因此第 1 次重复判定
+    没有副作用；`run_agent_call` 里那次判定保留，是为了在预算已尽时**不往账本写
+    `started`**（那会留下永远等不到 `completed` 的记录）。
+    """
+    hook = _before_request_hook
+    if hook is None:
+        return
+    hook(attempt)
+
+
+def after_model_request(attempt: int) -> None:
+    """在一次真实请求**将要发出**时计数。
+
+    调用点在 `chain.invoke` 之前（见各 Agent 的重试辅助函数）：这样即使请求
+    本身失败也已经计入，不会给"反复失败重发"留出绕过上限的空间。
+    统计口径是**真实请求数**，一次逻辑调用内部重试的每一次请求都各记一次。
+    """
+    hook = _on_request_hook
+    if hook is None:
+        return
+    hook(attempt)
 
 
 def snapshot(state: dict[str, Any], *, now: float | None = None) -> dict[str, Any]:

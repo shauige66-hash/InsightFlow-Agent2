@@ -326,16 +326,36 @@ class TestEveryLlmNodeIsWired:
             module = importlib.import_module(f"agents.{module_name}")
             source = inspect.getsource(module)
             assert "bound_fields(" in source, f"{module_name} 未接入上下文预算"
-            assert f'bound_fields("{node}"' in source, (
-                f"{module_name} 的节点名不是 {node}"
+            # 节点名走 NODE_NAME 常量，避免名字在两处各写一遍而漂移
+            assert "bound_fields(NODE_NAME" in source, (
+                f"{module_name} 未用 NODE_NAME 调用 bound_fields"
+            )
+            assert f'NODE_NAME = "{node}"' in source, (
+                f"{module_name} 的 NODE_NAME 不是 {node}"
             )
 
     def test_every_agent_publishes_a_measurement(self) -> None:
+        """度量必须发布到按执行上下文隔离的出口。
+
+        回归：早期实现把度量放在**模块级字典** `LAST_CONTEXT_REPORT` 里，
+        而 `RunCoordinator` 用线程池并发执行多个 Run——两个 Run 同时调用
+        同一个 Agent 时，后写的会覆盖先写的，把 A Run 的度量记到 B Run 的日志。
+        现在统一通过 `utils.context_budget.publish_context_report` 发布，
+        底层是 `ContextVar`。
+        """
         import importlib
+        import inspect
 
         for module_name in self.AGENT_NODES:
             module = importlib.import_module(f"agents.{module_name}")
-            assert hasattr(module, "LAST_CONTEXT_REPORT"), module_name
+            source = inspect.getsource(module)
+            assert "publish_context_report(NODE_NAME" in source, (
+                f"{module_name} 未发布上下文度量"
+            )
+            assert not hasattr(module, "LAST_CONTEXT_REPORT"), (
+                f"{module_name} 仍有模块级 LAST_CONTEXT_REPORT，"
+                "并发 Run 之间会串写"
+            )
 
     def test_every_wired_node_has_a_budget(self) -> None:
         for node in self.AGENT_NODES.values():

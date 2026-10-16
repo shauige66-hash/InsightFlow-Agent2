@@ -2,7 +2,10 @@
 
 import json
 
-from utils.context_budget import bound_fields
+from utils.context_budget import bound_fields, publish_context_report
+
+NODE_NAME = "plotter"
+from utils.agent_loop import after_model_request, before_model_request
 from typing import Any
 
 from langchain_core.output_parsers import JsonOutputParser
@@ -176,9 +179,9 @@ def generate_plot_code(
     # P4：按节点预算压缩上下文。
     # 不可压缩字段见 utils.context_budget.NODE_PRESERVE_FIELDS；
     # 错误反馈与任务约束在那里被显式保留。
-    inputs, _context_report = bound_fields("plotter", inputs)
-    LAST_CONTEXT_REPORT.clear()
-    LAST_CONTEXT_REPORT.update(_context_report.to_dict())
+    inputs, _context_report = bound_fields(NODE_NAME, inputs)
+    # 度量按执行上下文隔离：并发执行的两个 Run 不会互相覆盖
+    publish_context_report(NODE_NAME, _context_report.to_dict())
 
     # prompt 里有 {retry_hint} 占位符，必须提供，否则 PromptTemplate 会直接报
     # 缺少变量。首次尝试留空，重试时把上一次的失败原因回传——temperature 为 0 时
@@ -191,6 +194,10 @@ def generate_plot_code(
         1,
         MAX_GENERATION_ATTEMPTS + 1
     ):
+        # P3：这是本文件自己的重试循环，同样要按真实请求判预算与计数。
+        # 两者都放在 invoke 之前，口径与 utils/llm_retry 保持一致。
+        before_model_request(attempt)
+        after_model_request(attempt)
         try:
             result = chain.invoke(current_inputs)
 
@@ -236,7 +243,3 @@ def generate_plot_code(
     raise RuntimeError(
         "Plot code generation failed."
     ) from last_error
-
-#: 最近一次上下文构造的度量结果（供节点写结构化日志）。
-#: 单进程内被同一 Run 的顺序调用覆盖是安全的：节点调用后立刻读取。
-LAST_CONTEXT_REPORT: dict[str, object] = {}

@@ -6,6 +6,11 @@ import os
 import time
 from typing import Any, Callable
 
+# `BudgetExceeded` 必须在模块级导入：`_with_state` 包装器在**导入期**就把它
+# 写进 except 子句（它在第 208 行定义，早于文件下半部分那组 utils 导入），
+# 因此不能依赖后面才出现的导入。
+from utils.agent_loop import AgentBudget, BudgetExceeded, usage_of
+
 from langgraph.types import interrupt
 
 from state import InsightFlowState
@@ -22,7 +27,7 @@ from tools.tool_registry import available_tools, invoke_tool
 from agents.repair import repair_execution_code
 from agents.critic import review_execution_result
 from agents.refine import refine_execution_code
-from agents.reporter import LAST_CONTEXT_REPORT, generate_analysis_report
+from agents.reporter import generate_analysis_report
 from utils.artifacts import save_markdown_report,save_html_report,save_pdf_report
 from agents.visualizer import create_visualization_plan
 from agents.plotter import generate_plot_code
@@ -118,6 +123,12 @@ def _governed_agent_call(
         subject=subject,
         call=invoke,
         attempt=attempt,
+        # 预算判定放在**幂等复用之后、账本落 started 之前**：
+        # 复用不该消耗额度，而超预算时绝不能往账本写一条 started——
+        # 那会留下一个永远等不到 completed 的记录，恢复时被判成
+        # "未确认的模型调用"并要求人工裁决，于是一个纯粹的预算问题
+        # 变成了人工工单。
+        before_request=_budget_guard,
     )
 
     extra = dict(extra or {})
@@ -125,12 +136,17 @@ def _governed_agent_call(
     extra.pop("__operation_id__", None)
 
     if invoked:
-        # 计数基于当前 state 重算，因此多次调用会累加而不是互相覆盖。
-        extra.update(consume_llm_call(_CURRENT_STATE.get() or {}))
+        # 计数**不在**这里做：真实请求数由 `utils/agent_loop.after_model_request`
+        # 在每次请求前逐次累加（含同一次逻辑调用内部的重试）。
+        # 这里曾经额外 `consume_llm_call` 一次，于是同一次请求被算了两次——
+        # 实测声明上限 3 时实际只发出 2 次请求就判定耗尽。
+        #
+        # 这里只做时钟结算：模型调用已结束，若接着去等人审批，时间不再累积。
+        settled = settle_active_time(_CURRENT_STATE.get() or {})
+        extra[BUDGET_FIELD] = settled[BUDGET_FIELD]
 
         # P4：把这个 Agent 的上下文度量写进结构化日志。
-        # 各 Agent 在裁剪时把结果放到自己模块的 LAST_CONTEXT_REPORT，
-        # 这里按 agent 名取回——不新增全局注册表，也就不用维护它的一致性。
+        # 各 Agent 在裁剪时把结果放进自己的上下文变量，这里按 agent 名取回。
         report = _context_report_of(agent)
         if report:
             log_event(
@@ -147,29 +163,46 @@ def _governed_agent_call(
 def _context_report_of(agent: str) -> dict:
     """取回某个 Agent 最近一次上下文裁剪的度量。
 
-    Agent 可能被安装为顶层模块（`planner`）或包内模块（`agents.planner`），
-    两种都试一次；取不到就返回空字典（不因为日志缺字段而影响执行）。
+    P4 的度量通过 `contextvars.ContextVar` 传递，因此**按执行上下文隔离**：
+    并发执行的两个 Run 各自看到自己的那份，不会互相串写。
+    早期实现把度量放在模块级字典里，两个 Run 并发调用同一个 Agent 时
+    可能把 A 的度量写进 B 的日志。
+
+    取不到就返回空字典（不因为日志缺字段而影响执行）。
     """
-    import sys as _sys
+    from utils.context_budget import context_report_of
 
-    for module_name in (f"agents.{agent}", agent):
-        module = _sys.modules.get(module_name)
-        report = getattr(module, "LAST_CONTEXT_REPORT", None) if module else None
-        if isinstance(report, dict) and report:
-            return dict(report)
-    return {}
+    return context_report_of(agent)
 
 
-def _budget_guard() -> dict:
-    """进入一次模型调用前判预算；超了抛 `BudgetExceeded`。
+def _budget_guard(*, for_model_request: bool = True) -> None:
+    """进入一次**真实模型请求**前判预算；超了抛 `BudgetExceeded`。
 
-    只判不记：计由 `_governed_agent_call` 在**确认发出请求后**完成，
-    否则命中幂等复用的调用会把预算算多。
+    这是预算真正生效的地方。只判不记：计由 `_governed_agent_call` 在
+    **确认幂等未命中、请求确实要发出**之后完成——否则命中幂等复用的调用
+    会把预算算多。
+
+    只看 `llm_calls`（默认）：这一次请求额外消耗的是一个模型调用额度，
+    不该因为工具调用或时间预算刚好用尽就被拒绝；那些分项在各自的入口
+    （`governed_tool_call`、`_round_update`）判定。
+
+    历史上这个函数被定义却从未接入调用路径——预算配置写进了 state，
+    但没有任何请求真正被拦下。现在它是 `run_agent_call` 的 `before_request`。
     """
-    from utils.agent_loop import check
+    from utils.agent_loop import check, check_llm_budget, requests_in_flight
+
+    if for_model_request:
+        # `requests_in_flight()` 是**本次逻辑调用**内已经发出的请求数。
+        # 图会为每个节点复制 state，因此同一节点内部的重试看不到彼此就写入的
+        # 计数——必须显式加上，否则第 2、3 次重试读到的仍是调用开始时的旧值，
+        # 上限形同虚设（实测：上限 3 却发出 4 次请求）。
+        check_llm_budget(
+            _CURRENT_STATE.get() or {},
+            extra_used=requests_in_flight(),
+        )
+        return
 
     check(_CURRENT_STATE.get() or {})
-    return {}
 
 
 def _round_update(*, node: str) -> dict:
@@ -194,6 +227,12 @@ def _with_state(func: Callable) -> Callable:
     P3-A：同时在这里确保 state 里有一份预算快照。放在这一层是因为
     所有会消耗预算的节点都被它包着，而 `initialize_budget` 是**幂等**的
     （已有计数不重置），所以恢复后重复进入不会把预算清零。
+
+    P3 定点修复：`BudgetExceeded` 也在这里统一收敛。预算判定现在接在
+    **真实请求之前**，因此它会从任意一个 Agent 调用点抛出来（10 处）。
+    逐处 catch 既啰嗦又容易漏掉一处，漏掉就意味着预算耗尽变成未分类异常、
+    整个 Run 崩掉而不是安全终止。这一层是所有消耗预算的节点的共同入口，
+    在这里转成"环境类失败"最稳妥：归类为 `unavailable`，不进入 Repair。
     """
 
     @functools.wraps(func)
@@ -204,10 +243,156 @@ def _with_state(func: Callable) -> Callable:
         token = _CURRENT_STATE.set(state)
         try:
             return func(state)
+        except BudgetExceeded as exceeded:
+            return _budget_failure(state, func.__name__, exceeded)
         finally:
             _CURRENT_STATE.reset(token)
 
     return wrapper
+
+
+def _budget_failure(
+    state: InsightFlowState, node: str, exceeded: BudgetExceeded
+) -> dict:
+    """把一个 `BudgetExceeded` 转成"能安全收尾"的 state 增量。
+
+    为什么不能让它继续往上抛：预算判定接在真实请求之前，因此它可能从任意
+    一个 Agent 调用点抛出。未分类异常会让整个 Run 崩掉，而不是按既有语义
+    收敛成失败——那既丢失了"为什么停"的解释，也让 RunStore 停在 running。
+
+    返回的形状按节点语义区分，而不是一套通用字段：
+
+    - `planner`：返回**空计划**。图在计划为空时会走
+      `route_to_approval → complete`，从而正常收尾，不会带着不存在的
+      计划去执行、也不会因为 `analysis_plan[0]` 越界而崩溃。
+    - 其余节点：返回执行/绘图层面的失败记录，由既有的路由判断"不进入修复"。
+    """
+    log_event(
+        run_id=state.get("run_id") or "unknown",
+        node=node,
+        event="budget_exceeded",
+        status="failed",
+        details={
+            "scope": exceeded.scope,
+            "used": exceeded.used,
+            "limit": exceeded.limit,
+        },
+    )
+
+    reason = str(exceeded)
+    plan = state.get("analysis_plan") or []
+    index = state.get("current_task_index") or 0
+    task_id = plan[index]["task_id"] if 0 <= index < len(plan) else "budget"
+
+    existing = list(state.get("failed_tasks") or [])
+    # 同一任务已经因预算记过失败就不再追加，避免"失败任务数"被算多
+    already = any(
+        item.get("task_id") == task_id
+        and item.get("error_kind") == BUDGET_ERROR_KIND
+        for item in existing
+    )
+    if not already:
+        existing.append(
+            {
+                "task_id": task_id,
+                "reason": reason,
+                "error": reason,
+                "error_kind": BUDGET_ERROR_KIND,
+                "retry_count": 0,
+            }
+        )
+
+    common = {
+        "analysis_status": "failed",
+        "status_reason": reason,
+        "failed_tasks": existing,
+        # **必须把预算增量一起返回**。
+        #
+        # 真实请求的计数是就地写进当前节点那份 state 的（图会为每个节点复制
+        # state），如果这里不把它带出去，LangGraph 就只合并我们返回的这几个键，
+        # 累计用量会**回退**到该节点开始时的值：实测出现 total 从 2 掉回 1，
+        # 于是已经耗尽的预算又被放行，上限 3 最终发出了 4 次请求。
+        #
+        # 返回**完整的** `execution_budget`（`limits` + `usage`），不是只返回
+        # `usage`：后者会让 `limits` 丢失，判定随即回落到默认上限。
+        BUDGET_FIELD: {
+            "limits": (
+                (state.get(BUDGET_FIELD) or {}).get("limits")
+                if isinstance(state.get(BUDGET_FIELD), dict)
+                else None
+            )
+            or AgentBudget().to_dict(),
+            "usage": usage_of(state),
+        },
+    }
+
+    if node == "planner_node":
+        # 空计划 → route_to_approval 走 complete，工作流安全收尾。
+        # 这也是既有"计划为空"的语义，只是原因说明不同。
+        return {
+            **common,
+            "analysis_plan": [],
+            "current_task_index": 0,
+            "analysis_status": "no_tasks",
+            "status_reason": f"执行预算已用尽，未能产出分析计划：{reason}",
+        }
+
+    if node == "execution_node":
+        # 图上 `execution → tool_execution` 是一条**无条件**边，因此代码没能
+        # 生成时不能什么都不返回：`tool_execution_node` 会去读 `current_code`
+        # 并抛 KeyError，把"预算耗尽"变成一次未分类崩溃。
+        #
+        # 这里只补 `current_code`，**不动** `current_tool`：tool 是 router 已经
+        # 定好的，下面 tool_execution 会走它既有的"代码为空"失败路径，
+        # 从而按既有语义收敛成任务失败，而不是崩在图里。
+        return {**common, "current_code": None}
+
+    return common
+
+
+def _register_request_hooks() -> None:
+    """把预算钩子注册进 `utils/agent_loop`。
+
+    为什么需要这一层：Agent 在**每次真实模型请求**前后都要判预算与计数
+    （内部重试的每一次请求也算），但 Agent 不能 import 节点模块——那会形成
+    `agents → nodes → agents` 的循环依赖。因此节点层把自己的取值方式注册过去。
+
+    `on_request` 直接**就地更新** state 里的用量。这样做是必要的：
+    一次逻辑调用内部可能发出多次请求，而 state 的正式增量要等节点返回才合并；
+    不就地累加的话，第二次请求判定时读到的仍是旧计数，上限 1 也拦不住第 2 次。
+    就地更新改变的是 LangGraph 传入的那份 state 对象，节点返回的增量是它的
+    超集，因此不会互相覆盖。
+    """
+    from utils.agent_loop import (
+        BUDGET_FIELD,
+        consume_llm_call,
+        set_request_hooks,
+        set_state_provider,
+    )
+
+    def _state() -> dict | None:
+        return _CURRENT_STATE.get()
+
+    def _before(attempt: int) -> None:
+        _budget_guard()
+
+    def _count(attempt: int) -> None:
+        state = _CURRENT_STATE.get()
+        if state is None:
+            return
+        # 同时推进两处：state 里的总量（用于落盘与日志）与本次逻辑调用的
+        # 请求计数（用于同一次调用内部的重试判定）。
+        updates = consume_llm_call(state)
+        state[BUDGET_FIELD] = updates[BUDGET_FIELD]
+        from utils.agent_loop import note_request_in_flight
+
+        note_request_in_flight()
+
+    set_state_provider(_state)
+    set_request_hooks(before=_before, after=_count)
+
+
+_register_request_hooks()
 from utils.run_logger import log_event
 from time import perf_counter
 from rag.knowledge_service import build_and_retrieve_knowledge
@@ -216,11 +401,22 @@ from rag.knowledge_service import build_and_retrieve_knowledge
 # 是为了让"预算判定"与"结构化日志"只有一个出口。
 from utils.agent_loop import (
     BUDGET_ERROR_KIND,
+    BUDGET_FIELD,
     BudgetExceeded,
-    consume_llm_call,
     initialize as initialize_budget,
+    settle_active_time,
 )
 from utils.middleware import governed_tool_call
+
+# `BudgetExceeded` 与预算字段要在模块顶部可用：`_with_state` 包装器在导入期
+# 就把它写进 except 子句，晚于它的局部导入（原先在函数体里）帮不上忙。
+from utils.agent_loop import BudgetExceeded
+
+# 绘图重试上限。与 `conditions.route_after_plot_execution` 共用同一个常量：
+# 预算耗尽时把计数直接置满，路由就会跳过 plot_repair——重画同一张图
+# 在预算已尽的情况下不会好转，只会再尝试启动一个容器。
+# 从 conditions 导入而不在这里另写一个字面量，避免两处上限将来漂移。
+from conditions import MAX_PLOT_RETRIES
 
 def loader_node(
     state: InsightFlowState
@@ -481,16 +677,71 @@ def tool_execution_node(
     tool = state["current_tool"]
     code = state["current_code"]
 
-    if tool is None:
-        raise ValueError("Current tool is missing.")
-
-    if code is None:
-        raise ValueError("Current code is missing.")
-
-    if tool not in available_tools():
-        raise ValueError(
-            f"Unsupported tool: {tool}"
+    # 缺少工具或代码是**任务级失败**，不是工作流崩溃。
+    #
+    # 图里 `execution → tool_execution` 是一条无条件边，因此当上游因为预算
+    # 耗尽没能产出代码时，这个节点一定会被进入。此时抛 ValueError 会把
+    # "预算耗尽、安全终止"变成一次未分类异常（Run 停在 running、原因丢失）。
+    # 下面把它转成与"工具返回失败"完全相同的形状，交给既有的
+    # `route_after_execution` 走 failed 分支收敛。
+    if tool is None or code is None or tool not in available_tools():
+        missing = (
+            "Current tool is missing."
+            if tool is None
+            else (
+                "Current code is missing."
+                if code is None
+                else f"Unsupported tool: {tool}"
+            )
         )
+        log_event(
+            run_id=state.get("run_id") or "unknown",
+            node="tool_execution",
+            event="execution_skipped",
+            status="failed",
+            details={
+                "task_id": task["task_id"],
+                "tool": tool,
+                "reason": missing,
+                "retry_count": state.get("retry_count", 0),
+            },
+        )
+        previous = state.get("execution_results", [])
+        attempt = (
+            task["task_id"],
+            state.get("retry_count", 0),
+            state.get("refine_count", 0),
+        )
+        deduped = [
+            existing
+            for existing in previous
+            if (
+                existing.get("task_id"),
+                existing.get("retry_count", 0),
+                existing.get("refine_count", 0),
+            )
+            != attempt
+        ]
+        return {
+            "execution_results": deduped
+            + [
+                {
+                    "task_id": task["task_id"],
+                    "tool_used": tool,
+                    "code": code,
+                    "success": False,
+                    "result": None,
+                    "result_artifact": None,
+                    "error": missing,
+                    "retry_count": state.get("retry_count", 0),
+                    "refine_count": state.get("refine_count", 0),
+                }
+            ],
+            "execution_error": missing,
+            # 归类为环境类：重发一次同样的"空代码"不会好转，
+            # 因此不进入修复循环，直接收敛成失败。
+            "execution_error_kind": BUDGET_ERROR_KIND,
+        }
 
     # 参数校验失败与执行失败都从 invoke_tool 以错误字典返回，
     # 交给 route_after_execution 走修复循环，而不是在这里抛异常终止工作流。
@@ -1080,6 +1331,30 @@ def report_node(
     state: InsightFlowState
 ) -> dict:
 
+    # 没有任何执行结果时不必调用模型。
+    #
+    # 这条路径由"预算耗尽"暴露出来：执行阶段被预算拦下后，图仍会走到这里
+    # （`failed_task → advance → complete → visualization_planner → report`）。
+    # 此前它会正常调用 Report Agent，而预算已尽 → 再抛 `BudgetExceeded`；
+    # 即便拿到了内容，`artifact_node` 也会因为缺少产物而崩。
+    # 因此这里显式收敛：没有可汇报的结果时直接给出结论，不产出产物文件。
+    #
+    # **不要覆盖已经确定的结论**：计划为空时上游已经把 analysis_status
+    # 置为 `no_tasks`（一个合法终态），预算耗尽时置为 `failed`。
+    # 这里若无条件写 `failed`，会把"没有任务可分析"错报成"运行失败"——
+    # 那正是 `test_planner_rejecting_is_not_reported_as_success` 守住的性质。
+    if not get_final_execution_results(state.get("execution_results", [])):
+        existing_status = state.get("analysis_status")
+        reason = (
+            state.get("status_reason")
+            or "没有任何成功的分析结果可供生成报告"
+        )
+        return {
+            "report_content": None,
+            "analysis_status": existing_status or "failed",
+            "status_reason": reason,
+        }
+
     final_execution_results = (
         get_final_execution_results(
             state.get(
@@ -1196,7 +1471,8 @@ def report_node(
                 # P4：把这次报告上下文的预算与真实用量记进结构化日志，
                 # 使"上下文用了多少"成为可观察事实而不是猜测。
                 # estimated_tokens 是估算值（无匹配 tokenizer），字段名里已标注。
-                "context": dict(LAST_CONTEXT_REPORT),
+                # 度量按执行上下文隔离：并发 Run 之间不会互相串写。
+                "context": _context_report_of("reporter"),
             }
         )
 
@@ -1211,14 +1487,18 @@ def artifact_node(
     state: InsightFlowState
 ) -> dict:
 
-    report_content = state[
-        "report_content"
-    ]
+    # 报告内容可能是有意不产出（例如预算耗尽、没有任何执行结果）。
+    # 这种情况不该崩在工作流里：直接跳过产物生成，让 Run 以 failed 收尾。
+    report_content = state.get("report_content")
 
     if report_content is None:
-        raise ValueError(
-            "Report content is missing."
-        )
+        return {
+            "artifacts": list(state.get("artifacts") or []),
+            "report_path": state.get("report_path"),
+            "analysis_status": state.get("analysis_status") or "failed",
+            "status_reason": state.get("status_reason")
+            or "没有报告内容，未生成产物",
+        }
 
     run_id = state.get(
         "run_id"
@@ -1667,10 +1947,47 @@ def plot_generation_node(
     )
 
     if source_execution_result is None:
-        raise ValueError(
-            f"No successful execution result found "
-            f"for source task: {source_task_id}"
+        # 没有可用的源结果时绘图无法进行（典型原因：分析阶段被预算拦下，
+        # 或上游任务失败）。这里收敛成"这张图失败"，而不是抛未分类异常——
+        # 抛异常会让 Run 停在 running，并把"预算耗尽"这个已知原因
+        # 淹没在一个通用崩溃里。
+        reason = (
+            f"绘图所需的分析结果不可用：源任务 {source_task_id} 没有成功的执行结果"
         )
+        # run_id 在这个节点里稍后才赋值，这里单独取一次（日志需要它）
+        log_run_id = state.get("run_id")
+        if log_run_id is not None:
+            log_event(
+                run_id=log_run_id,
+                node="plot_generation",
+                event="plot_skipped",
+                status="failed",
+                details={
+                    "chart_id": chart_id,
+                    "source_task_id": source_task_id,
+                    "reason": reason,
+                },
+            )
+        return {
+            "current_plot_code": None,
+            "visualization_results": [
+                result
+                for result in state.get("visualization_results", [])
+                if result.get("chart_id") != chart_id
+            ]
+            + [
+                {
+                    "chart_id": chart_id,
+                    "code": None,
+                    "success": False,
+                    "path": None,
+                    "error": reason,
+                }
+            ],
+            "plot_error": reason,
+            # 置满重试计数：重画不会好转，路由直接 advance_chart
+            "plot_retry_count": MAX_PLOT_RETRIES,
+        }
 
     generation, _ops, _extra = _governed_agent_call(
         "plotter",
@@ -1735,9 +2052,31 @@ def plot_execution_node(
     code = state["current_plot_code"]
 
     if code is None:
-        raise ValueError(
-            "Current plot code is missing."
-        )
+        # 绘图计划产出为空（例如预算拦下了代码生成）。
+        # 与 `tool_execution_node` 同样的道理：图上 `plot_generation →
+        # plot_execution` 是无条件边，这里抛异常会把"预算耗尽、安全终止"
+        # 变成未分类崩溃。返回失败结果让路由按既有语义走 advance_chart。
+        chart_id = visualization_task["chart_id"]
+        reason = "绘图代码为空，未执行绘图"
+        previous = [
+            result
+            for result in state.get("visualization_results", [])
+            if result.get("chart_id") != chart_id
+        ]
+        return {
+            "visualization_results": previous
+            + [
+                {
+                    "chart_id": chart_id,
+                    "code": None,
+                    "success": False,
+                    "path": None,
+                    "error": reason,
+                }
+            ],
+            "plot_error": reason,
+            "plot_retry_count": MAX_PLOT_RETRIES,
+        }
 
     target_tables = visualization_task[
         "target_tables"
@@ -1818,13 +2157,59 @@ def plot_execution_node(
             "completed_operations": completed_operations(state),
         }
 
-    # 绘图的 result_df 需要记录序列，而不是带 __kind__ 的信封。
-    execution = invoke_tool("plot", resolve_tables(state), {
-        "table_names": target_tables,
-        "chart_id": chart_id,
-        "code": code,
-        "analysis_result": unwrap_records(analysis_result),
-    })
+    # 绘图与 Python/SQL 走**同一个**治理入口。此前这里直接调用 invoke_tool，
+    # 于是绘图既不计入 tool_calls，也不受预算约束——预算设为 0 时仍会启动
+    # 一个 Docker 容器。绘图是有副作用且开销最大的工具，不能是治理的缺口。
+    budget_updates: dict = {}
+    try:
+        with governed_tool_call(state, node="plot_execution", tool="plot") as gate:
+            execution = invoke_tool("plot", resolve_tables(state), {
+                "table_names": target_tables,
+                "chart_id": chart_id,
+                "code": code,
+                "analysis_result": unwrap_records(analysis_result),
+            })
+            gate["error_kind"] = execution.get("error_kind")
+            budget_updates = gate.get("budget_updates") or {}
+    except BudgetExceeded as exceeded:
+        # 预算耗尽属于环境类失败：重画同一张图不会好转，因此**不允许**
+        # 进入 plot_repair 循环（那会为了重试而再次尝试启动容器）。
+        #
+        # 用既有的 plot_retry_count 表达"不再重试"，而不是新增 state 字段：
+        # 未在 InsightFlowState 里声明的键会被 LangGraph 静默丢掉，
+        # 那样路由读不到标志，还是会把流程送进 plot_repair。
+        log_event(
+            run_id=run_id or "unknown",
+            node="plot_execution",
+            event="budget_exceeded",
+            status="failed",
+            details={
+                "scope": exceeded.scope,
+                "used": exceeded.used,
+                "limit": exceeded.limit,
+                "chart_id": chart_id,
+            },
+        )
+        previous_results = [
+            result
+            for result in state.get("visualization_results", [])
+            if result.get("chart_id") != chart_id
+        ]
+        return {
+            "visualization_results": previous_results
+            + [
+                {
+                    "chart_id": chart_id,
+                    "code": code,
+                    "success": False,
+                    "path": None,
+                    "error": str(exceeded),
+                }
+            ],
+            "plot_error": str(exceeded),
+            # 置满重试计数 → route_after_plot_execution 直接走 advance_chart
+            "plot_retry_count": MAX_PLOT_RETRIES,
+        }
 
     visualization_result = {
         "chart_id": chart_id,
@@ -1897,6 +2282,10 @@ def plot_execution_node(
             "plot_error": execution["error"],
         },
     )
+
+    # 把治理层产生的预算增量（工具调用计数 + 执行时钟结算）并入返回值，
+    # 否则绘图消耗不会落盘，恢复后预算就归零了。
+    updates.update(budget_updates)
 
     return updates
 

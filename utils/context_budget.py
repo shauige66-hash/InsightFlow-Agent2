@@ -27,9 +27,48 @@
 
 from __future__ import annotations
 
+import contextvars
 import json
 from dataclasses import dataclass, field
 from typing import Any
+
+# ---------------------------------------------------------------------------
+# 上下文度量的传递：按执行上下文隔离
+# ---------------------------------------------------------------------------
+
+#: 最近一次上下文构造的度量，**按执行上下文隔离**。
+#:
+#: 早期实现把它放在每个 Agent 模块的模块级字典里。`RunCoordinator` 用
+#: `ThreadPoolExecutor` 并发执行多个 Run，于是两个 Run 同时调用同一个 Agent 时，
+#: 后写的那个会覆盖先写的——结果是 **A Run 的上下文度量被记到 B Run 的日志里**。
+#: 模块级可变状态在并发下没有归属，换成 `ContextVar` 就没有这个问题：
+#: 每个线程/任务看到自己 set 的那份（线程池提交时会复制上下文）。
+#:
+#: 结构是 `{agent 名: 度量}`，因为同一次执行里可能调用多个 Agent。
+_context_reports: contextvars.ContextVar[dict[str, dict[str, Any]]] = (
+    contextvars.ContextVar("insightflow_context_reports", default={})
+)
+
+
+def publish_context_report(node: str, report: dict[str, Any]) -> None:
+    """记录某个 Agent 本次的上下文度量。
+
+    整体替换而不是 `clear()` + `update()`：后者是两步操作，中间可能被
+    另一个线程观察到"空度量"。
+    """
+    current = dict(_context_reports.get())
+    current[node] = dict(report)
+    _context_reports.set(current)
+
+
+def context_report_of(node: str) -> dict[str, Any]:
+    """取回某个 Agent **本次执行**的上下文度量；没有则返回空字典。"""
+    return dict(_context_reports.get().get(node) or {})
+
+
+def clear_context_reports() -> None:
+    """清空本执行上下文的度量（测试用）。"""
+    _context_reports.set({})
 
 # 估算比例：英文字符约 4 个/token，中文约 1 个/token。
 # 这里取 3.5 作为两种文本混合时的粗略折算，**明确标注为估算**。

@@ -18,6 +18,23 @@ from core.runtime import (
 )
 from ingestion.resources import ResourceResolver
 from utils.agent_loop import AgentBudget, new_usage
+
+
+def _resolve_budget(budget: AgentBudget | dict[str, Any] | None) -> AgentBudget:
+    """把调用方给的预算收敛成 `AgentBudget`。
+
+    接受 dict 是为了让 CLI/脚本能直接写配置；未知字段被忽略、
+    负数被拒绝（与 `AgentBudget.from_dict` 同一套规则，见那里的说明：
+    `0` 是合法上限，表示"一次都不许"）。
+    """
+    if budget is None:
+        return AgentBudget()
+    if isinstance(budget, AgentBudget):
+        return budget
+    if isinstance(budget, dict):
+        return AgentBudget.from_dict(budget)
+    raise TypeError(f"不支持的预算类型：{type(budget).__name__}")
+
 from utils.idempotency import LlmCallAbandoned
 from utils.run_logger import create_run_id, log_event
 from workflow import create_workflow
@@ -74,6 +91,7 @@ def run_analysis(
     continue_from_checkpoint: bool = False,
     resume_value: Any | None = None,
     mcp: McpSettings | None = None,
+    budget: AgentBudget | dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """执行（或恢复）一次完整分析。
 
@@ -84,6 +102,11 @@ def run_analysis(
     `continue_from_checkpoint` 用于进程异常终止后的续跑：传 None 作为输入，
     让 LangGraph 从最后提交的 Checkpoint 继续，而不是从头重跑。
     `checkpointer` 为 None 时退化为无持久化的一次性执行，便于单次脚本调用。
+
+    `budget` 覆盖默认执行预算（轮次/工具调用/模型请求/墙上时钟）。
+    与 `mcp` 一样属于**可信运行期配置**：它决定"这次允许做多少工作"，
+    因此只由宿主调用方提供，不从请求体读取。传 None 用默认值。
+    注意它只影响**新建**的预算快照；恢复已有 Run 时以 state 里已存的为准。
 
     注意：从 Checkpoint 续跑意味着最后提交点之后的工作会被重放。
     有副作用的步骤依靠幂等登记跳过，模型调用无法保证恰好一次（见
@@ -126,8 +149,12 @@ def run_analysis(
             # P3-A：预算从第一轮就写入 state，之后按增量累加。
             # 恢复时不重建它（见 utils/agent_loop.initialize）。
             "execution_budget": {
-                "limits": AgentBudget().to_dict(),
-                "usage": {**new_usage(), "started_at": time.time()},
+                "limits": _resolve_budget(budget).to_dict(),
+                "usage": {
+                    **new_usage(),
+                    "started_at": time.time(),
+                    "last_active_at": time.time(),
+                },
             },
             "run_status": "running",
             "require_plan_approval": require_plan_approval,

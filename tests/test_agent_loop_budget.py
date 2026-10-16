@@ -21,6 +21,7 @@ import pytest
 from core.runtime import McpSettings
 from ingestion.resources import ResourceResolver
 from services.analysis_service import run_analysis
+from utils import agent_loop
 from utils.agent_loop import (
     BUDGET_ERROR_KIND,
     BUDGET_FIELD,
@@ -103,16 +104,43 @@ class TestBudgetArithmetic:
             check(state)
         assert error.value.scope == scope
 
-    def test_time_budget_is_wall_clock(self) -> None:
-        state = state_with(max_seconds=10)
+    def test_time_budget_counts_real_work(self) -> None:
+        """时间预算按**真实工作**累计，用受控时钟验证（不 sleep）。
 
-        # 开始时刻往前推 11 秒，模拟"已经跑了很久"
-        usage = usage_of(state)
-        state[BUDGET_FIELD]["usage"] = {**usage, "started_at": time.time() - 11}
+        这条用例替换了早期的 `test_time_budget_is_wall_clock`：那时实现是
+        `now - started_at`，把等待人工审批的时间也算作消耗。修正后的语义是
+        "操作开始→结束"之间的时间才计入，因此这里显式走一遍该序列。
+        """
+        clock = {"now": 1_000_000.0}
+        original = agent_loop.time.time
+        agent_loop.time.time = lambda: clock["now"]
+        try:
+            state = state_with(max_seconds=10)
 
-        with pytest.raises(BudgetExceeded) as error:
-            check(state)
-        assert error.value.scope == "seconds"
+            # 开始一次操作，12 秒后结束
+            state.update(agent_loop.capture_active_time(state))
+            clock["now"] += 12
+            state.update(agent_loop.settle_active_time(state))
+
+            assert elapsed_seconds(state) == pytest.approx(12.0, abs=0.01)
+            with pytest.raises(BudgetExceeded) as error:
+                check(state)
+            assert error.value.scope == "seconds"
+        finally:
+            agent_loop.time.time = original
+
+    def test_time_budget_ignores_idling(self) -> None:
+        """没有发生任何操作时，时间不得前进（这是"等待不计入"的基础）。"""
+        clock = {"now": 1_000_000.0}
+        original = agent_loop.time.time
+        agent_loop.time.time = lambda: clock["now"]
+        try:
+            state = state_with(max_seconds=10)
+            clock["now"] += 3600  # 干等一小时
+            assert elapsed_seconds(state) == pytest.approx(0.0, abs=0.01)
+            check(state)  # 不应耗尽
+        finally:
+            agent_loop.time.time = original
 
     def test_elapsed_excludes_nothing_before_start(self) -> None:
         assert elapsed_seconds({}) == 0.0
@@ -340,30 +368,17 @@ class TestMiddlewareBudgets:
             with governed_tool_call(state, node="tool_execution", tool="python"):
                 pytest.fail("预算已耗尽时不应进入调用体")
 
-    def test_governed_llm_call_reports_duration(self) -> None:
-        from utils.middleware import governed_llm_call
+    def test_governed_llm_call_is_no_longer_a_second_entry(self) -> None:
+        """模型预算只有一条生效路径。
 
-        state = state_with()
-        state["run_id"] = "p3-mw-llm"
+        回归：`utils/middleware.governed_llm_call` 曾被定义但从未被调用，
+        而真正生效的是 `nodes._governed_agent_call` →
+        `utils/idempotency.run_agent_call`。两套并行实现会让人误以为
+        前者参与预算执行，因此已删除。这条用例固定"只有一条路径"。
+        """
+        import utils.middleware as middleware
 
-        payload, updates = governed_llm_call(
-            state, node="planner", subject="plan_1#0", call=lambda: {"ok": True}
-        )
-
-        assert payload == {"ok": True}
-        assert updates[BUDGET_FIELD]["usage"]["llm_calls"] == 1
-
-    def test_governed_llm_call_propagates_exceptions(self) -> None:
-        from utils.middleware import governed_llm_call
-
-        state = state_with()
-        state["run_id"] = "p3-mw-llm-err"
-
-        def boom() -> None:
-            raise RuntimeError("上游炸了")
-
-        with pytest.raises(RuntimeError):
-            governed_llm_call(state, node="planner", subject="s", call=boom)
+        assert not hasattr(middleware, "governed_llm_call")
 
     def test_merge_budget_keeps_latest(self) -> None:
         from utils.middleware import merge_budget

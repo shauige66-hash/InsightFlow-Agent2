@@ -126,6 +126,29 @@ class LlmCallAbandoned(RuntimeError):
     """
 
 
+#: 当前逻辑调用的请求计数作用域 token。
+#:
+#: 放在模块级而不是节点层：`run_agent_call` 是这条路径的唯一入口，
+#: 进出都在这里配对，不会因为节点层忘记恢复而泄漏。
+_request_scope: Any = None
+
+
+def _begin_request_scope() -> None:
+    from utils.agent_loop import begin_operation_requests
+
+    global _request_scope
+    _request_scope = begin_operation_requests()
+
+
+def _end_request_scope() -> None:
+    from utils.agent_loop import end_operation_requests
+
+    global _request_scope
+    token, _request_scope = _request_scope, None
+    if token is not None:
+        end_operation_requests(token)
+
+
 # 恢复时，state 里这些键指向"上次可能已发出但未登记结果"的模型调用
 PENDING_LLM_KEY = "pending_llm_calls"
 
@@ -197,6 +220,7 @@ def run_agent_call(
     subject: str,
     call: Any,
     attempt: int = 1,
+    before_request: Any = None,
 ) -> tuple[Any, dict[str, dict[str, Any]], dict[str, Any]]:
     """执行一次 Agent 调用，并把它记入账本与幂等登记。
 
@@ -207,6 +231,19 @@ def run_agent_call(
     返回 `(结果, 幂等登记, 额外 state 增量)`。第三个返回值不能省：
     获准重试时必须把 `pending_llm_calls` 清空写回 state，
     否则下一次 resume 会从账本重新算出同一个未确认调用并再次中断。
+
+    `before_request` 是**真实请求发出前的最后一道闸门**（P3 用它判预算）。
+    位置很关键，必须同时满足：
+
+    - 在幂等命中判断**之后**：复用不会发出请求，因此不该被预算拦下，
+      也不该消耗额度；
+    - 在 `record_started` **之前**：拦住时不能往账本写 `started`，
+      否则会留下永远没有 `completed` 的记录，恢复时被当成"未确认的模型调用"
+      并要求人工裁决——预算问题不该变成人工工单。
+
+    `call` 里若发生结构化输出解析失败并内部重试，重试的计数与判定由
+    `utils/llm_retry` 的回调完成（见那里的 `before_request` / `on_request`），
+    本函数只保证"至少有一次真实请求"这一口径。
 
     三层保护各司其职：
 
@@ -228,12 +265,26 @@ def run_agent_call(
     # 每次进入都要先过未确认检查
     updates, _decision = guard_llm_calls(state)
 
+    # 开启"本次逻辑调用"的请求计数作用域。真实请求的判定与计数由
+    # `utils/agent_loop` 的钩子完成（它们要覆盖内部重试的每一次请求），
+    # 这里只负责划出作用域边界。
+    _begin_request_scope()
+
+    # 预算闸门：只判不记，且必须在落账本之前
+    if before_request is not None:
+        before_request()
+
     ledger_root = _ledger_root()
     llm_ledger.record_started(
         run_id=run_id, operation_id=op_id, node=node, attempt=attempt, root=ledger_root
     )
 
-    payload = call()
+    try:
+        payload = call()
+    finally:
+        # 无论成功与否都要清掉"本次逻辑调用已发出的请求数"，
+        # 否则计数会泄漏到下一次调用，让后续调用的判定提前失败。
+        _end_request_scope()
 
     llm_ledger.record_completed(
         run_id=run_id, operation_id=op_id, node=node, attempt=attempt, root=ledger_root

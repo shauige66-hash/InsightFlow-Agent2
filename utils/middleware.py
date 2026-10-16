@@ -14,28 +14,37 @@
 并复用既有的日志、账本、错误分类与 Tool Registry。
 不新建幂等系统、不新建重试系统、不接管节点路由。
 
-## 三个入口
+## 入口
 
-- `governed_tool_call()`：包住一次工具调用，计时 + 计费 + 记录。
-- `governed_llm_call()`：包住一次模型调用，计费 + 记录。
+- `governed_tool_call()`：包住一次工具调用，判预算 + 计时 + 计数 + 记录。
 - `record_round()`：记一次 Reason→Act→Observe→Decide 轮次。
 
-三者都在预算耗尽时抛 `BudgetExceeded`，由节点转成正常的失败记录。
+两者都在预算耗尽时抛 `BudgetExceeded`，由节点转成正常的失败记录。
+
+**模型调用不在这里。** 它必须与幂等登记、账本的 `started`/`completed`、
+以及"未确认调用需人工裁决"的拦截协同，那些逻辑集中在
+`utils/idempotency.run_agent_call`；预算闸门以 `before_request` 回调的形式
+接进那条路径（见 `nodes._governed_agent_call` 与
+`utils/agent_loop.before_model_request`）。
+
+早期这里还有一个 `governed_llm_call()`，但没有任何代码调用它，而真正生效的
+是上面那条路径——两套并行实现会让人误以为它参与了预算执行，已删除。
 """
 
 from __future__ import annotations
 
 import time
 from contextlib import contextmanager
-from typing import Any, Callable, Iterator
+from typing import Any, Iterator
 
 from utils.agent_loop import (
     BUDGET_ERROR_KIND,
+    BUDGET_FIELD,
     BudgetExceeded,
     check,
-    consume_llm_call,
     consume_round,
     consume_tool_call,
+    settle_active_time,
     snapshot,
 )
 from utils.run_logger import log_event
@@ -93,6 +102,11 @@ def governed_tool_call(
 
     预算耗尽可能发生在进入之前（`check`）——那时会抛 `BudgetExceeded`。
     工具自身抛异常不受影响：异常照常向上传播，计时与日志在 finally 里完成。
+
+    调用结束时会把执行时钟**结算**到当前时刻（`settle_active_time`）：
+    这样"距上次操作"的那段尾巴被一次算清，之后停下来等待人工审批的时间
+    不会继续被计入执行预算。返回值在 `budget_updates` 里，
+    调用方必须写回 state，否则时钟推进不会落盘。
     """
     check(state)
 
@@ -105,58 +119,22 @@ def governed_tool_call(
     finally:
         duration_ms = round((time.perf_counter() - started) * 1000, 2)
         results["duration_ms"] = duration_ms
+        # 结算执行时钟（与计数合并成同一份增量）
+        merged = results.get("budget_updates") or {}
+        settled = settle_active_time({**state, **merged})
+        merged = {
+            **merged,
+            BUDGET_FIELD: settled[BUDGET_FIELD],
+        }
+        results["budget_updates"] = merged
         _log(
-            state,
+            {**state, **merged},
             node=node,
             event="tool_call",
             status=str(results.get("error_kind") or "ok"),
             details={"tool": tool, "error_kind": results.get("error_kind")},
             duration_ms=duration_ms,
         )
-
-
-def governed_llm_call(
-    state: dict[str, Any],
-    *,
-    node: str,
-    subject: str,
-    call: Callable[[], Any],
-) -> tuple[Any, dict[str, Any]]:
-    """包住一次模型调用：判预算、计时、记录。
-
-    返回 `(结果, 要写回 state 的预算增量)`。
-
-    与 `utils/idempotency.run_agent_call` 的分工是明确的：
-    **幂等与"是否已确认完成"由它负责，这里的预算是另一件事**。
-    本函数不碰账本，也不决定要不要重发。
-    """
-    check(state)
-
-    updates = consume_llm_call(state)
-    started = time.perf_counter()
-
-    try:
-        payload = call()
-    except BaseException:
-        _log(
-            state,
-            node=node,
-            event="llm_call",
-            status="error",
-            details={"subject": subject},
-            duration_ms=round((time.perf_counter() - started) * 1000, 2),
-        )
-        raise
-
-    _log(
-        state,
-        node=node,
-        event="llm_call",
-        status="ok",
-        details={"subject": subject},
-        duration_ms=round((time.perf_counter() - started) * 1000, 2),
-    )
-    return payload, updates
 
 
 def merge_budget(
@@ -177,7 +155,6 @@ def merge_budget(
 __all__ = [
     "BUDGET_ERROR_KIND",
     "BudgetExceeded",
-    "governed_llm_call",
     "governed_tool_call",
     "merge_budget",
     "record_round",
