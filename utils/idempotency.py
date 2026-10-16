@@ -27,8 +27,9 @@ Checkpoint 是"至少一次"语义：进程可能在节点执行完、提交之�
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Iterator
 
 from utils import llm_ledger
 
@@ -126,26 +127,24 @@ class LlmCallAbandoned(RuntimeError):
     """
 
 
-#: 当前逻辑调用的请求计数作用域 token。
-#:
-#: 放在模块级而不是节点层：`run_agent_call` 是这条路径的唯一入口，
-#: 进出都在这里配对，不会因为节点层忘记恢复而泄漏。
-_request_scope: Any = None
+@contextmanager
+def _request_scope() -> Iterator[None]:
+    """划出"本次逻辑调用"的请求计数区间。
 
+    Token 必须是这一层的局部变量。曾经把它存进模块级全局，而
+    `RunExecutor` 用线程池并发执行 Run：两个 Run 的区间重叠时，
+    后进入者的 token 会覆盖先进入者的，先进入者结算时拿到的是**别人上下文**
+    里的 token，`ContextVar.reset` 直接抛 `ValueError`；或者全局已被清空，
+    先进入者的 token 永远不被 reset，计数泄漏到后续调用。
 
-def _begin_request_scope() -> None:
-    from utils.agent_loop import begin_operation_requests
+    放在 `finally` 里重置，异常路径也能结算。
+    """
+    from utils.agent_loop import begin_operation_requests, end_operation_requests
 
-    global _request_scope
-    _request_scope = begin_operation_requests()
-
-
-def _end_request_scope() -> None:
-    from utils.agent_loop import end_operation_requests
-
-    global _request_scope
-    token, _request_scope = _request_scope, None
-    if token is not None:
+    token = begin_operation_requests()
+    try:
+        yield
+    finally:
         end_operation_requests(token)
 
 
@@ -265,30 +264,24 @@ def run_agent_call(
     # 每次进入都要先过未确认检查
     updates, _decision = guard_llm_calls(state)
 
-    # 开启"本次逻辑调用"的请求计数作用域。真实请求的判定与计数由
-    # `utils/agent_loop` 的钩子完成（它们要覆盖内部重试的每一次请求），
-    # 这里只负责划出作用域边界。
-    _begin_request_scope()
+    # 请求计数作用域要罩住**整段**逻辑调用：闸门被预算拦下、账本写入失败、
+    # 请求本身抛错，都必须结算区间，否则计数会泄漏到下一次调用。
+    # 闸门仍留在 `record_started` 之前，账本语义不变。
+    with _request_scope():
+        # 预算闸门：只判不记，且必须在落账本之前
+        if before_request is not None:
+            before_request()
 
-    # 预算闸门：只判不记，且必须在落账本之前
-    if before_request is not None:
-        before_request()
+        ledger_root = _ledger_root()
+        llm_ledger.record_started(
+            run_id=run_id, operation_id=op_id, node=node, attempt=attempt, root=ledger_root
+        )
 
-    ledger_root = _ledger_root()
-    llm_ledger.record_started(
-        run_id=run_id, operation_id=op_id, node=node, attempt=attempt, root=ledger_root
-    )
-
-    try:
         payload = call()
-    finally:
-        # 无论成功与否都要清掉"本次逻辑调用已发出的请求数"，
-        # 否则计数会泄漏到下一次调用，让后续调用的判定提前失败。
-        _end_request_scope()
 
-    llm_ledger.record_completed(
-        run_id=run_id, operation_id=op_id, node=node, attempt=attempt, root=ledger_root
-    )
+        llm_ledger.record_completed(
+            run_id=run_id, operation_id=op_id, node=node, attempt=attempt, root=ledger_root
+        )
 
     merged = completed_operations(state)
     merged[op_id] = OperationRecord(
