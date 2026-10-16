@@ -105,8 +105,9 @@ def governed_tool_call(
 
     调用结束时会把执行时钟**结算**到当前时刻（`settle_active_time`）：
     这样"距上次操作"的那段尾巴被一次算清，之后停下来等待人工审批的时间
-    不会继续被计入执行预算。返回值在 `budget_updates` 里，
-    调用方必须写回 state，否则时钟推进不会落盘。
+    不会继续被计入执行预算。返回值在 `budget_updates` 里，调用方必须写回
+    state，否则时钟推进不会落盘——结算发生在 `finally`，因此要在 `with`
+    **退出之后**再取，块内取到的是结算前的值。
     """
     check(state)
 

@@ -768,7 +768,9 @@ def tool_execution_node(
                 snapshots=state.get("table_snapshot") or {},
             )
             gate["error_kind"] = execution.get("error_kind")
-            budget_updates = gate.get("budget_updates") or {}
+        # finally 里才结算执行时钟，必须在 with 退出后重读，否则拿到的是
+        # 结算前的 clock_open=True
+        budget_updates = gate.get("budget_updates") or {}
     except BudgetExceeded as exceeded:
         execution = {
             "success": False,
@@ -2170,7 +2172,8 @@ def plot_execution_node(
                 "analysis_result": unwrap_records(analysis_result),
             })
             gate["error_kind"] = execution.get("error_kind")
-            budget_updates = gate.get("budget_updates") or {}
+        # 同 tool_execution：时钟在 finally 里结算，退出 with 之后再取
+        budget_updates = gate.get("budget_updates") or {}
     except BudgetExceeded as exceeded:
         # 预算耗尽属于环境类失败：重画同一张图不会好转，因此**不允许**
         # 进入 plot_repair 循环（那会为了重试而再次尝试启动容器）。
