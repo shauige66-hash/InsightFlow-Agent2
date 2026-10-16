@@ -210,6 +210,25 @@ def budget_of(state: dict[str, Any]) -> AgentBudget:
     return AgentBudget()
 
 
+def _wait_started_at(state: dict[str, Any]) -> float | None:
+    """老 Checkpoint 里"开始等待人工审批"的时刻，取不到返回 None。
+
+    `pending_approval` 是审批请求本身（在 `interrupt` 之前写入），它带
+    `created_at`，就是执行停下来等人工的那一刻。迁移时用它可以只折算
+    "等待之前真正执行过的那段"，而不把等待算进执行预算。
+
+    审批完成后 `pending_approval` 被清空，归档记录里只有 `decided_at`
+    （没有请求时刻），因此**无法**再区分等待与执行——那种情况下返回 None，
+    由调用方走保守策略。
+    """
+    pending = state.get("pending_approval")
+    if isinstance(pending, dict):
+        created = pending.get("created_at")
+        if isinstance(created, (int, float)):
+            return float(created)
+    return None
+
+
 def initialize(state: dict[str, Any]) -> dict[str, Any]:
     """确保 state 里有一份预算快照，并在首次调用时打上开始时刻。
 
@@ -217,10 +236,17 @@ def initialize(state: dict[str, Any]) -> dict[str, Any]:
     "恢复后不重置预算"的实现点。
 
     **老 Checkpoint 的迁移**：P3 早期只持久化 `started_at`，没有
-    `active_seconds`。那种记录里的"已消耗时间"就是 `now - started_at`
-    （当时确实是这么算的）。迁移时把它一次性折成 `active_seconds`，
-    从而**保留已消耗的时间**，并在此之后改为按真实操作累加——
-    也就是说升级不会把已用的时间预算退回去，也不会把历史等待时间继续算下去。
+    `active_seconds`，当时的"已消耗时间"是 `now - started_at`，也就是把
+    人工审批的等待一并算了进去。迁移规则：
+
+    - 能证明当时正在等待审批（`pending_approval.created_at` 可用）时，
+      只折算 `created_at - started_at`，等待时间不计入执行预算；
+    - 否则按 `now - started_at` 折算，但以 `max_seconds` 封顶。
+
+    这是**保守且可解释**的策略，不是精确重建：老格式没有记录执行与等待的
+    分界，无法还原真实执行时间。封顶的意义是避免"等待了两小时的老 Run，
+    预算只有 1800 秒，一恢复就立刻失败"——那会让等待时间变成一次性的额度
+    清零。已消耗的时间不会被退回，已归档的审批记录也不改写。
     """
     payload = state.get(BUDGET_FIELD)
 
@@ -237,6 +263,7 @@ def initialize(state: dict[str, Any]) -> dict[str, Any]:
         }
 
     usage = usage_of(state)
+    limits = AgentBudget.from_dict(payload.get("limits"))
     changed = False
 
     if usage.get("started_at") is None:
@@ -245,12 +272,19 @@ def initialize(state: dict[str, Any]) -> dict[str, Any]:
         changed = True
 
     if payload.get("usage", {}).get("active_seconds") is None:
-        # 迁移：旧的"已用时间"按 started_at 折算一次，之后不再用墙钟
+        # 迁移：把旧的"已用时间"折算一次，之后不再用墙钟
         started = usage.get("started_at")
         carried = 0.0
         if isinstance(started, (int, float)):
-            carried = max(0.0, time.time() - float(started))
-        usage["active_seconds"] = carried
+            started = float(started)
+            wait_started = _wait_started_at(state)
+            if wait_started is not None and wait_started >= started:
+                # 等待之前的那段才是执行时间
+                carried = wait_started - started
+            else:
+                carried = max(0.0, time.time() - started)
+            carried = min(carried, limits.max_seconds)
+        usage["active_seconds"] = max(0.0, carried)
         changed = True
 
     if usage.get("last_active_at") is None:
@@ -262,7 +296,7 @@ def initialize(state: dict[str, Any]) -> dict[str, Any]:
 
     return {
         BUDGET_FIELD: {
-            "limits": AgentBudget.from_dict(payload.get("limits")).to_dict(),
+            "limits": limits.to_dict(),
             "usage": usage,
         }
     }
@@ -452,11 +486,6 @@ def consume_llm_call(state: dict[str, Any]) -> dict[str, Any]:
     return _bump(state, "llm_calls")
 
 
-#: `consume_llm_call` 的显式别名。两者是同一个函数，
-#: 别名只是为了让"这里计的是真实请求"在调用点更醒目。
-consume_llm_request = consume_llm_call
-
-
 # ---------------------------------------------------------------------------
 # 模型请求钩子：让 Agent 层能在**每次真实请求**前后判预算与计数
 # ---------------------------------------------------------------------------
@@ -474,19 +503,11 @@ _state_provider: Any = None
 def set_state_provider(provider: Any = None) -> None:
     """注册"取当前 state"的函数。
 
-    节点层用一个 `ContextVar` 保存正在执行的 state，这里通过它取值，
+    节点层用一个 `ContextVar` 保存正在执行的 state，这里的钩子通过它取值，
     从而让 `utils` 层不必知道节点模块的存在。
     """
     global _state_provider
     _state_provider = provider
-
-
-def current_state() -> dict[str, Any] | None:
-    """当前 Run 的 state；不在节点执行上下文中时返回 None。"""
-    provider = _state_provider
-    if provider is None:
-        return None
-    return provider()
 
 
 def set_request_hooks(

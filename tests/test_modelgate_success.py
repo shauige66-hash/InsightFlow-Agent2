@@ -191,9 +191,8 @@ def _fetch_run_detail(run_id: str) -> dict:
 def gateway_with_mock_upstream(mock_provider):
     """以成功链路配置启动隔离的 ModelGate 测试栈。
 
-    拆除前把证据转存到 `docs/evidence/modelgate-success.json`：
-    测试栈会连同数据卷一起删除，留在库里的记录随之消失，
-    因此需要在栈还活着的时候取证。
+    拆除前采集证据（测试栈会连同数据卷一起删除，留在库里的记录随之消失）。
+    证据的落点见 `_evidence_path()`：默认不覆盖已被 Git 跟踪的公开证据文件。
     """
     up = _compose("up", "-d")
     if up.returncode != 0:
@@ -276,12 +275,47 @@ def _dump_evidence() -> None:
         "runs": entries,
     }
 
-    out_path = PROJECT_ROOT / "docs" / "evidence" / "modelgate-success.json"
+    out_path = _evidence_path()
     out_path.parent.mkdir(parents=True, exist_ok=True)
+    if _is_tracked_by_git(out_path):
+        # 取证会带上本次随机的 run_id 与耗时，写回已跟踪的公开证据文件等于制造噪声改动。
+        # 需要刷新证据时显式设置 MODELGATE_EVIDENCE_DIR（或直接删掉目标文件）再跑。
+        print(f"\n[证据] 跳过写入已跟踪文件 {out_path}（设置 MODELGATE_EVIDENCE_DIR 可指定输出位置）")
+        return
+
     out_path.write_text(
         json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
     )
     print(f"\n[证据] 已写入 {out_path}")
+
+
+def _evidence_path() -> Path:
+    """证据输出位置。
+
+    默认写仓库的 `docs/evidence/`；该目录里的文件已被 Git 跟踪，
+    因此测试运行默认跳过覆盖，只有显式指定 **未被跟踪** 的位置才写入。
+    这样公开证据文件不会被一次测试运行改写成带随机 run_id 的内容。
+    """
+    override = os.getenv("MODELGATE_EVIDENCE_DIR")
+    if override:
+        return Path(override) / "modelgate-success.json"
+    return PROJECT_ROOT / "docs" / "evidence" / "modelgate-success.json"
+
+
+def _is_tracked_by_git(path: Path) -> bool:
+    """目标文件是否已被 Git 跟踪。"""
+    git = shutil.which("git")
+    if git is None:
+        return False
+    try:
+        result = subprocess.run(
+            [git, "-C", str(PROJECT_ROOT), "ls-files", "--error-unmatch", str(path)],
+            capture_output=True,
+            timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return result.returncode == 0
 
 
 def fresh_run_id(prefix: str = "iflow") -> str:
