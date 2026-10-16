@@ -199,22 +199,36 @@ class RunCoordinator:
         )
         return result
 
-    def _fail(self, run_id: str, error: Exception) -> None:
+    def _fail(self, run_id: str, error: Exception, *, output_root: Path) -> None:
         """把异常映射成终态。
 
         `LlmCallAbandoned`（人工选择不重发未确认的调用）是受控终止，
         其余异常也一律落 failed——不能让 Run 停在 running。
+
+        日志目录跟随 `output_root`，因此这里必须显式绑定运行期上下文：
+        `run_analysis` 已经退出它的 `use_runtime`，不重新绑定的话
+        `utils.run_logger` 会退回相对当前工作目录的默认位置，
+        同一个 Run 的失败记录会落到另一棵目录树里。
         """
-        log_event(
+        from core.runtime import RunRuntime, use_runtime
+
+        runtime = RunRuntime(
             run_id=run_id,
-            node="coordinator",
-            event="run_failed",
-            status="failed",
-            details={
-                "error_type": type(error).__name__,
-                "error": str(error),
-            },
+            model_factory=None,  # type: ignore[arg-type] - 仅用于解析日志目录
+            resolver=None,  # type: ignore[arg-type]
+            output_root=Path(output_root),
         )
+        with use_runtime(runtime):
+            log_event(
+                run_id=run_id,
+                node="coordinator",
+                event="run_failed",
+                status="failed",
+                details={
+                    "error_type": type(error).__name__,
+                    "error": str(error),
+                },
+            )
         self.store.update_status(run_id, "failed", error=str(error))
 
     def start(
@@ -259,7 +273,7 @@ class RunCoordinator:
                 )
                 return self._finalize(run_id, result)
             except Exception as error:  # noqa: BLE001 - 失败必须落到 Run 状态
-                self._fail(run_id, error)
+                self._fail(run_id, error, output_root=self.output_root)
                 raise
             finally:
                 self.executor._stop_heartbeat(run_id)
@@ -317,7 +331,7 @@ class RunCoordinator:
                 # 查询接口会一直显示 running。
                 return self._finalize(run_id, result)
             except Exception as error:  # noqa: BLE001
-                self._fail(run_id, error)
+                self._fail(run_id, error, output_root=self.output_root)
                 raise
             finally:
                 self.executor._stop_heartbeat(run_id)

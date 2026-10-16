@@ -42,7 +42,8 @@ from typing import Any
 #: `ThreadPoolExecutor` 并发执行多个 Run，于是两个 Run 同时调用同一个 Agent 时，
 #: 后写的那个会覆盖先写的——结果是 **A Run 的上下文度量被记到 B Run 的日志里**。
 #: 模块级可变状态在并发下没有归属，换成 `ContextVar` 就没有这个问题：
-#: 每个线程/任务看到自己 set 的那份（线程池提交时会复制上下文）。
+#: 每个执行上下文看到自己 set 的那份。注意线程池**不会**把提交线程的上下文
+#: 复制进工作线程（工作线程看到的是 `default`），隔离性正是由此而来。
 #:
 #: 结构是 `{agent 名: 度量}`，因为同一次执行里可能调用多个 Agent。
 _context_reports: contextvars.ContextVar[dict[str, dict[str, Any]]] = (

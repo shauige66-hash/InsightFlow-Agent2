@@ -368,27 +368,22 @@ class TestMiddlewareBudgets:
             with governed_tool_call(state, node="tool_execution", tool="python"):
                 pytest.fail("预算已耗尽时不应进入调用体")
 
-    def test_governed_llm_call_is_no_longer_a_second_entry(self) -> None:
-        """模型预算只有一条生效路径。
+    def test_middleware_has_no_parallel_entry_points(self) -> None:
+        """治理只有一条生效路径，中间件不再有重复实现。
 
-        回归：`utils/middleware.governed_llm_call` 曾被定义但从未被调用，
-        而真正生效的是 `nodes._governed_agent_call` →
-        `utils/idempotency.run_agent_call`。两套并行实现会让人误以为
-        前者参与预算执行，因此已删除。这条用例固定"只有一条路径"。
+        回归：`utils/middleware` 里曾有 `governed_llm_call`（无调用方）、
+        `record_round`（轮次其实走 `nodes._round_update` →
+        `agent_loop.consume_round`）与 `merge_budget`（只有测试在用）。
+        两套并行实现会让人误以为它们参与预算执行，因此已删除。
+        模型调用真正生效的路径是 `nodes._governed_agent_call` →
+        `utils/idempotency.run_agent_call`。
         """
         import utils.middleware as middleware
 
         assert not hasattr(middleware, "governed_llm_call")
-
-    def test_merge_budget_keeps_latest(self) -> None:
-        from utils.middleware import merge_budget
-
-        merged = merge_budget(
-            {BUDGET_FIELD: {"usage": {"rounds": 1}}},
-            {BUDGET_FIELD: {"usage": {"rounds": 2}}},
-            None,
-        )
-        assert merged[BUDGET_FIELD]["usage"]["rounds"] == 2
+        # 轮次计数只有 `agent_loop.consume_round` 一条路径，中间件不再重复实现
+        assert not hasattr(middleware, "record_round")
+        assert not hasattr(middleware, "merge_budget")
 
 
 class TestIdempotentReuseIsNotCounted:

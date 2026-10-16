@@ -42,6 +42,16 @@ from workflow import create_workflow
 DEFAULT_RECURSION_LIMIT = 100
 
 
+def _budget_snapshot(result: dict[str, Any]) -> dict[str, Any]:
+    """从结果里取预算用量快照，供 `run_completed` 记录。
+
+    只看图状态里的 `execution_budget`；没有就返回空字典，不因为缺字段影响收尾。
+    """
+    from utils.agent_loop import snapshot
+
+    return snapshot(result) if isinstance(result.get("execution_budget"), dict) else {}
+
+
 def _resume_inputs(
     run_id: str, runtime: RunRuntime, *, grant_retry: bool = False
 ) -> dict[str, Any]:
@@ -194,6 +204,7 @@ def run_analysis(
         # 运行期依赖用 ContextVar 绑定：它不参与 Checkpoint，也不跨 Run 串值。
         # 所有日志都在这个上下文内写：日志目录跟随 output_root，
         # 否则工作流级别的日志会落到进程当前目录，绕过隔离目录。
+        run_started_at = time.time()
         with use_runtime(runtime):
             # 已完成/已失败的 Run 不再重跑：否则每次 resume 都会重新执行一遍节点，
             # 让追加型字段（如 execution_results）持续增长。终态是幂等的。
@@ -240,7 +251,11 @@ def run_analysis(
                     "failed_tasks": len(result.get("failed_tasks", [])),
                     "visualizations": len(result.get("visualization_plan", [])),
                     "artifacts": result.get("artifacts", []),
+                    # 预算用量与整轮耗时：没有它们就无法回答
+                    # "这次跑完花了多少额度、多久"，只能逐节点翻日志。
+                    "budget": _budget_snapshot(result),
                 },
+                duration_ms=round((time.time() - run_started_at) * 1000, 2),
             )
     except LlmCallAbandoned as abandoned:
         # 人工选择不重发未确认的调用：这是受控终止，必须落成终态，

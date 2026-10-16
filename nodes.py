@@ -68,33 +68,6 @@ def _crash_point(name: str) -> None:
         _os._exit(17)
 
 
-def _agent_call(
-    agent: str,
-    subject: str,
-    invoke: Callable[[], Any],
-    *,
-    attempt: int = 1,
-) -> tuple[Any, dict, dict]:
-    """执行一次 Agent 调用，并取回该次调用的幂等登记与额外 state 增量。
-
-    `subject` 必须已经用 `attempt_subject()` 带上逻辑尝试序号（会重复调用的
-    节点），`attempt` 用于账本上的人读标注。两者分开的原因见
-    `utils/idempotency.run_agent_call`。
-
-    节点在返回 state 增量时必须一并带上 `completed_operations` 与额外增量
-    （例如清空 `pending_llm_calls`），否则这些记录不会进入 Checkpoint：
-    "已完成"没落盘会导致恢复时重复执行，
-    "未确认清单"没清空会导致每次恢复都重新询问同一件事。
-    """
-    return run_agent_call(
-        _CURRENT_STATE.get() or {},
-        node=agent,
-        subject=subject,
-        call=invoke,
-        attempt=attempt,
-    )
-
-
 def _governed_agent_call(
     agent: str,
     subject: str,
@@ -102,11 +75,11 @@ def _governed_agent_call(
     *,
     attempt: int = 1,
 ) -> tuple[Any, dict, dict]:
-    """`_agent_call` 之上再套一层预算治理。
+    """`run_agent_call` 之上再套一层预算治理。
 
     分工必须说清楚，否则会出现两套互相打架的计数：
 
-    - `_agent_call`（→ `utils/idempotency.run_agent_call`）负责**幂等**：
+    - `utils.idempotency.run_agent_call` 负责**幂等**：
       同一逻辑调用已完成就复用结果，以及"请求发出但未确认"的人工拦截；
     - 这里负责**总量**：把**真正发生过上游请求**的调用计入
       `execution_budget.llm_calls`。
@@ -133,7 +106,9 @@ def _governed_agent_call(
 
     extra = dict(extra or {})
     invoked = bool(extra.pop("__upstream_invoked__", False))
-    extra.pop("__operation_id__", None)
+    # 操作 ID 与账本、幂等登记用的是同一个值，日志带上它才能把
+    # "这次模型调用"与账本里的 started/completed 对上。它不进 state。
+    operation_id = extra.pop("__operation_id__", None)
 
     if invoked:
         # 计数**不在**这里做：真实请求数由 `utils/agent_loop.after_model_request`
@@ -154,7 +129,11 @@ def _governed_agent_call(
                 node=agent,
                 event="llm_context",
                 status="ok",
-                details={"subject": subject, "context": report},
+                details={
+                    "subject": subject,
+                    "operation_id": operation_id,
+                    "context": report,
+                },
             )
 
     return payload, operations, extra
@@ -175,31 +154,24 @@ def _context_report_of(agent: str) -> dict:
     return context_report_of(agent)
 
 
-def _budget_guard(*, for_model_request: bool = True) -> None:
+def _budget_guard() -> None:
     """进入一次**真实模型请求**前判预算；超了抛 `BudgetExceeded`。
 
-    这是预算真正生效的地方。只判不记：计由 `_governed_agent_call` 在
-    **确认幂等未命中、请求确实要发出**之后完成——否则命中幂等复用的调用
-    会把预算算多。
+    这是模型预算真正生效的地方。只判不记：计由请求计数钩子完成——命中幂等
+    复用的调用不该被算成新请求。
 
-    只看 `llm_calls`（默认）：这一次请求额外消耗的是一个模型调用额度，
-    不该因为工具调用或时间预算刚好用尽就被拒绝；那些分项在各自的入口
+    只看 `llm_calls`：这一次请求额外消耗的是一个模型调用额度，不该因为工具
+    调用或时间预算刚好用尽就被拒绝；那些分项在各自的入口
     （`governed_tool_call`、`_round_update`）判定。
 
-    历史上这个函数被定义却从未接入调用路径——预算配置写进了 state，
-    但没有任何请求真正被拦下。现在它是 `run_agent_call` 的 `before_request`。
+    `run_agent_call` 在落账本之前调它一次，`utils.llm_retry` 在每次重发之前
+    再调一次。两次都只读。
     """
-    from utils.agent_loop import check, check_llm_budget
+    from utils.agent_loop import check_llm_budget
 
-    if for_model_request:
-        # `llm_calls` 在每次请求**发出前**就地累加，因此同一逻辑调用内部的
-        # 重试读到的已经是"已发出的请求数"。这里不能再另外加一次
-        # `requests_in_flight()`：那会把当前这次请求算两次，导致上限 2 时
-        # 只发出 1 次请求就被判超预算。
-        check_llm_budget(_CURRENT_STATE.get() or {})
-        return
-
-    check(_CURRENT_STATE.get() or {})
+    # `llm_calls` 在每次请求**发出前**就地累加，因此同一逻辑调用内部的重试
+    # 读到的已经是"已发出的请求数"，这里只比较、不再额外加一。
+    check_llm_budget(_CURRENT_STATE.get() or {})
 
 
 def _round_update(*, node: str) -> dict:
@@ -217,7 +189,7 @@ _CURRENT_STATE: contextvars.ContextVar[dict | None] = contextvars.ContextVar(
 
 
 def _with_state(func: Callable) -> Callable:
-    """把 state 放进 ContextVar，供 `_agent_call` 读取。
+    """把 state 放进 ContextVar，供预算闸门与请求计数钩子读取。
 
     只包装实际调用 Agent 的节点；其余节点不受影响。
 
@@ -830,6 +802,9 @@ def tool_execution_node(
                     "refine_count",
                     0
                 ),
+                # 分类随状态一起记录：只看错误文案无法区分"环境类失败"
+                # 与"代码写错了"，而路由正是按 error_kind 决定的。
+                "error_kind": execution.get("error_kind"),
                 "error": execution["error"]
             }
         )
@@ -2237,6 +2212,7 @@ def plot_execution_node(
                     0
                 ),
                 "path": execution["result"],
+                "error_kind": execution.get("error_kind"),
                 "error": execution["error"]
             }
         )

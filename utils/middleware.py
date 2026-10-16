@@ -17,9 +17,7 @@
 ## 入口
 
 - `governed_tool_call()`：包住一次工具调用，判预算 + 计时 + 计数 + 记录。
-- `record_round()`：记一次 Reason→Act→Observe→Decide 轮次。
-
-两者都在预算耗尽时抛 `BudgetExceeded`，由节点转成正常的失败记录。
+  预算耗尽时抛 `BudgetExceeded`，由节点转成正常的失败记录。
 
 **模型调用不在这里。** 它必须与幂等登记、账本的 `started`/`completed`、
 以及"未确认调用需人工裁决"的拦截协同，那些逻辑集中在
@@ -27,8 +25,10 @@
 接进那条路径（见 `nodes._governed_agent_call` 与
 `utils/agent_loop.before_model_request`）。
 
-早期这里还有一个 `governed_llm_call()`，但没有任何代码调用它，而真正生效的
-是上面那条路径——两套并行实现会让人误以为它参与了预算执行，已删除。
+早期这里还有 `governed_llm_call()`、`record_round()` 与 `merge_budget()`，
+都没有生产调用方：前两个与真正生效的路径重复（轮次计数走
+`nodes._round_update` → `agent_loop.consume_round`），第三个只有测试在用。
+两套并行实现会让人误以为它们参与了治理，已删除。
 """
 
 from __future__ import annotations
@@ -42,7 +42,6 @@ from utils.agent_loop import (
     BUDGET_FIELD,
     BudgetExceeded,
     check,
-    consume_round,
     consume_tool_call,
     settle_active_time,
     snapshot,
@@ -74,17 +73,6 @@ def _log(
     )
 
 
-def record_round(state: dict[str, Any], *, node: str) -> dict[str, Any]:
-    """记一次循环轮次，并返回要写回 state 的增量。
-
-    调用方必须把返回值合并进自己的 state 增量，否则计数不会落盘，
-    恢复后预算就归零了。
-    """
-    updates = consume_round(state)
-    _log(state, node=node, event="loop_round", status="ok")
-    return updates
-
-
 @contextmanager
 def governed_tool_call(
     state: dict[str, Any],
@@ -108,6 +96,11 @@ def governed_tool_call(
     不会继续被计入执行预算。返回值在 `budget_updates` 里，调用方必须写回
     state，否则时钟推进不会落盘——结算发生在 `finally`，因此要在 `with`
     **退出之后**再取，块内取到的是结算前的值。
+
+    `finally` 里同时就地写入传入的 `state`。工具调用一旦开始就已经消耗了
+    额度，调用方若在写回之前抛异常（例如 `resolve_tables` 失败），只有就地
+    写入才能让这次消耗留在 state 上，不会因为一次崩溃白拿一次额度。这与
+    模型请求计数钩子（`nodes._register_request_hooks`）的做法一致。
     """
     check(state)
 
@@ -128,6 +121,7 @@ def governed_tool_call(
             BUDGET_FIELD: settled[BUDGET_FIELD],
         }
         results["budget_updates"] = merged
+        state[BUDGET_FIELD] = merged[BUDGET_FIELD]
         _log(
             {**state, **merged},
             node=node,
@@ -138,25 +132,8 @@ def governed_tool_call(
         )
 
 
-def merge_budget(
-    *budget_updates: dict[str, Any] | None,
-) -> dict[str, Any]:
-    """把若干次预算增量合并成一份 state 增量。
-
-    后写的覆盖先写的：同一字段在一轮里被多次递增时，最后一次的计数值
-    才是最新的（`consume_*` 每次都基于传入 state 重算，不会丢计数）。
-    """
-    merged: dict[str, Any] = {}
-    for item in budget_updates:
-        if item:
-            merged.update(item)
-    return merged
-
-
 __all__ = [
     "BUDGET_ERROR_KIND",
     "BudgetExceeded",
     "governed_tool_call",
-    "merge_budget",
-    "record_round",
 ]
