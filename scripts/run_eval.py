@@ -1,0 +1,209 @@
+"""P5：本地评测入口。
+
+用法：
+    python scripts/run_eval.py --output eval/reports
+    python scripts/run_eval.py --family sqlite_join --output eval/reports
+    python scripts/run_eval.py --limit 5 --output eval/reports
+    python scripts/run_eval.py --faults-only --output eval/reports
+    python scripts/run_eval.py --provider real --output eval/reports   # 需显式授权
+
+不指定 --output 时报告写在运行隔离目录里，不在仓库中留下产物。
+
+## 关于 `--provider real`
+
+真实模型运行**需要明确授权的 API Key 与费用预算**。没有这两样时，
+本脚本不会去调用付费模型，而是打印需要提供什么。这样做的原因很简单：
+编造成功率、成本或 Token 数据比不测更糟。
+
+输出（`--output` 目录下）：
+    eval.json      机器可读结果（含口径声明）
+    eval.csv       逐任务汇总
+    eval.md        Markdown 报告
+    eval.png       分族完成率/正确率对比图
+    faults.json    故障注入场景的观测与判定
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+from pathlib import Path
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from eval import faults as faults_module  # noqa: E402
+from eval.runner import (  # noqa: E402
+    MOCK_SCOPE_NOTE,
+    UNVERIFIED_REAL_MODEL_METRICS,
+    run_all,
+    write_csv,
+    write_json,
+    write_markdown,
+    write_plot,
+)
+from eval.tasks import build_tasks  # noqa: E402
+
+
+def _select_tasks(args: argparse.Namespace):
+    tasks = build_tasks()
+    if args.family:
+        wanted = set(args.family)
+        tasks = [task for task in tasks if task.family in wanted]
+    if args.limit is not None:
+        tasks = tasks[: args.limit]
+    return tasks
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="InsightFlow 评测与可靠性基准")
+    parser.add_argument(
+        "--output",
+        default=None,
+        help=(
+            "报告输出目录。不指定时与评测工作目录同为系统临时目录下的"
+            "隔离目录，避免在仓库里留下机器相关的产物"
+        ),
+    )
+    parser.add_argument(
+        "--workdir",
+        default=None,
+        help="评测工作目录（默认在系统临时目录下建一个隔离目录）",
+    )
+    parser.add_argument(
+        "--family",
+        action="append",
+        default=None,
+        help="只跑指定任务族（可重复）",
+    )
+    parser.add_argument("--limit", type=int, default=None, help="只跑前 N 个任务")
+    parser.add_argument(
+        "--mode",
+        choices=("direct", "mcp"),
+        default="mcp",
+        help="SQL 后端（任务集里 SQLite 任务建议用 mcp）",
+    )
+    parser.add_argument(
+        "--faults-only", action="store_true", help="只跑故障注入场景"
+    )
+    parser.add_argument(
+        "--skip-faults", action="store_true", help="跳过故障注入场景"
+    )
+    parser.add_argument(
+        "--provider",
+        choices=("mock", "real"),
+        default="mock",
+        help="模型提供方；real 需要显式授权的 API Key 与预算",
+    )
+    args = parser.parse_args()
+
+    if args.provider == "real":
+        if not os.environ.get("INSIGHTFLOW_EVAL_REAL_API_KEY"):
+            print(
+                "拒绝执行：`--provider real` 需要显式授权。\n"
+                "请设置 INSIGHTFLOW_EVAL_REAL_API_KEY（以及可选的 "
+                "INSIGHTFLOW_EVAL_REAL_BUDGET_USD）后再运行。\n"
+                "\n"
+                "本仓库不会在缺少授权时调用付费模型，也不会用 Mock 结果"
+                "冒充真实模型能力。\n"
+                "\n"
+                "在获得授权之前，下列指标属于**尚未验证**：",
+                file=sys.stderr,
+            )
+            for item in UNVERIFIED_REAL_MODEL_METRICS:
+                print(f"  - {item}", file=sys.stderr)
+            return 2
+
+        print(
+            "注意：真实模型运行尚未在本仓库中实现。需要接入 "
+            "core.llm.build_model_factory 与真实的 key/预算策略，"
+            "并重新校准判分口径（真实模型可能给出非确定性输出）。",
+            file=sys.stderr,
+        )
+        return 3
+
+    if args.workdir:
+        workdir = Path(args.workdir).resolve()
+    else:
+        import tempfile
+
+        workdir = Path(tempfile.mkdtemp(prefix="insightflow-eval-"))
+
+    # 默认把报告写进同一次运行的隔离目录：报告里含宿主绝对路径与
+    # 机器相关的耗时，留在仓库里既没意义也会泄漏本机路径。
+    if args.output:
+        output = Path(args.output).resolve()
+    else:
+        output = workdir / "reports"
+    output.mkdir(parents=True, exist_ok=True)
+
+    print(MOCK_SCOPE_NOTE)
+    print()
+
+    written: list[Path] = []
+
+    if not args.faults_only:
+        tasks = _select_tasks(args)
+        print(f"任务数：{len(tasks)} | SQL 后端：{args.mode}")
+
+        def progress(outcome) -> None:  # noqa: ANN001
+            mark = "OK " if outcome.correct else "-- "
+            print(
+                f"  {mark}{outcome.task_id:<34} {outcome.status:<10} "
+                f"{outcome.duration_seconds:5.1f}s"
+            )
+
+        run = run_all(
+            workdir=workdir, mode=args.mode, tasks=tasks, on_outcome=progress
+        )
+
+        written.append(write_json(run, output / "eval.json"))
+        written.append(write_csv(run, output / "eval.csv"))
+        written.append(write_markdown(run, output / "eval.md"))
+        plot = write_plot(run, output / "eval.png")
+        if plot is not None:
+            written.append(plot)
+
+        print()
+        print(
+            f"完成率 {run.summary.completion_rate:.2%} | "
+            f"正确率 {run.summary.correctness_rate:.2%} | "
+            f"条件正确率 {run.summary.conditional_accuracy:.2%}"
+        )
+
+    if not args.skip_faults:
+        print()
+        print("故障注入场景：")
+        fault_result = faults_module.run_all(
+            workdir=workdir / "faults", mode=args.mode
+        )
+        for verdict in fault_result["verdicts"]:
+            mark = "OK " if verdict["passed"] else "!! "
+            print(
+                f"  {mark}{verdict['scenario_id']:<22} "
+                f"{'; '.join(verdict['problems']) or '符合期望处置'}"
+            )
+
+        fault_path = output / "faults.json"
+        fault_path.write_text(
+            json.dumps(fault_result, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        written.append(fault_path)
+
+        print()
+        print(f"故障场景通过：{fault_result['passed']} / {fault_result['total']}")
+
+    print()
+    print(f"工作目录：{workdir}")
+    print("已写出：")
+    for path in written:
+        print(f"  {path}")
+
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
