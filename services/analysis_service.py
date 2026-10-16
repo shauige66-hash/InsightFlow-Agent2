@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from pathlib import Path
 from typing import Any
 
@@ -16,6 +17,7 @@ from core.runtime import (
     use_runtime,
 )
 from ingestion.resources import ResourceResolver
+from utils.agent_loop import AgentBudget, new_usage
 from utils.idempotency import LlmCallAbandoned
 from utils.run_logger import create_run_id, log_event
 from workflow import create_workflow
@@ -68,6 +70,7 @@ def run_analysis(
     output_root: Path | str = "outputs",
     resume: Any | None = None,
     require_plan_approval: bool = False,
+    require_report_approval: bool = False,
     continue_from_checkpoint: bool = False,
     resume_value: Any | None = None,
     mcp: McpSettings | None = None,
@@ -120,8 +123,15 @@ def run_analysis(
             "artifacts": [],
             "approvals": [],
             "completed_operations": {},
+            # P3-A：预算从第一轮就写入 state，之后按增量累加。
+            # 恢复时不重建它（见 utils/agent_loop.initialize）。
+            "execution_budget": {
+                "limits": AgentBudget().to_dict(),
+                "usage": {**new_usage(), "started_at": time.time()},
+            },
             "run_status": "running",
             "require_plan_approval": require_plan_approval,
+            "require_report_approval": require_report_approval,
             "pending_llm_calls": list(runtime.unconfirmed_llm_calls),
         }
     elif continue_from_checkpoint:

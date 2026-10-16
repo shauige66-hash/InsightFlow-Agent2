@@ -199,6 +199,50 @@ def _factory(
     )
 
 
+def mock_model_factory(run_id: str) -> ModelFactory:
+    """脚本化 Mock 工厂，签名与 `build_model_factory` 一致。
+
+    供 `scripts/serve_api.py` 使用：演示工程链路时可以完全不接触模型服务。
+    调用记录写到临时目录，避免污染仓库。
+
+    目标表与执行代码可以按需覆盖（环境变量）：
+
+    - `INSIGHTFLOW_MOCK_TABLE`：planner 点名的表。SQLite 资源的键是
+      `<文件名>.<表名>`，因此用 SQLite 演示时要给成 `customers.customers`
+      这类名字。
+    - `INSIGHTFLOW_MOCK_CODE`：executor/repair/refine 的代码。默认是
+      Python 表达式，适合 CSV；要用 SQLite 时给一条 SELECT。
+
+    注意：Mock 只能证明链路可跑通，**不能证明真实模型的自主分析能力**。
+    """
+    import os
+    import tempfile
+
+    table = os.environ.get("INSIGHTFLOW_MOCK_TABLE", "customers")
+    code = os.environ.get("INSIGHTFLOW_MOCK_CODE", "result = len(df)")
+
+    REPLIES["planner"]["tasks"][0]["target_tables"] = [table]
+    REPLIES["visualizer"]["charts"][0]["target_tables"] = [table]
+    REPLIES["executor"] = {"code": code}
+    REPLIES["repair"] = {"code": code}
+    REPLIES["refine"] = {"code": code}
+    _REPLY_SEQUENCES.clear()
+    _REPLY_INDEX.clear()
+
+    record_path = Path(tempfile.gettempdir()) / f"insightflow-mock-{run_id}.txt"
+
+    def resolver(agent_name: str) -> _Scripted:
+        return _Scripted(agent_name=agent_name, record_path=str(record_path))
+
+    return ModelFactory(
+        settings=Settings(
+            api_key="sk-fake", base_url="http://127.0.0.1:8000/v1", model="deepseek-chat"
+        ),
+        context=CallContext(run_id=run_id, client_app="insightflow-agent2"),
+        resolver=resolver,
+    )
+
+
 def _summarize(result: dict[str, Any]) -> dict[str, Any]:
     interrupts = result.get("__interrupt__") or []
     pending = []

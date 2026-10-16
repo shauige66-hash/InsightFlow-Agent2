@@ -283,37 +283,59 @@ class TestRealCrossProcessMcpRecovery:
         assert "CallToolRequest" not in crashed["stderr"]
 
 
-class TestApiDoesNotExposeMcpMode:
-    """/runs API 目前不走 MCP —— 这是实测事实，不是设计意图的声明。
+class TestApiMcpExposureBoundary:
+    """API 对 MCP 的暴露边界。
 
-    两条 API 路径（api.py 的兼容接口与 services/run_coordinator.py 的
-    生命周期接口）都没有把 McpSettings 传给 run_analysis，
-    因此 API 发起的 Run 一律使用默认的 direct 后端。
+    P2-C 时 API 完全不支持 MCP，因此当时的断言是"源码里不出现 McpSettings"。
+    P2-D 把后端选择接进了 HTTP，这条断言随之失效——**契约变了，测试要跟着改**，
+    但不能放宽：这里改为断言新的、更重要的性质：
+
+    - Coordinator 传递的是**按 Run 记录派生**的配置，而不是请求里的任意对象；
+    - 请求模型里不存在任何可指定 MCP 基础设施的字段；
+    - 非 mcp 模式的 Run 不产生任何 MCP 私有配置。
     """
 
-    def test_run_coordinator_does_not_pass_mcp_settings(self) -> None:
+    def test_coordinator_derives_settings_from_the_stored_record(self) -> None:
         source = (PROJECT_ROOT / "services" / "run_coordinator.py").read_text(
             encoding="utf-8"
         )
 
-        assert "McpSettings" not in source
-        assert "mcp=" not in source
+        # 必须从记录派生模式，而不是直接用调用方给的对象
+        assert "_settings_for(record.sql_backend)" in source
+        # 只覆盖 mode：Server 模块、超时与私有目录沿用宿主模板
+        assert "replace(self._mcp_template, mode=SqlBackend(" in source
 
-    def test_api_module_does_not_reference_mcp(self) -> None:
-        for name in ("api.py", "api_runs.py"):
-            source = (PROJECT_ROOT / name).read_text(encoding="utf-8")
-            assert "McpSettings" not in source, name
-            assert "mcp=" not in source, name
+    def test_request_model_cannot_carry_mcp_infrastructure(self) -> None:
+        import api_runs
+
+        fields = set(api_runs.CreateRunRequest.model_fields)
+        assert "sql_backend" in fields
+
+        for forbidden in (
+            "mcp_command",
+            "mcp_args",
+            "mcp_env",
+            "mcp_private_root",
+            "private_root",
+            "server_module",
+            "workspace_root",
+            "startup_timeout",
+            "call_timeout",
+        ):
+            assert forbidden not in fields, f"请求模型不应接受 {forbidden}"
+
+        # resume 请求同样不能改写后端
+        resume_fields = set(api_runs.ResumeRequest.model_fields)
+        assert "sql_backend" not in resume_fields
 
     def test_api_run_never_creates_mcp_private_config(
         self, tmp_path: Path, monkeypatch
     ) -> None:
-        """真实 HTTP 创建一次 Run：不产生任何 MCP 私有配置。
+        """direct 模式的 Run 不产生任何 MCP 私有配置。
 
         这是最直接的判据：mcp 模式**每次**调用都会写出
         `<output_root>.mcp_private/<run_id>/authorizations.json`
-        （见 TestRealCrossProcessMcpRecovery）。API 发起的 Run 若真的走了 MCP，
-        这个文件必然出现；没有出现就说明它走的是 direct。
+        （见 TestRealCrossProcessMcpRecovery）。没有出现就说明它走的是 direct。
 
         不在这里断言业务是否跑通：假模型的 planner 指向 customers 表，
         而 SQLite 资源键是 sales.orders，任务失败与后端选择无关。

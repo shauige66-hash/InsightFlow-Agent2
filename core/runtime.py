@@ -22,6 +22,7 @@ import contextvars
 import os
 from contextlib import contextmanager
 from dataclasses import dataclass, field
+from enum import Enum
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -39,6 +40,20 @@ class RuntimeContextMissing(RuntimeError):
 
 class PrivatePathConflict(ValueError):
     """私有配置路径落在了会被挂载进沙箱的目录树之内。"""
+
+
+class SqlBackend(str, Enum):
+    """SQL 工具的执行后端。
+
+    只有两种取值，且**必须显式指定**：没有"自动挑一个"的默认值，
+    因为那会在 MCP 通道不通时把失败悄悄变成另一种执行路径。
+
+    继承 `str` 是为了让 JSON、SQLite 与既有字符串比较都能直接用；
+    API 层、RunStore 与 Coordinator 共用这一个定义，避免三处各写一份常量。
+    """
+
+    DIRECT = "direct"
+    MCP = "mcp"
 
 
 def _normalized(path: Path) -> str:
@@ -78,20 +93,32 @@ class McpSettings:
 
     `mode` 只有 `direct` 与 `mcp` 两种，且必须显式指定：
     没有"自动挑一个"的默认值，因为那会在通道不通时把失败悄悄变成另一种执行路径。
+
+    这里只放宿主自己决定的项（模式、超时、Server 模块）。**不放**任何来自
+    请求的东西：Server 启动命令、环境变量、私有目录、宿主路径都由宿主固定，
+    调用方（更不用说模型）无从指定。
     """
 
-    mode: str = "direct"
+    mode: SqlBackend | str = SqlBackend.DIRECT
     # 用于定位 Server 配置与 workspace 边界；不指定时由 RunRuntime.output_root 推导
     workspace_root: Path | None = None
-    # 私有配置根目录；不指定时为 `<output_root>/mcp_private`（在任何 Run 目录之外）
+    # 私有配置根目录；不指定时为 `<output_root>.mcp_private`（在任何 Run 目录之外）
     private_root: Path | None = None
     startup_timeout: float = 60.0
     call_timeout: float = 60.0
     server_module: str = "mcp_bridge.server"
 
     def __post_init__(self) -> None:
-        if self.mode not in ("direct", "mcp"):
-            raise ValueError(f"不支持的 MCP 后端模式：{self.mode}")
+        # 接受字符串是为了让从 SQLite / JSON 读回来的值直接可用；
+        # 统一收敛成枚举，后面的比较就不会再受大小写或类型影响。
+        try:
+            self.mode = SqlBackend(self.mode)
+        except ValueError as error:
+            raise ValueError(f"不支持的 SQL 后端模式：{self.mode}") from error
+
+    @property
+    def is_mcp(self) -> bool:
+        return self.mode == SqlBackend.MCP
 
 
 @dataclass

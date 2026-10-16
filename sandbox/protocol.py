@@ -239,9 +239,16 @@ def decode_dataframe(payload: dict[str, Any]) -> Any:
 
 
 def write_json(payload: Any, path: Path) -> None:
+    """写出 JSON。
+
+    刻意**不**用 `default=str`：那会把任何不可序列化的对象静默变成字符串。
+    实测代价很大——`analysis_result` 里的 DataFrame 被变成一段文本，
+    容器里 `result_df` 于是成了 None，绘图失败却看不出原因。
+    这里改为直接暴露：写不出去就报错，而不是写出一份语义不对的文件。
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
-        json.dumps(payload, ensure_ascii=False, default=str), encoding="utf-8"
+        json.dumps(payload, ensure_ascii=False), encoding="utf-8"
     )
 
 

@@ -8,6 +8,7 @@ from nodes import (
     context_node,
     planner_node,
     approval_gate_node,
+    report_publish_gate_node,
     router_node,
     execution_node,
     tool_execution_node,
@@ -31,7 +32,9 @@ from conditions import (
     route_after_critic,
     route_after_advance,
     route_after_approval,
+    route_after_report_approval,
     route_to_approval,
+    route_to_report_approval,
     route_after_plot_execution,
     route_after_chart_advance,
     route_after_visualization_plan,
@@ -110,8 +113,13 @@ def create_workflow(checkpointer=None):
     )
 
     graph.add_node(
-    "report",
-    report_node
+        "report",
+        report_node
+    )
+
+    graph.add_node(
+        "report_publish_gate",
+        report_publish_gate_node
     )
 
     graph.add_node(
@@ -283,9 +291,24 @@ def create_workflow(checkpointer=None):
     )
 
 
-    graph.add_edge(
+    graph.add_conditional_edges(
         "report",
-        "artifact"
+        route_to_report_approval,
+        {
+            "report_publish_gate": "report_publish_gate",
+            "artifact": "artifact",
+        }
+    )
+
+    # 报告发布关口：报告内容已生成但文件尚未写出，中断可安全重放。
+    # 拒绝时不落盘、不给产物，与计划被拒的行为一致。
+    graph.add_conditional_edges(
+        "report_publish_gate",
+        route_after_report_approval,
+        {
+            "artifact": "artifact",
+            "complete": END,
+        }
     )
 
     graph.add_edge(

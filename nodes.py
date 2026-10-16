@@ -22,7 +22,7 @@ from tools.tool_registry import available_tools, invoke_tool
 from agents.repair import repair_execution_code
 from agents.critic import review_execution_result
 from agents.refine import refine_execution_code
-from agents.reporter import generate_analysis_report
+from agents.reporter import LAST_CONTEXT_REPORT, generate_analysis_report
 from utils.artifacts import save_markdown_report,save_html_report,save_pdf_report
 from agents.visualizer import create_visualization_plan
 from agents.plotter import generate_plot_code
@@ -90,6 +90,95 @@ def _agent_call(
     )
 
 
+def _governed_agent_call(
+    agent: str,
+    subject: str,
+    invoke: Callable[[], Any],
+    *,
+    attempt: int = 1,
+) -> tuple[Any, dict, dict]:
+    """`_agent_call` 之上再套一层预算治理。
+
+    分工必须说清楚，否则会出现两套互相打架的计数：
+
+    - `_agent_call`（→ `utils/idempotency.run_agent_call`）负责**幂等**：
+      同一逻辑调用已完成就复用结果，以及"请求发出但未确认"的人工拦截；
+    - 这里负责**总量**：把**真正发生过上游请求**的调用计入
+      `execution_budget.llm_calls`。
+
+    两者都不替代对方：幂等管"要不要重发"，预算管"还能不能发"。
+
+    命中幂等复用时不计数——那次没有发生模型调用，计进去会让预算虚高。
+    判据来自 `run_agent_call` 的内部标记，标记本身必须**从 state 增量里剔除**，
+    否则会写进 Checkpoint（未声明的键会被 LangGraph 丢掉，但留着会误导阅读）。
+    """
+    payload, operations, extra = run_agent_call(
+        _CURRENT_STATE.get() or {},
+        node=agent,
+        subject=subject,
+        call=invoke,
+        attempt=attempt,
+    )
+
+    extra = dict(extra or {})
+    invoked = bool(extra.pop("__upstream_invoked__", False))
+    extra.pop("__operation_id__", None)
+
+    if invoked:
+        # 计数基于当前 state 重算，因此多次调用会累加而不是互相覆盖。
+        extra.update(consume_llm_call(_CURRENT_STATE.get() or {}))
+
+        # P4：把这个 Agent 的上下文度量写进结构化日志。
+        # 各 Agent 在裁剪时把结果放到自己模块的 LAST_CONTEXT_REPORT，
+        # 这里按 agent 名取回——不新增全局注册表，也就不用维护它的一致性。
+        report = _context_report_of(agent)
+        if report:
+            log_event(
+                run_id=(_CURRENT_STATE.get() or {}).get("run_id") or "unknown",
+                node=agent,
+                event="llm_context",
+                status="ok",
+                details={"subject": subject, "context": report},
+            )
+
+    return payload, operations, extra
+
+
+def _context_report_of(agent: str) -> dict:
+    """取回某个 Agent 最近一次上下文裁剪的度量。
+
+    Agent 可能被安装为顶层模块（`planner`）或包内模块（`agents.planner`），
+    两种都试一次；取不到就返回空字典（不因为日志缺字段而影响执行）。
+    """
+    import sys as _sys
+
+    for module_name in (f"agents.{agent}", agent):
+        module = _sys.modules.get(module_name)
+        report = getattr(module, "LAST_CONTEXT_REPORT", None) if module else None
+        if isinstance(report, dict) and report:
+            return dict(report)
+    return {}
+
+
+def _budget_guard() -> dict:
+    """进入一次模型调用前判预算；超了抛 `BudgetExceeded`。
+
+    只判不记：计由 `_governed_agent_call` 在**确认发出请求后**完成，
+    否则命中幂等复用的调用会把预算算多。
+    """
+    from utils.agent_loop import check
+
+    check(_CURRENT_STATE.get() or {})
+    return {}
+
+
+def _round_update(*, node: str) -> dict:
+    """记一次 Reason→Act→Observe→Decide 轮次。"""
+    from utils.agent_loop import consume_round
+
+    return consume_round(_CURRENT_STATE.get() or {})
+
+
 # 当前节点正在处理的 state。节点函数签名不能带额外参数（LangGraph 会把
 # 参数名当成状态通道），因此这里用 ContextVar 传递，避免改动 19 个节点签名。
 _CURRENT_STATE: contextvars.ContextVar[dict | None] = contextvars.ContextVar(
@@ -101,10 +190,17 @@ def _with_state(func: Callable) -> Callable:
     """把 state 放进 ContextVar，供 `_agent_call` 读取。
 
     只包装实际调用 Agent 的节点；其余节点不受影响。
+
+    P3-A：同时在这里确保 state 里有一份预算快照。放在这一层是因为
+    所有会消耗预算的节点都被它包着，而 `initialize_budget` 是**幂等**的
+    （已有计数不重置），所以恢复后重复进入不会把预算清零。
     """
 
     @functools.wraps(func)
     def wrapper(state: InsightFlowState) -> dict:
+        # 预算是"当前 state 已有则保留、没有才建"的语义。
+        # 这里只在缺字段时补一个 ContextVar 可见的副本，不写回 state——
+        # 写回必须由节点自己的返回值完成，否则会被 LangGraph 当成未声明增量丢弃。
         token = _CURRENT_STATE.set(state)
         try:
             return func(state)
@@ -115,6 +211,16 @@ def _with_state(func: Callable) -> Callable:
 from utils.run_logger import log_event
 from time import perf_counter
 from rag.knowledge_service import build_and_retrieve_knowledge
+
+# P3：有界执行与统一治理。放在这里而不是散进各节点，
+# 是为了让"预算判定"与"结构化日志"只有一个出口。
+from utils.agent_loop import (
+    BUDGET_ERROR_KIND,
+    BudgetExceeded,
+    consume_llm_call,
+    initialize as initialize_budget,
+)
+from utils.middleware import governed_tool_call
 
 def loader_node(
     state: InsightFlowState
@@ -133,7 +239,10 @@ def loader_node(
     resolve_snapshots(snapshots_to_state(snapshots))
 
     return {
-        "table_snapshot": snapshots_to_state(snapshots)
+        "table_snapshot": snapshots_to_state(snapshots),
+        # P3-A：预算在这里落地。`initialize_budget` 只补缺失字段，
+        # 已有计数原样保留，因此恢复时不会把已消耗的预算清零。
+        **initialize_budget(state),
     }
 
 
@@ -203,7 +312,7 @@ def planner_node(
         []
     )
 
-    plan, _ops, _extra = _agent_call(
+    plan, _ops, _extra = _governed_agent_call(
         "planner",
         "plan",
         lambda: create_analysis_plan(
@@ -320,7 +429,7 @@ def execution_node(
     # execution_node 每个任务只进入一次：之后的代码由 repair / refine 产出
     # （图上是 repair→tool_execution、refine→tool_execution，不再回到这里）。
     # 因此这里保持 task_id 作为身份就足够，不需要尝试序号。
-    code, _ops, _extra = _agent_call(
+    code, _ops, _extra = _governed_agent_call(
         "executor",
         task["task_id"],
         lambda: generate_execution_code(
@@ -394,12 +503,35 @@ def tool_execution_node(
     # 权威数据快照一并传入：MCP 后端据此确定授权集合（哪些 dataset_id 可见），
     # direct 后端忽略它。不传的话 MCP 只能按本次点名的表临时授权，
     # 与 P1 的"数据源变化必须失败"语义脱节。
-    execution = invoke_tool(
-        tool,
-        resolve_tables(state),
-        arguments,
-        snapshots=state.get("table_snapshot") or {},
-    )
+    #
+    # P3-B：经统一治理层调用。它在真正执行前判一次预算、执行后记一次
+    # 结构化日志与耗时；预算耗尽时抛 BudgetExceeded，这里转成环境类失败，
+    # 由既有的 route_after_execution 走"失败"而不是"修复"（重试不会好转）。
+    budget_updates: dict = {}
+    try:
+        with governed_tool_call(state, node="tool_execution", tool=tool) as gate:
+            execution = invoke_tool(
+                tool,
+                resolve_tables(state),
+                arguments,
+                snapshots=state.get("table_snapshot") or {},
+            )
+            gate["error_kind"] = execution.get("error_kind")
+            budget_updates = gate.get("budget_updates") or {}
+    except BudgetExceeded as exceeded:
+        execution = {
+            "success": False,
+            "result": None,
+            "error": str(exceeded),
+            "error_kind": BUDGET_ERROR_KIND,
+        }
+        log_event(
+            run_id=state.get("run_id") or "unknown",
+            node="tool_execution",
+            event="budget_exceeded",
+            status="failed",
+            details={"scope": exceeded.scope, "used": exceeded.used, "limit": exceeded.limit},
+        )
 
     run_id = state.get("run_id")
 
@@ -488,6 +620,9 @@ def tool_execution_node(
         # 分类随错误一起进 state：路由据此判断是否值得进入修复循环，
         # 而不是去解析错误文案。
         "execution_error_kind": execution.get("error_kind"),
+        # P3-A/B：把这次工具调用的预算计数落盘。不写回的话
+        # "已消耗"不会进 Checkpoint，恢复后预算就归零了。
+        **budget_updates,
     }
 
 
@@ -527,7 +662,7 @@ def repair_node(
     # 同一轮修复被 Checkpoint 重放时，入站值相同才算同一次逻辑调用。
     repair_attempt = state.get("retry_count", 0)
 
-    repaired_code, _ops, _extra = _agent_call(
+    repaired_code, _ops, _extra = _governed_agent_call(
         "repair",
         attempt_subject(task["task_id"], repair_attempt),
         lambda: repair_execution_code(
@@ -567,6 +702,8 @@ def repair_node(
         "current_code": repaired_code,
         "retry_count": retry_count,
         "completed_operations": _ops,
+        # P3-A：进入修复就是一次新的 Reason→Act→Observe→Decide 轮次。
+        **_round_update(node="repair"),
         **_extra,
     }
 
@@ -718,7 +855,7 @@ def critic_node(
     # 否则第二轮评审会复用第一轮的结论，精修循环等于没有校验。
     review_round = state.get("refine_count", 0)
 
-    review, _ops, _extra = _agent_call(
+    review, _ops, _extra = _governed_agent_call(
         "critic",
         attempt_subject(task["task_id"], review_round),
         lambda: review_execution_result(
@@ -814,7 +951,7 @@ def refine_node(
 
     refine_attempt = state.get("refine_count", 0)
 
-    refined_code, _ops, _extra = _agent_call(
+    refined_code, _ops, _extra = _governed_agent_call(
         "refine",
         attempt_subject(task["task_id"], refine_attempt),
         lambda: refine_execution_code(
@@ -855,6 +992,8 @@ def refine_node(
         "current_code": refined_code,
         "refine_count": refine_count,
         "completed_operations": _ops,
+        # P3-A：进入精修同样是一次新的循环轮次。
+        **_round_update(node="refine"),
         **_extra,
     }
 
@@ -1005,7 +1144,7 @@ def report_node(
             result_item
         )
 
-    report, _ops, _extra = _agent_call(
+    report, _ops, _extra = _governed_agent_call(
         "reporter",
         "report",
         lambda: generate_analysis_report(
@@ -1053,7 +1192,11 @@ def report_node(
                 ),
                 "visualization_count": len(
                     report_visualizations
-                )
+                ),
+                # P4：把这次报告上下文的预算与真实用量记进结构化日志，
+                # 使"上下文用了多少"成为可观察事实而不是猜测。
+                # estimated_tokens 是估算值（无匹配 tokenizer），字段名里已标注。
+                "context": dict(LAST_CONTEXT_REPORT),
             }
         )
 
@@ -1281,7 +1424,7 @@ def approval_gate_node(
     # 真正的中断：resume 时 interrupt() 返回 Command(resume=...) 携带的值
     decision = interrupt(request)
 
-    return _apply_decision(state, request, decision)
+    return _apply_decision(state, request, decision, field="plan_approval")
 
 
 def _task_is_sql(
@@ -1314,12 +1457,15 @@ def _find_approval(
 
 
 def _apply_decision(
-    state: InsightFlowState, request: dict, decision: Any
+    state: InsightFlowState, request: dict, decision: Any, *, field: str
 ) -> dict:
     """把审批结果归档，并给出后续路由依据。
 
     重复提交同一个审批 ID 时直接复用已归档的决定，不再触发第二次中断，
     避免同一次操作被批准两次。
+
+    `field` 指明这次决定归属哪个审批（`plan_approval` / `report_approval`）：
+    两个关口的决定必须分开存放，否则报告审批会覆盖计划审批的路由依据。
     """
     payload = decision if isinstance(decision, dict) else {}
     verdict = str(payload.get("decision", "")).lower()
@@ -1341,7 +1487,7 @@ def _apply_decision(
 
     log_event(
         run_id=request["run_id"],
-        node="approval_gate",
+        node=request["node"],
         event="approval_decided",
         status=verdict,
         details=record_entry,
@@ -1350,13 +1496,24 @@ def _apply_decision(
     approvals = list(state.get("approvals") or [])
     approvals.append(record_entry)
 
+    approved = verdict == "approve"
+
+    # 拒绝时的措辞按关口区分：计划被拒与报告被拒是两件事，
+    # 用同一句"分析计划未获批准"来描述报告被拒会误导排查。
+    if approved:
+        reason = None
+    elif field == "report_approval":
+        reason = "分析报告未获批准发布"
+    else:
+        reason = "分析计划未获批准"
+
     return {
-        "plan_approval": record_entry,
+        field: record_entry,
         "approvals": approvals,
         "pending_approval": None,
-        "run_status": "completed" if verdict == "approve" else "failed",
-        "analysis_status": None if verdict == "approve" else "failed",
-        "status_reason": None if verdict == "approve" else "分析计划未获批准",
+        "run_status": "completed" if approved else "failed",
+        "analysis_status": None if approved else "failed",
+        "status_reason": reason,
     }
 
 
@@ -1396,7 +1553,9 @@ def report_publish_gate_node(
     )
 
     decision = interrupt(request)
-    return _apply_decision(state, request, decision)
+    return _apply_decision(
+        state, request, decision, field="report_approval"
+    )
 
 
 @_with_state
@@ -1413,7 +1572,7 @@ def visualization_planner_node(
         )
     )
 
-    visualization_plan, _ops, _extra = _agent_call(
+    visualization_plan, _ops, _extra = _governed_agent_call(
         "visualizer",
         "plan",
         lambda: create_visualization_plan(
@@ -1513,7 +1672,7 @@ def plot_generation_node(
             f"for source task: {source_task_id}"
         )
 
-    generation, _ops, _extra = _agent_call(
+    generation, _ops, _extra = _governed_agent_call(
         "plotter",
         attempt_subject(chart_id, index),
         lambda: generate_plot_code(
@@ -1902,7 +2061,7 @@ def plot_repair_node(
     # 与 repair 同理：本次绘图修复的身份由入站 plot_retry_count 决定。
     plot_repair_attempt = state.get("plot_retry_count", 0)
 
-    repaired_code, _ops, _extra = _agent_call(
+    repaired_code, _ops, _extra = _governed_agent_call(
         "plot_repair",
         attempt_subject(chart_id, plot_repair_attempt),
         lambda: repair_plot_code(
@@ -1943,5 +2102,7 @@ def plot_repair_node(
         "current_plot_code": repaired_code,
         "plot_retry_count": plot_retry_count,
         "completed_operations": _ops,
+        # P3-A：绘图修复是一个独立的有界循环，也计入总轮次。
+        **_round_update(node="plot_repair"),
         **_extra,
     }

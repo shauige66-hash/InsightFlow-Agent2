@@ -14,6 +14,7 @@ from core.runtime import RuntimeContextMissing, current_runtime
 from ingestion.models import TableResource
 from sandbox.protocol import SandboxErrorKind, SandboxJob, classify_exception
 from tools.python_tool import execute_in_sandbox
+from utils.result_artifacts import to_jsonable
 
 CHART_ID_PATTERN = re.compile(r"[A-Za-z0-9\_-]+")
 
@@ -76,6 +77,14 @@ def create_plot_tool(
             for name in table_names
             if tables[name].dataframe is not None
         }
+
+        # 先转成 JSON 可表达的信封再交给沙箱。
+        #
+        # 不能把 DataFrame 直接塞进 job.json：写 JSON 时的 `default=str`
+        # 会把它**静默**变成一个字符串，容器里 `result_df` 于是成了 None，
+        # 绘图代码一取列就报 `TypeError: 'NoneType' object is not subscriptable`。
+        # 错误离现场很远，且图只是"没画出来"，很容易被当成绘图代码写错。
+        analysis_result = to_jsonable(analysis_result)
 
         job = SandboxJob(
             mode="plot",

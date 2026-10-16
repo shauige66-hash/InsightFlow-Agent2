@@ -23,6 +23,7 @@ from pydantic import BaseModel, Field
 
 from core.checkpoints import open_checkpointer
 from core.llm import build_model_factory
+from core.runtime import SqlBackend
 from services.analysis_service import read_run_state
 from services.run_coordinator import RunCoordinator
 from services.run_store import RunStore
@@ -30,19 +31,56 @@ from services.run_store import RunStore
 # run_id 会参与文件路径与线程名，只允许字母数字与下划线/短横线
 RUN_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{4,64}$")
 
-OUTPUT_ROOT = Path("outputs")
+# 默认产物根目录：锚定在**项目根**，而不是进程当前目录。
+#
+# 用相对路径 `Path("outputs")` 时，这个模块一旦被导入就会按当时的 cwd
+# 解析并创建 `outputs/runs/`——任何以别的 cwd 导入 `api_runs` 的进程都会
+# 在自己的目录里凭空建出目录树（演示脚本、测试子进程都会命中）。
+_PROJECT_ROOT = Path(__file__).resolve().parent
+DEFAULT_OUTPUT_ROOT = _PROJECT_ROOT / "outputs"
+
+OUTPUT_ROOT = DEFAULT_OUTPUT_ROOT
 
 # Checkpoint 位置：与 coordinator 保持一致，测试可覆盖。
 # 读取状态必须走同一个文件，否则会读到另一个（默认）位置的 Checkpoint。
 CHECKPOINT_PATH: Path | None = None
 
-run_store = RunStore()
-coordinator = RunCoordinator(
-    run_store,
-    output_root=OUTPUT_ROOT,
-    checkpointer_path=None,
-    model_factory_builder=build_model_factory,
-)
+# 单例在这里**延迟构造**。
+#
+# 早期写法是模块顶层直接 `run_store = RunStore()`：那会在导入期就建出
+# `outputs/runs/runs.sqlite`。即使 `serve_api` 随后把 store 换成隔离目录，
+# 仓库根也已经多了一份无用的库。导入模块不该有这种副作用。
+run_store: RunStore | None = None
+coordinator: RunCoordinator | None = None
+
+
+def _ensure_singletons() -> tuple[RunStore, RunCoordinator]:
+    """按需构造默认的 Store 与 Coordinator。
+
+    只在没有被替换过时构造：测试与 `scripts/serve_api.py` 都会在启动时
+    直接赋值 `api_runs.run_store` / `api_runs.coordinator`，那种情况下
+    这里不再重复建库。
+    """
+    global run_store, coordinator
+
+    if run_store is None:
+        run_store = RunStore(OUTPUT_ROOT / "runs" / "runs.sqlite")
+    if coordinator is None:
+        coordinator = RunCoordinator(
+            run_store,
+            output_root=OUTPUT_ROOT,
+            checkpointer_path=None,
+            model_factory_builder=build_model_factory,
+        )
+    return run_store, coordinator
+
+
+def get_run_store() -> RunStore:
+    return _ensure_singletons()[0]
+
+
+def get_coordinator() -> RunCoordinator:
+    return _ensure_singletons()[1]
 
 
 def _open_checkpointer():
@@ -58,6 +96,18 @@ class CreateRunRequest(BaseModel):
     analysis_focus: str | None = None
     knowledge_sources: list[str] = Field(default_factory=list)
     require_plan_approval: bool = False
+    # 报告发布前的人工确认。与计划审批一样是显式开关，
+    # 未开启时报告直接落盘，保持既有全自动行为。
+    require_report_approval: bool = False
+
+    # SQL 后端模式。默认 direct，与 P2-C 之前的既有客户端行为一致。
+    #
+    # 只允许这两个**模式名**：Server 启动命令、环境变量、私有配置目录与宿主
+    # 路径全部由宿主固定，请求里根本没有对应的字段可以填。
+    sql_backend: str = Field(
+        default=SqlBackend.DIRECT.value,
+        description="SQL 后端：direct（宿主内执行）或 mcp（经 stdio MCP Server）",
+    )
 
     # 允许显式指定 run_id，便于调用方在重试时复用同一个线程；
     # 不传则由服务生成。
@@ -73,6 +123,23 @@ class ResumeRequest(BaseModel):
     resume_value: dict[str, Any] | None = None
 
 
+def _validate_sql_backend(value: str) -> str:
+    """只接受已知的后端模式名。
+
+    显式校验而不是依赖枚举转换抛错：请求是面向用户的输入，
+    需要 400 而不是 500。同时这也保证请求无法借"模式"字段夹带
+    任何 Server 启动参数——非枚举值一律拒绝。
+    """
+    try:
+        return SqlBackend(value).value
+    except ValueError:
+        allowed = ", ".join(item.value for item in SqlBackend)
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"sql_backend 必须是以下之一：{allowed}",
+        ) from None
+
+
 def _validate_run_id(run_id: str) -> str:
     if not RUN_ID_PATTERN.match(run_id):
         raise HTTPException(
@@ -84,7 +151,7 @@ def _validate_run_id(run_id: str) -> str:
 
 def _require_run(run_id: str):
     _validate_run_id(run_id)
-    record = run_store.get(run_id)
+    record = get_run_store().get(run_id)
     if record is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -128,6 +195,7 @@ def create_run(payload: CreateRunRequest) -> dict[str, Any]:
 
     run_id = _validate_run_id(payload.run_id) if payload.run_id else create_run_id()
     data_sources = _validate_data_sources(payload.data_sources)
+    sql_backend = _validate_sql_backend(payload.sql_backend)
 
     if not data_sources:
         raise HTTPException(
@@ -135,18 +203,22 @@ def create_run(payload: CreateRunRequest) -> dict[str, Any]:
             detail="至少需要一个数据源",
         )
 
-    coordinator.start(
+    get_coordinator().start(
         run_id,
         data_sources=data_sources,
         analysis_focus=payload.analysis_focus,
         knowledge_sources=payload.knowledge_sources,
         require_plan_approval=payload.require_plan_approval,
+        require_report_approval=payload.require_report_approval,
+        sql_backend=sql_backend,
     )
 
     return {
         "run_id": run_id,
         "status": "running",
         "require_plan_approval": payload.require_plan_approval,
+        "require_report_approval": payload.require_report_approval,
+        "sql_backend": sql_backend,
     }
 
 
@@ -158,9 +230,10 @@ def list_runs(limit: int = 50) -> dict[str, Any]:
         )
 
     records = []
-    for record in run_store.list(limit=limit):
+    store = get_run_store()
+    for record in store.list(limit=limit):
         payload = record.to_dict()
-        payload["stale"] = run_store.is_stale_running(record.run_id)
+        payload["stale"] = store.is_stale_running(record.run_id)
         records.append(payload)
 
     return {"runs": records}
@@ -179,7 +252,7 @@ def get_run(run_id: str) -> dict[str, Any]:
         state = read_run_state(run_id, checkpointer=saver)
 
     payload = record.to_dict()
-    payload["stale"] = run_store.is_stale_running(run_id)
+    payload["stale"] = get_run_store().is_stale_running(run_id)
     payload["resumable"] = (
         record.status in ("waiting_approval", "interrupted", "failed")
         or payload["stale"]
@@ -213,14 +286,20 @@ def resume_run(run_id: str, payload: ResumeRequest | None = None) -> dict[str, A
     """继续一个合法的待恢复任务。"""
     record = _require_run(run_id)
 
-    if record.status not in ("waiting_approval", "interrupted", "failed"):
+    # `running` 有两种含义：正在执行，或执行者已经消失（进程被杀）。
+    # 查询接口早就用 `stale` 区分了两者，恢复接口却只看状态字面量，
+    # 于是"崩溃后恢复"这条最重要的路径被自己的守卫挡住了。
+    # 这里与查询接口对齐：stale 的 running 允许恢复。
+    stale = get_run_store().is_stale_running(run_id)
+
+    if record.status not in ("waiting_approval", "interrupted", "failed") and not stale:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail=f"run 当前状态为 {record.status}，不可恢复",
         )
 
     try:
-        coordinator.resume(
+        get_coordinator().resume(
             run_id, resume_value=(payload.resume_value if payload else None)
         )
     except ValueError as error:
@@ -228,7 +307,13 @@ def resume_run(run_id: str, payload: ResumeRequest | None = None) -> dict[str, A
             status_code=status.HTTP_409_CONFLICT, detail=str(error)
         ) from error
 
-    return {"run_id": run_id, "status": "running"}
+    # 恢复沿用该 Run 最初保存的后端，响应里回显出来便于调用方确认
+    return {
+        "run_id": run_id,
+        "status": "running",
+        "sql_backend": record.sql_backend,
+        "resumed_from_stale": stale,
+    }
 
 
 @router.post("/{run_id}/approval", status_code=status.HTTP_202_ACCEPTED)
@@ -264,7 +349,7 @@ def submit_approval(run_id: str, payload: ApprovalRequest) -> dict[str, Any]:
             }
 
     if approval_id:
-        run_store.record_approval(
+        get_run_store().record_approval(
             run_id,
             {
                 "approval_id": approval_id,
@@ -276,7 +361,7 @@ def submit_approval(run_id: str, payload: ApprovalRequest) -> dict[str, Any]:
             },
         )
 
-    coordinator.resume(
+    get_coordinator().resume(
         run_id,
         resume_value={"decision": decision, "comment": payload.comment},
     )

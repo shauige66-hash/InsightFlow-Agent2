@@ -25,7 +25,10 @@ import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterator
+from typing import TYPE_CHECKING, Any, Iterator
+
+if TYPE_CHECKING:  # pragma: no cover - 仅用于类型标注
+    from core.runtime import McpSettings
 
 RUN_STATUSES = (
     "pending",
@@ -50,19 +53,39 @@ CREATE TABLE IF NOT EXISTS runs (
     pending_approval TEXT,
     approvals     TEXT NOT NULL DEFAULT '[]',
     owner_pid     INTEGER,
-    heartbeat_at  REAL
+    heartbeat_at  REAL,
+    sql_backend   TEXT NOT NULL DEFAULT 'direct',
+    require_plan_approval INTEGER NOT NULL DEFAULT 0,
+    require_report_approval INTEGER NOT NULL DEFAULT 0
 );
 """
 
 # 心跳超过这个时长就认为持有者已消失。取一个明显大于单步耗时的值：
 # 太长会把真正卡住的 Run 一直显示为 running，太短会误判正在执行的 Run。
+#
+# 注意这只是**兜底**：正常路径靠 `_process_alive` 判断持有者是否还在，
+# 心跳超时用于"进程还活着但已经卡死"的情况。
 STALE_HEARTBEAT_SECONDS = 120.0
+
+#: Windows `GetExitCodeProcess` 在进程仍在运行时的返回值。
+_STILL_ACTIVE = 259
 
 
 def _process_alive(pid: int | None) -> bool:
-    """检查 pid 是否仍然存在。
+    """检查 pid 是否仍然是**活着的**进程。
 
     只用于判断"上次执行者是否还在"，不作为安全边界。
+
+    Windows 上必须查退出码，不能只看 `OpenProcess` 是否成功：
+    一个已经被杀掉但尚未被回收的进程仍然是一个内核对象，
+    `OpenProcess` 会返回有效句柄（哪怕只请求
+    `PROCESS_QUERY_LIMITED_INFORMATION`）。只判断句柄会把
+    **僵尸进程当成存活**，于是"执行者已崩溃"的 Run 只能靠
+    120 秒心跳超时才被判为过期——恢复接口在那之前一直返回 409。
+    这正是跨进程恢复用例偶发失败的原因。
+
+    因此这里用 `GetExitCodeProcess`：退出码仍是 `STILL_ACTIVE`
+    才算活着，否则说明它已经退出（僵尸或已回收）。
     """
     if not pid:
         return False
@@ -74,11 +97,24 @@ def _process_alive(pid: int | None) -> bool:
         if os.name == "nt":
             import ctypes
 
-            handle = ctypes.windll.kernel32.OpenProcess(0x1000, False, pid)
+            kernel32 = ctypes.windll.kernel32
+            # PROCESS_QUERY_LIMITED_INFORMATION：只需查询权限，
+            # 不要请求 PROCESS_QUERY_INFORMATION，它会被权限策略拒绝
+            handle = kernel32.OpenProcess(0x1000, False, pid)
             if not handle:
+                # 打不开通常意味着进程已不存在；也可能是权限不足，
+                # 此时保守地当作"不存在"，因为心跳超时仍会兜底
                 return False
-            ctypes.windll.kernel32.CloseHandle(handle)
-            return True
+            try:
+                exit_code = ctypes.c_ulong()
+                ok = kernel32.GetExitCodeProcess(
+                    handle, ctypes.byref(exit_code)
+                )
+                if not ok:
+                    return False
+                return exit_code.value == _STILL_ACTIVE
+            finally:
+                kernel32.CloseHandle(handle)
 
         os.kill(pid, 0)
         return True
@@ -101,6 +137,25 @@ class RunRecord:
     approvals: list[dict[str, Any]] = field(default_factory=list)
     owner_pid: int | None = None
     heartbeat_at: float | None = None
+    # SQL 后端模式：创建时确定，之后不再改变。
+    # 恢复必须依据它，否则一个 mcp 模式的 Run 可能被恢复成 direct。
+    sql_backend: str = "direct"
+    # 是否要求计划审批：同样在创建时确定，恢复时必须沿用。
+    # 硬写成 True 会让"崩溃点晚于审批门"的 Run 恢复时又被拦一次。
+    require_plan_approval: bool = False
+    # 是否要求报告发布前确认：同上。
+    require_report_approval: bool = False
+
+    @property
+    def mcp_settings(self) -> "McpSettings":
+        """按登记的后端模式重建 MCP 配置。
+
+        只重建**模式**；Server 模块、超时与私有目录仍由当前进程的可信配置
+        决定，不从数据库读取——那些值不该成为可持久化的攻击面。
+        """
+        from core.runtime import McpSettings
+
+        return McpSettings(mode=self.sql_backend)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -115,6 +170,11 @@ class RunRecord:
             "approvals": self.approvals,
             "owner_pid": self.owner_pid,
             "heartbeat_at": self.heartbeat_at,
+            # 只暴露模式名。MCP 私有配置路径、Server 启动命令与环境变量
+            # 一律不出现在这里——它们是宿主内部实现，不是运行信息。
+            "sql_backend": self.sql_backend,
+            "require_plan_approval": self.require_plan_approval,
+            "require_report_approval": self.require_report_approval,
         }
 
 
@@ -138,6 +198,12 @@ class RunStore:
 
         `CREATE TABLE IF NOT EXISTS` 不会改动已有表，因此新增列需要显式补齐，
         否则升级后读取会直接失败。
+
+        非破坏性：只 `ADD COLUMN`，不重建表、不改动既有行。
+        `sql_backend` 带 `DEFAULT 'direct'`，因此**旧 Run 自动落在 direct 上**
+        ——那正是它们当初实际使用的后端，历史语义不会被改写。
+        刻意不设 `NOT NULL`：SQLite 的 `ADD COLUMN` 对既有行只做默认值填充，
+        这里保持与建表语句一致的宽松性，避免在旧库上因约束失败而启动不了。
         """
         existing = {
             row["name"]
@@ -147,6 +213,11 @@ class RunStore:
         for column, ddl in (
             ("owner_pid", "INTEGER"),
             ("heartbeat_at", "REAL"),
+            ("sql_backend", "TEXT NOT NULL DEFAULT 'direct'"),
+            # 审批要求也是"创建时确定、恢复时必须沿用"的设置。
+            # 旧 Run 默认 0（不要求审批）——与它们当初的行为一致。
+            ("require_plan_approval", "INTEGER NOT NULL DEFAULT 0"),
+            ("require_report_approval", "INTEGER NOT NULL DEFAULT 0"),
         ):
             if column not in existing:
                 connection.execute(f"ALTER TABLE runs ADD COLUMN {column} {ddl}")
@@ -161,6 +232,20 @@ class RunStore:
         finally:
             connection.close()
 
+    @staticmethod
+    def _normalize_backend(sql_backend: str) -> str:
+        """收敛并校验后端取值。
+
+        用 `SqlBackend` 而不是各写一份字面量：写入库里的值必须与运行期
+        接受的值来自同一个定义，否则将来加后端时会出现"API 能收、库里不认"。
+        """
+        from core.runtime import SqlBackend
+
+        try:
+            return SqlBackend(sql_backend).value
+        except ValueError as error:
+            raise ValueError(f"不支持的 SQL 后端模式：{sql_backend}") from error
+
     def create(
         self,
         run_id: str,
@@ -168,14 +253,20 @@ class RunStore:
         data_sources: list[str],
         analysis_focus: str | None = None,
         status: str = "pending",
+        sql_backend: str = "direct",
+        require_plan_approval: bool = False,
+        require_report_approval: bool = False,
     ) -> RunRecord:
         now = time.time()
+        backend = self._normalize_backend(sql_backend)
+
         with self._connect() as connection:
             connection.execute(
                 "INSERT OR REPLACE INTO runs "
                 "(run_id, status, data_sources, analysis_focus, created_at, "
-                " updated_at, error, pending_approval, approvals) "
-                "VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, '[]')",
+                " updated_at, error, pending_approval, approvals, sql_backend, "
+                " require_plan_approval, require_report_approval) "
+                "VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, '[]', ?, ?, ?)",
                 (
                     run_id,
                     status,
@@ -183,9 +274,31 @@ class RunStore:
                     analysis_focus,
                     now,
                     now,
+                    backend,
+                    1 if require_plan_approval else 0,
+                    1 if require_report_approval else 0,
                 ),
             )
         return self.get(run_id)  # type: ignore[return-value]
+
+    def get_sql_backend(self, run_id: str) -> str:
+        """读取登记的后端模式；未登记的 Run 视为 direct。"""
+        record = self.get(run_id)
+        return record.sql_backend if record is not None else "direct"
+
+    def set_sql_backend(self, run_id: str, sql_backend: str) -> None:
+        """改写已登记 Run 的后端模式。
+
+        正常流程不需要它（模式在 create 时一次写定）。保留是为了让运维脚本
+        能在明确知情的前提下切换某个历史 Run 的后端。
+        """
+        backend = self._normalize_backend(sql_backend)
+
+        with self._connect() as connection:
+            connection.execute(
+                "UPDATE runs SET sql_backend = ?, updated_at = ? WHERE run_id = ?",
+                (backend, time.time(), run_id),
+            )
 
     def get(self, run_id: str) -> RunRecord | None:
         with self._connect() as connection:
@@ -280,6 +393,7 @@ class RunStore:
 
 
 def _row_to_record(row: sqlite3.Row) -> RunRecord:
+    keys = row.keys()
     return RunRecord(
         run_id=row["run_id"],
         status=row["status"],
@@ -294,4 +408,14 @@ def _row_to_record(row: sqlite3.Row) -> RunRecord:
         approvals=json.loads(row["approvals"] or "[]"),
         owner_pid=row["owner_pid"],
         heartbeat_at=row["heartbeat_at"],
+        # 未迁移过的行没有这列；按 direct 处理，与列默认值一致
+        sql_backend=(row["sql_backend"] or "direct")
+        if "sql_backend" in keys
+        else "direct",
+        require_plan_approval=bool(row["require_plan_approval"])
+        if "require_plan_approval" in keys
+        else False,
+        require_report_approval=bool(row["require_report_approval"])
+        if "require_report_approval" in keys
+        else False,
     )

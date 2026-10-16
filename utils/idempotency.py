@@ -246,7 +246,15 @@ def run_agent_call(
         detail={"payload": payload},
     ).to_dict()
 
-    return payload, merged, (updates or {})
+    # 明确告诉调用方"这次真的请求了上游"。
+    # P3 的预算治理需要这个区分：命中幂等复用（上面那条 return）时
+    # 没有发生任何模型调用，把它也计进 llm_calls 会让预算虚高。
+    # 只加键、不改既有三个返回值的位置，因此对现有调用方是兼容的。
+    updates = dict(updates or {})
+    updates["__upstream_invoked__"] = True
+    updates["__operation_id__"] = op_id
+
+    return payload, merged, updates
 
 
 def _ledger_root() -> Any:

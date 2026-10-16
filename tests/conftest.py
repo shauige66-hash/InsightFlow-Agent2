@@ -40,6 +40,32 @@ def block_real_network() -> None:
     install_network_guard()
 
 
+@pytest.fixture(scope="session", autouse=True)
+def _assert_import_has_no_side_effects(tmp_path_factory) -> None:
+    """导入 `api_runs` 不得在进程当前目录里建出目录。
+
+    早期 `api_runs` 在模块顶层直接 `RunStore()`，路径是相对的
+    `outputs/runs/runs.sqlite`；任何以别的 cwd 导入它的进程（演示脚本、
+    测试子进程）都会在自己目录里凭空建出 `outputs/`。
+
+    现在改为延迟构造。这里把这条性质固定下来：从一个空目录导入，
+    该目录里不应出现任何东西。
+    """
+    import os
+
+    previous = Path.cwd()
+    scratch = tmp_path_factory.mktemp("import-side-effect")
+    os.chdir(scratch)
+    try:
+        import api_runs  # noqa: F401
+
+        created = sorted(item.name for item in scratch.iterdir())
+    finally:
+        os.chdir(previous)
+
+    assert created == [], f"导入 api_runs 产生了副作用：{created}"
+
+
 @pytest.fixture(scope="session")
 def project_root() -> Path:
     return PROJECT_ROOT

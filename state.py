@@ -132,9 +132,14 @@ class InsightFlowState(TypedDict, total=False):
 
     # 是否要求执行前人工审批。显式开关，未开启时保持全自动路径。
     require_plan_approval: bool
-
     # 最近一次执行前审批的归档结果（路由依据）
     plan_approval: dict[str, Any] | None
+
+    # 是否要求报告发布前人工确认。同样是显式开关：
+    # 未开启时报告直接落盘，保持既有全自动行为。
+    require_report_approval: bool
+    # 最近一次报告发布审批的归档结果（路由依据）
+    report_approval: dict[str, Any] | None
 
     # 已处理的审批决定，按审批 ID 归档，用于重复审批保护与审计
     approvals: list[dict[str, Any]]
@@ -153,6 +158,11 @@ class InsightFlowState(TypedDict, total=False):
     # 副作用幂等登记：操作 ID -> 完成记录。恢复时据此判断某个副作用
     # 是否已经执行过，避免重复写文件或重复调用工具。
     completed_operations: dict[str, dict[str, Any]]
+
+    # P3-A：有界执行的预算快照（上限 + 已用量）。
+    # 放进 state 是**必须的**：预算要跨进程恢复后不重置，
+    # 放在进程内存里的话崩溃重启就归零，"有界"名不副实。
+    execution_budget: dict[str, Any]
 
     # 可能已发出但未确认结果的模型调用（由账本在恢复时比对得出）。
     # 必须在 state 中声明：未声明的键会被 LangGraph 直接丢弃，

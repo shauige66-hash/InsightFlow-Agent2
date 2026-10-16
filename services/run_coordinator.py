@@ -16,11 +16,13 @@ from __future__ import annotations
 
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Callable
 
 from langgraph.types import Command
 
+from core.runtime import McpSettings, SqlBackend
 from ingestion.resources import ResourceResolver
 from services.analysis_service import run_analysis
 from services.run_store import STALE_HEARTBEAT_SECONDS, RunStore
@@ -113,13 +115,25 @@ class RunCoordinator:
         checkpointer_path: Path | str | None = None,
         model_factory_builder: Callable[[str], Any] | None = None,
         max_workers: int = 2,
+        mcp_settings: McpSettings | None = None,
     ) -> None:
         self.store = store
         self.output_root = Path(output_root)
         self.checkpointer_path = checkpointer_path
         self._model_factory_builder = model_factory_builder
+        # 宿主固定的 MCP 参数（Server 模块、超时、私有目录的推导基准）。
+        # 请求只能改**模式**，改不了这里的任何一项。
+        self._mcp_template = mcp_settings or McpSettings()
         self.executor = RunExecutor(store, max_workers=max_workers)
         self._runners: dict[str, Callable[..., dict[str, Any]]] = {}
+
+    def _settings_for(self, sql_backend: str) -> McpSettings:
+        """按模式从宿主模板派生本次执行的 MCP 配置。
+
+        只覆盖 `mode`；`server_module`、超时与私有目录一律沿用宿主模板，
+        因此请求无法借后端选择去指定 Server 启动命令或宿主路径。
+        """
+        return replace(self._mcp_template, mode=SqlBackend(sql_backend))
 
     def _factory_for(self, run_id: str) -> Any:
         if self._model_factory_builder is None:
@@ -137,6 +151,8 @@ class RunCoordinator:
         knowledge_sources: list[str],
         resume: Any,
         require_plan_approval: bool,
+        require_report_approval: bool = False,
+        mcp: McpSettings | None = None,
     ) -> dict[str, Any]:
         from core.checkpoints import open_checkpointer
 
@@ -152,6 +168,8 @@ class RunCoordinator:
                 output_root=self.output_root,
                 resume=resume,
                 require_plan_approval=require_plan_approval,
+                require_report_approval=require_report_approval,
+                mcp=mcp,
             )
 
     def _finalize(self, run_id: str, result: dict[str, Any]) -> dict[str, Any]:
@@ -207,12 +225,25 @@ class RunCoordinator:
         analysis_focus: str | None = None,
         knowledge_sources: list[str] | None = None,
         require_plan_approval: bool = False,
+        require_report_approval: bool = False,
+        sql_backend: str = "direct",
     ) -> None:
-        """登记并异步启动一次运行。"""
+        """登记并异步启动一次运行。
+
+        后端模式在登记时写定并持久化：恢复时按它重建，而不是按恢复进程的
+        默认值——否则一个 mcp 模式的 Run 会在恢复时悄悄变成 direct。
+        """
         self.store.create(
-            run_id, data_sources=data_sources, analysis_focus=analysis_focus
+            run_id,
+            data_sources=data_sources,
+            analysis_focus=analysis_focus,
+            sql_backend=sql_backend,
+            require_plan_approval=require_plan_approval,
+            require_report_approval=require_report_approval,
         )
         self.store.update_status(run_id, "running")
+
+        mcp = self._settings_for(sql_backend)
 
         def work() -> dict[str, Any]:
             try:
@@ -223,6 +254,8 @@ class RunCoordinator:
                     knowledge_sources=knowledge_sources or [],
                     resume=None,
                     require_plan_approval=require_plan_approval,
+                    require_report_approval=require_report_approval,
+                    mcp=mcp,
                 )
                 return self._finalize(run_id, result)
             except Exception as error:  # noqa: BLE001 - 失败必须落到 Run 状态
@@ -242,7 +275,15 @@ class RunCoordinator:
         if record is None:
             raise KeyError(f"未登记的 run：{run_id}")
 
-        if record.status not in ("waiting_approval", "interrupted", "failed"):
+        # `running` 有两种含义：正在执行，或执行者已经消失（进程被杀）。
+        # 只按状态字面量判断会把"崩溃后恢复"这条路径永远挡在门外——
+        # 而进程内的执行记录在重启后本来就是空的，is_active 一定为 False。
+        stale = self.store.is_stale_running(run_id)
+
+        if (
+            record.status not in ("waiting_approval", "interrupted", "failed")
+            and not stale
+        ):
             raise ValueError(
                 f"run {run_id} 当前状态为 {record.status}，不可恢复"
             )
@@ -251,6 +292,10 @@ class RunCoordinator:
             raise ValueError(f"run {run_id} 正在执行中，拒绝并发的恢复请求")
 
         self.store.update_status(run_id, "running")
+
+        # 后端模式取记录里最初保存的值，**不接受**调用方在恢复时另行指定：
+        # 否则同一 Run 的前后两段会走不同后端，Checkpoint 里的结果语义就乱了。
+        mcp = self._settings_for(record.sql_backend)
 
         command = Command(resume=resume_value) if resume_value is not None else None
 
@@ -262,7 +307,11 @@ class RunCoordinator:
                     analysis_focus=record.analysis_focus,
                     knowledge_sources=[],
                     resume=command,
-                    require_plan_approval=True,
+                    # 沿用该 Run 创建时的审批要求。硬写成 True 会让"崩溃点晚于
+                    # 审批门"的 Run 在恢复时又被拦一次，等于凭空多出一道门。
+                    require_plan_approval=record.require_plan_approval,
+                    require_report_approval=record.require_report_approval,
+                    mcp=mcp,
                 )
                 # 恢复同样要落状态：否则等待重试的审批不会反映到生命周期上，
                 # 查询接口会一直显示 running。

@@ -142,6 +142,24 @@ def _normalize(outcome: Any) -> Result:
     }
 
 
+def _kind_of(error: BaseException) -> str | None:
+    """取出异常自带的错误分类。
+
+    LangChain 的 `tool.invoke()` 会把工具函数抛出的异常包一层再抛回来，
+    因此 `call_mcp_sql` 里返回的 `error_kind` 在这里会丢失——结果是
+    "MCP 通道不可用"被当成"SQL 写错了"，白白触发多轮修复，
+    还把真实原因埋在错误文案里（P2-D 端到端测试暴露了这个缺陷）。
+
+    这里按属性协议取分类：异常自己声明了 `error_kind` 就沿用它。
+    不从文案里猜——那正是 P2-B2 明确避开的做法。
+    """
+    for candidate in (error, getattr(error, "__cause__", None)):
+        kind = getattr(candidate, "error_kind", None)
+        if isinstance(kind, str) and kind:
+            return kind
+    return None
+
+
 def invoke_tool(
     tool_name: str,
     tables: dict[str, TableResource],
@@ -163,7 +181,7 @@ def invoke_tool(
     try:
         return _normalize(_get_tool(tool_name, tables, snapshots).invoke(arguments))
     except Exception as error:  # noqa: BLE001 - 工具失败统一转为结果
-        return _failure(error)
+        return _failure(error, _kind_of(error))
 
 
 def clear_tool_cache() -> None:

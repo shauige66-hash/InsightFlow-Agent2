@@ -310,12 +310,12 @@ def analyze_upload(
 def download_report(
     run_id: str
 ):
+    # 走 api_runs 的运行期 output_root，而不是硬编码的 `outputs`。
+    # 硬编码会让任何把产物写到别处（测试、演示、容器）的部署拿不到报告，
+    # 而 Run 本身明明是成功的——P2-D 端到端测试暴露了这个断链。
+    import api_runs
 
-    report_path = (
-        Path("outputs")
-        / run_id
-        / "analysis_report.pdf"
-    )
+    report_path = Path(api_runs.OUTPUT_ROOT) / run_id / "analysis_report.pdf"
 
     if not report_path.exists():
         raise HTTPException(

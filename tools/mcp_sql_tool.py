@@ -61,15 +61,22 @@ def call_mcp_sql(
     长驻一个共享会话会让恢复语义变得依赖进程状态。
     """
     runtime = current_runtime()
-    config_path = ensure_mcp_config(
-        run_id=run_id,
-        snapshots=snapshots,
-        workspace_root=runtime.workspace_root(),
-        output_root=runtime.output_root,
-        # 私有根目录在 run 目录之外：run 目录会被只读挂载进沙箱作为 /history，
-        # 放在那里模型代码能直接读到宿主绝对路径（实测可复现）
-        private_root=runtime.mcp_private_root(),
-    )
+
+    try:
+        config_path = ensure_mcp_config(
+            run_id=run_id,
+            snapshots=snapshots,
+            workspace_root=runtime.workspace_root(),
+            output_root=runtime.output_root,
+            # 私有根目录在 run 目录之外：run 目录会被只读挂载进沙箱作为 /history，
+            # 放在那里模型代码能直接读到宿主绝对路径（实测可复现）
+            private_root=runtime.mcp_private_root(),
+        )
+    except Exception as error:  # noqa: BLE001
+        # 写不出私有配置同样是"通道不可用"，必须归类。
+        # 若让它裸抛，LangChain 会把它变成一条无分类的错误，
+        # 下游路由就会误以为这是可以靠改代码修复的问题。
+        return _failure(f"MCP 配置不可用：{error}", ERROR_KIND_MCP_UNAVAILABLE)
 
     client = McpStdioClient(
         config_path=config_path,
@@ -92,17 +99,26 @@ def call_mcp_sql(
         return _failure(f"MCP 启动失败：{error}", ERROR_KIND_MCP_UNAVAILABLE)
 
     try:
-        # 动态发现不等于自动授权：只调用允许清单内的工具
-        if TOOL_RUN_READONLY_SQL not in client.allowed_tools():
-            return _failure(
-                f"MCP Server 未提供允许的工具：{TOOL_RUN_READONLY_SQL}",
-                ERROR_KIND_MCP_UNAVAILABLE,
-            )
+        try:
+            # 动态发现不等于自动授权：只调用允许清单内的工具
+            if TOOL_RUN_READONLY_SQL not in client.allowed_tools():
+                return _failure(
+                    f"MCP Server 未提供允许的工具：{TOOL_RUN_READONLY_SQL}",
+                    ERROR_KIND_MCP_UNAVAILABLE,
+                )
 
-        outcome = client.call_tool(
-            TOOL_RUN_READONLY_SQL,
-            {"query": query, "dataset_ids": dataset_ids},
-        )
+            outcome = client.call_tool(
+                TOOL_RUN_READONLY_SQL,
+                {"query": query, "dataset_ids": dataset_ids},
+            )
+        except McpTimeout as error:
+            # 超时会话已被标记失效，这里必须显式归类成 timeout，
+            # 否则会被当成 SQL 写错而去触发无意义的修复轮次。
+            return _failure(str(error), ERROR_KIND_MCP_TIMEOUT)
+        except McpUnavailable as error:
+            return _failure(str(error), ERROR_KIND_MCP_UNAVAILABLE)
+        except Exception as error:  # noqa: BLE001
+            return _failure(f"MCP 调用失败：{error}", ERROR_KIND_MCP_UNAVAILABLE)
     finally:
         pid = client._child_pid
         client.close()

@@ -56,6 +56,39 @@ def route_after_approval(
     return "complete"
 
 
+def route_to_report_approval(
+    state: InsightFlowState
+) -> Literal["report_publish_gate", "artifact"]:
+    """报告已经生成，决定是发布前人工确认还是直接落盘。
+
+    与 `route_to_approval` 对称：`require_report_approval` 是显式开关，
+    未开启时保持既有的全自动路径。
+
+    放在 report 之后、artifact 之前：此时报告**内容**已在 state 里，
+    但文件尚未写出，因此中断与恢复都不会留下半成品产物。
+    """
+    if state.get("require_report_approval"):
+        return "report_publish_gate"
+
+    return "artifact"
+
+
+def route_after_report_approval(
+    state: InsightFlowState
+) -> Literal["artifact", "complete"]:
+    """报告确认被拒绝时不发布。
+
+    拒绝意味着"这份报告不交付"：不写文件、也不给出产物列表，
+    与计划被拒的行为保持一致（被拒的分析不该产出交付物）。
+    """
+    decision = state.get("report_approval") or {}
+
+    if decision.get("decision") == "approve":
+        return "artifact"
+
+    return "complete"
+
+
 def route_after_execution(
     state: InsightFlowState
 ) -> Literal["repair", "critic", "failed"]:
