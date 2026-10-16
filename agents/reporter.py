@@ -1,6 +1,9 @@
 # 根据所有分析任务的执行结果生成最终数据分析报告。
 
 import json
+from typing import Any
+
+from utils.context_budget import bound_fields
 
 from langchain_core.language_models import BaseChatModel
 from langchain_core.output_parsers import StrOutputParser
@@ -128,9 +131,29 @@ def generate_analysis_report(
         )
     }
 
+    # P4：按节点预算压缩上下文。
+    #
+    # 这里的字段已经是**有界预览**（`build_report_execution_previews` 走
+    # P2-B3 的 `build_preview`：列名 + 行数 + 少量样本），因此正常路径下
+    # 不会触发压缩；预算是防止上游给出别的东西时这个节点的 Prompt 失控。
+    #
+    # 与其余 Agent 用同一个 `bound_fields`：口径一致才谈得上"逐节点预算"。
+    inputs, context_report = bound_fields("reporter", inputs)
+
     def _require_text(text: object) -> str:
         if not isinstance(text, str) or not text.strip():
             raise ValueError("报告内容为空")
         return text
 
-    return invoke_report_with_retry(chain, inputs, validate=_require_text)
+    result = invoke_report_with_retry(chain, inputs, validate=_require_text)
+
+    # 把度量挂到模块级，供节点写结构化日志（与其余 Agent 一致）。
+    LAST_CONTEXT_REPORT.clear()
+    LAST_CONTEXT_REPORT.update(context_report.to_dict())
+
+    return result
+
+
+#: 最近一次报告上下文构造的度量结果（供节点记录到结构化日志）。
+#: 单进程内被同一 Run 的顺序调用覆盖是安全的：节点在调用后立刻读取。
+LAST_CONTEXT_REPORT: dict[str, Any] = {}

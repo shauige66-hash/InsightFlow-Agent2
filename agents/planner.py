@@ -1,6 +1,7 @@
 # 根据数据上下文、用户关注点和检索到的业务知识，让大模型生成结构化分析计划。
 
 import json
+from utils.context_budget import bound_fields
 from typing import Any
 
 from langchain_core.output_parsers import JsonOutputParser
@@ -126,6 +127,12 @@ def create_analysis_plan(
         ),
         "retrieved_knowledge": knowledge_text
     }
+    # P4：按节点预算压缩上下文。
+    # 不可压缩字段见 utils.context_budget.NODE_PRESERVE_FIELDS；
+    # 错误反馈与任务约束在那里被显式保留。
+    inputs, _context_report = bound_fields("planner", inputs)
+    LAST_CONTEXT_REPORT.clear()
+    LAST_CONTEXT_REPORT.update(_context_report.to_dict())
 
     def _extract(payload: dict[str, Any]):
         """必填字段缺失属于可重试的格式问题，必须在校验器里抛错，
@@ -140,3 +147,7 @@ def create_analysis_plan(
         validate=_extract
     )
     return result
+
+#: 最近一次上下文构造的度量结果（供节点写结构化日志）。
+#: 单进程内被同一 Run 的顺序调用覆盖是安全的：节点调用后立刻读取。
+LAST_CONTEXT_REPORT: dict[str, object] = {}

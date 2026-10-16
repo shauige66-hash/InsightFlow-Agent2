@@ -2,6 +2,7 @@
 
 import json
 
+from utils.context_budget import bound_fields
 from typing import Any
 
 from langchain_core.output_parsers import JsonOutputParser
@@ -172,6 +173,12 @@ def generate_plot_code(
             default=str
         )
     }
+    # P4：按节点预算压缩上下文。
+    # 不可压缩字段见 utils.context_budget.NODE_PRESERVE_FIELDS；
+    # 错误反馈与任务约束在那里被显式保留。
+    inputs, _context_report = bound_fields("plotter", inputs)
+    LAST_CONTEXT_REPORT.clear()
+    LAST_CONTEXT_REPORT.update(_context_report.to_dict())
 
     # prompt 里有 {retry_hint} 占位符，必须提供，否则 PromptTemplate 会直接报
     # 缺少变量。首次尝试留空，重试时把上一次的失败原因回传——temperature 为 0 时
@@ -229,3 +236,7 @@ def generate_plot_code(
     raise RuntimeError(
         "Plot code generation failed."
     ) from last_error
+
+#: 最近一次上下文构造的度量结果（供节点写结构化日志）。
+#: 单进程内被同一 Run 的顺序调用覆盖是安全的：节点调用后立刻读取。
+LAST_CONTEXT_REPORT: dict[str, object] = {}

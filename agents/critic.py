@@ -1,6 +1,7 @@
 # 检查分析执行结果是否真正完成了原始分析任务。
 
 import json
+from utils.context_budget import bound_fields
 from typing import Any
 
 from langchain_core.output_parsers import JsonOutputParser
@@ -114,6 +115,12 @@ def review_execution_result(
         default=str
     )
 }
+    # P4：按节点预算压缩上下文。
+    # 不可压缩字段见 utils.context_budget.NODE_PRESERVE_FIELDS；
+    # 错误反馈与任务约束在那里被显式保留。
+    inputs, _context_report = bound_fields("critic", inputs)
+    LAST_CONTEXT_REPORT.clear()
+    LAST_CONTEXT_REPORT.update(_context_report.to_dict())
 
     def _extract(payload: dict[str, Any]) -> dict[str, Any]:
         """必填字段缺失属于可重试的格式问题，在校验器里抛错才会触发重试。"""
@@ -128,3 +135,7 @@ def review_execution_result(
         validate=_extract
     )
     return result
+
+#: 最近一次上下文构造的度量结果（供节点写结构化日志）。
+#: 单进程内被同一 Run 的顺序调用覆盖是安全的：节点调用后立刻读取。
+LAST_CONTEXT_REPORT: dict[str, object] = {}

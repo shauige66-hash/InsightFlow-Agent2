@@ -1,6 +1,7 @@
 # 根据分析任务和执行路线，让大模型生成具体的 Python 或 SQL 分析代码。
 
 import json
+from utils.context_budget import bound_fields
 from typing import Any, Literal
 from langchain_core.output_parsers import JsonOutputParser
 from langchain_core.language_models import BaseChatModel
@@ -178,6 +179,12 @@ def generate_execution_code(
         "retrieved_knowledge": knowledge_text,
         "route": route
     }
+    # P4：按节点预算压缩上下文。
+    # 不可压缩字段见 utils.context_budget.NODE_PRESERVE_FIELDS；
+    # 错误反馈与任务约束在那里被显式保留。
+    inputs, _context_report = bound_fields("executor", inputs)
+    LAST_CONTEXT_REPORT.clear()
+    LAST_CONTEXT_REPORT.update(_context_report.to_dict())
 
     def _extract(payload: dict[str, Any]):
         """必填字段缺失属于可重试的格式问题，必须在校验器里抛错，
@@ -192,3 +199,7 @@ def generate_execution_code(
         validate=_extract
     )
     return result
+
+#: 最近一次上下文构造的度量结果（供节点写结构化日志）。
+#: 单进程内被同一 Run 的顺序调用覆盖是安全的：节点调用后立刻读取。
+LAST_CONTEXT_REPORT: dict[str, object] = {}
