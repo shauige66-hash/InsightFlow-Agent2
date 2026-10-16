@@ -435,14 +435,19 @@ Server 的数据源 `workspace_root` 校验不变、内容指纹语义不变、
 其中 `test_old_layout_would_have_leaked` 手工把私有树写回旧位置，
 用同一容器复现泄漏，以证明新布局那条用例不是因为"路径写错"而通过。
 
-### 9.4 `/runs` API 未暴露 MCP 模式（实测结论，非设计意图）
+### 9.4 `/runs` API 未暴露 MCP 模式（P2-C 时的实测结论）
+
+> **后续状态（P2-D 已实现）**：本节描述的是 P2-C 交付时的事实。P2-D 已把后端
+> 选择接入 HTTP：`POST /runs` 接受 `sql_backend`（`direct` / `mcp`，缺省 `direct`），
+> 模式随 Run 持久化并在恢复时沿用。本节保留为当时的记录与 P2-D 的立项依据；
+> 当前契约见 README 的「FastAPI」一节与 `/docs` 的 OpenAPI 描述。
 
 `services/run_coordinator.py::_execute` 与 `api.py` 都没有把 `McpSettings`
 传给 `run_analysis`，因此**API 发起的 Run 一律使用默认的 direct 后端**。
 MCP 模式目前只能通过程序化的 `run_analysis(mcp=McpSettings(mode="mcp"))`
 使用（或 `scripts/recovery_driver.py --mcp-mode mcp`）。
 
-已固定的证据：
+已固定的证据（P2-C 时）：
 
 - `run_coordinator.py` 与 `api.py` / `api_runs.py` 中不存在 `McpSettings`；
 - 真实 HTTP 创建一次 Run 后，`<output_root>.mcp_private` **不会出现**——

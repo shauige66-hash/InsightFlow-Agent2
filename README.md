@@ -344,10 +344,13 @@ http://127.0.0.1:8000/docs
 - MCP 已支持：SQL 可经独立 MCP Server 子进程（stdio）执行。
   该 Server 是宿主上的普通进程，**不是安全沙箱**；当前只暴露只读工具，
   传输未实现 HTTP/SSE。
-- MCP 模式目前**只能程序化使用**（`run_analysis(mcp=...)`）；
-  FastAPI 的 `/runs` 尚未暴露后端选择，API 发起的 Run 一律使用 direct。
+- FastAPI `/runs` 已可选择 SQL 后端：创建时传 `sql_backend`（`direct` 或 `mcp`，
+  缺省 `direct`）。模式会随 Run 持久化，恢复时沿用最初保存的值。
+  请求**无法**指定 MCP Server 启动命令、私有目录、环境变量或宿主路径；
+  mcp 模式不可用时明确失败，不会静默回退 direct。
 - 上传文件和生成的分析产物目前保存在本地文件系统。
-- 当前 API 暂未实现用户认证、权限控制和多用户隔离。
+- 当前 API 暂未实现用户认证、权限控制和多用户隔离，
+  因此只能作为**本地演示/开发服务**使用，不得直接公网部署。
 - RAG 检索阈值目前基于实验结果设定，还没有经过大规模 Benchmark 验证。
 
 ## 后续计划
@@ -357,7 +360,7 @@ http://127.0.0.1:8000/docs
 - 把 SQL 执行迁入受限容器或独立进程
 - 持久化向量数据库
 - LangSmith 工作流追踪与可观测性
-- 把 MCP 后端选择接入 FastAPI /runs（当前仅支持程序化调用）
+- API 鉴权、限流与多用户隔离
 - RAG 与 Agent 分析质量 Benchmark
 - 异步分析任务和后台执行
 - 实时工作流进度推送
@@ -374,8 +377,8 @@ http://127.0.0.1:8000/docs
 ### 1. 克隆项目
 
 ```bash
-git clone https://github.com/shauige66-hash/insightflow-agent.git
-cd insightflow-agent
+git clone https://github.com/shauige66-hash/InsightFlow-Agent2.git
+cd InsightFlow-Agent2
 ```
 
 ### 2. 创建 Python 虚拟环境
@@ -468,12 +471,40 @@ chart_*.png
 uvicorn api:app --reload
 ```
 
+> 该服务**没有鉴权**，只能本机使用，不得直接公网部署。
+
+#### 本地演示（推荐，隔离且不需要模型服务）
+
+用 Mock 模型跑完整工程链路，并把 RunStore / Checkpoint / 产物全部限制在一个
+临时目录里，不会碰到真实数据：
+
+```powershell
+$env:INSIGHTFLOW_WORKDIR = "$env:TEMP\insightflow-demo"   # 隔离工作目录
+$env:INSIGHTFLOW_MOCK_LLM = "1"                            # 不访问任何模型服务
+python scripts\serve_api.py --port 8000
+```
+
+创建一次 **MCP 后端**的分析：
+
+```powershell
+$body = @{
+  data_sources   = @("$env:TEMP\insightflow-demo\demo.sqlite")
+  analysis_focus = "各区域订单金额"
+  sql_backend    = "mcp"          # direct（默认）或 mcp
+} | ConvertTo-Json
+Invoke-RestMethod -Uri http://127.0.0.1:8000/runs -Method Post `
+  -Body $body -ContentType "application/json"
+```
+
+`sql_backend` 会随 Run 持久化；`POST /runs/{id}/resume` 恢复时沿用最初保存的值，
+请求无法改写它。其他端点（查询状态、计划审批、报告审批、恢复）与请求字段
+见 <http://127.0.0.1:8000/docs> 的 OpenAPI 描述。
+
 然后打开：
 
 ```text
 http://127.0.0.1:8000/docs
 ```
-
 可以直接上传：
 
 - CSV、Excel 或 SQLite 数据文件
@@ -481,6 +512,48 @@ http://127.0.0.1:8000/docs
 - 自然语言分析问题
 
 InsightFlow 会自动执行完整的 Agentic 数据分析流程，并返回分析结果与生成的报告产物。
+
+### 评测与可靠性基准
+
+`eval/` 是一套可重复的评测框架，用来回答两个**分开**的问题：
+工作流跑通了吗（完成率），以及算对了吗（正确率）。
+
+```bash
+# 完整评测：42 个任务 + 7 个故障注入场景，不访问任何模型服务
+python scripts/run_eval.py --output eval/reports
+
+# 只跑某个任务族
+python scripts/run_eval.py --family sqlite_join --output eval/reports
+
+# 只跑故障注入场景
+python scripts/run_eval.py --faults-only --output eval/reports
+```
+
+任务集合覆盖 CSV / Excel / SQLite 三类数据源，以及聚合、过滤、分组、
+双键分组、Top-N、极值、去重、连接、比率与统计等算子。
+**每个任务的期望值由 `eval/tasks.py` 用纯 Python 独立算出**，
+不经过被测工作流的任何代码路径；把答案改错会被判错，有专门的负面用例固定这一点。
+
+故障注入场景验证**出错时的处置语义**：代码异常与 SQL 错误应进入 Repair；
+MCP 不可用、数据源缺失属于环境故障，应安全失败而**不**进入 Repair——
+把环境故障当代码错误去修只会浪费调用并掩盖真实原因。
+
+输出：`eval.json`（机器可读）、`eval.csv`（逐任务）、`eval.md`（报告）、
+`eval.png`（分族完成率/正确率对比图）、`faults.json`（故障场景观测）。
+
+> **评测口径与边界**：当前评测由**脚本化 Mock 模型**驱动**真实工作流**
+> ——真实 Docker 沙箱、真实 MCP 子进程、真实 Checkpoint 都是真的，只有 LLM 是 Mock。
+> 因此它证明的是**工程链路与判分逻辑**的可靠性，
+> **不能**用来声称真实模型的自主分析能力。真实模型指标
+> （真实数值正确率、Token 消耗与成本、模糊需求澄清、错误修复成功率、
+> 长上下文稳定性）在提供明确授权的 API key 与费用预算之前**均未验证**。
+> `scripts/run_eval.py --provider real` 在缺少
+> `INSIGHTFLOW_EVAL_REAL_API_KEY` 时会**拒绝执行**并按清单打印所需条件，
+> 不会静默调用付费模型。
+>
+> **不使用真实 Token 计量**：本仓库没有与所用模型匹配的 tokenizer，
+> 因此上下文预算以**字符**为准，另给出明确标注为估算的
+> `estimated_tokens`（口径 `chars/3.5`），不得当作计费 Token。
 
 
 
@@ -650,8 +723,8 @@ Users can upload structured datasets and optional business knowledge documents. 
 ### 1. Clone the repository
 
 ```bash
-git clone https://github.com/shauige66-hash/insightflow-agent.git
-cd insightflow-agent
+git clone https://github.com/shauige66-hash/InsightFlow-Agent2.git
+cd InsightFlow-Agent2
 ```
 
 ### 2. Create a virtual environment
@@ -758,6 +831,52 @@ The interactive API interface allows you to upload:
 
 InsightFlow then runs the complete agentic analysis workflow and returns the analysis results and generated artifacts.
 
+## Evaluation & Reliability Benchmark
+
+`eval/` is a reproducible harness that answers two **separate** questions:
+did the workflow complete, and did it compute the right answer?
+
+```bash
+# Full run: 42 tasks plus 7 fault-injection scenarios, no model services contacted
+python scripts/run_eval.py --output eval/reports
+
+# A single task family
+python scripts/run_eval.py --family sqlite_join --output eval/reports
+
+# Fault-injection scenarios only
+python scripts/run_eval.py --faults-only --output eval/reports
+```
+
+The task set covers CSV, Excel and SQLite sources across aggregation, filtering,
+grouping, two-key grouping, top-N, extremes, distinct counts, joins, ratios and
+statistics. **Every expected answer is computed in `eval/tasks.py` with plain
+Python**, without going through the code under test, and a wrong answer is
+scored wrong — dedicated negative cases pin that down.
+
+The fault-injection scenarios check failure handling rather than happy paths:
+code and SQL errors should enter repair, while an unavailable MCP backend or a
+missing data source is an environment fault that must fail safely **without**
+repair, since repairing an environment fault only burns calls and hides the cause.
+
+Outputs: `eval.json`, `eval.csv`, `eval.md`, `eval.png` (per-family completion
+vs correctness) and `faults.json`.
+
+> **Scope.** The current run is driven by a **scripted mock model** over the
+> **real workflow** — the Docker sandbox, MCP subprocess and checkpoints are all
+> real, only the LLM is mocked. It therefore demonstrates the reliability of the
+> engineering path and of the scoring logic, and it does **not** demonstrate a
+> real model's analysis ability. Real-model metrics (numeric accuracy, token cost,
+> clarification of ambiguous requests, repair success rate, long-context
+> stability) are **unverified** until an explicitly authorised API key and budget
+> are provided. `scripts/run_eval.py --provider real` refuses to run without
+> `INSIGHTFLOW_EVAL_REAL_API_KEY` and prints what it needs instead of silently
+> calling a paid model.
+>
+> **No real token accounting.** No tokenizer matching the target model is
+> available here, so context budgets are expressed in **characters**, with a
+> clearly labelled estimate (`estimated_tokens`, method `chars/3.5`) alongside.
+> The estimate must not be read as billable token usage.
+
 ## Project Structure
 
 ```text
@@ -806,7 +925,9 @@ insightflow-agent/
 │   └── run.py
 │
 ├── services/
-│   └── analysis_service.py
+│   ├── analysis_service.py
+│   ├── run_store.py
+│   └── run_coordinator.py
 │
 ├── tools/
 │   ├── python_tool.py
@@ -814,11 +935,25 @@ insightflow-agent/
 │   └── plot_tool.py
 │
 ├── utils/
+│   ├── agent_loop.py
 │   ├── artifacts.py
+│   ├── context_budget.py
 │   ├── llm_retry.py
+│   ├── middleware.py
 │   └── ...
 │
+├── eval/
+│   ├── tasks.py
+│   ├── scoring.py
+│   ├── runner.py
+│   └── faults.py
+│
+├── scripts/
+│   ├── serve_api.py
+│   └── run_eval.py
+│
 ├── docs/
+│   ├── architecture.md
 │   ├── p0-delivery.md
 │   ├── p1-delivery.md
 │   ├── p2a-delivery.md
@@ -833,6 +968,7 @@ insightflow-agent/
 │   └── orders.csv
 │
 ├── api.py
+├── api_runs.py
 ├── main.py
 ├── nodes.py
 ├── state.py
@@ -955,11 +1091,27 @@ Current limitations include:
 - MCP is supported: SQL can run through a separate MCP server subprocess over stdio.
   That server is an ordinary host process and is **not a security sandbox**; it currently
   exposes read-only tools only, and HTTP/SSE transports are not implemented.
-- MCP mode is currently **programmatic only** (`run_analysis(mcp=...)`); the FastAPI
-  `/runs` endpoint does not yet expose backend selection and always uses direct.
+- The FastAPI `/runs` endpoint can select the SQL backend via `sql_backend`
+  (`direct` or `mcp`, defaulting to `direct`). The choice is persisted with the run and
+  reused on resume. Requests cannot specify the MCP server command, private directory,
+  environment, or host paths, and an unavailable MCP backend fails loudly instead of
+  silently falling back to direct.
 - Uploaded files and generated artifacts are stored on the local filesystem.
-- The current API does not include authentication, authorization, or multi-user isolation.
+- The current API does not include authentication, authorization, or multi-user isolation,
+  so it is intended for **local demo/development use only** and must not be exposed publicly.
 - Retrieval thresholds are currently based on empirical testing rather than a large-scale retrieval benchmark.
+- Agent execution is bounded by a per-run budget (rounds, tool calls, model calls and
+  wall-clock time) held in workflow state. The budget survives a checkpoint resume
+  rather than resetting. Exhausting it is classified as an environment failure, so it
+  converges to a safe failure instead of entering repair. This is governance over the
+  existing bounded loops, not a new dynamic agent loop.
+- Context passed to each model call is bounded by a **per-node character budget**.
+  Fields that carry failure feedback or task constraints (error text, task definitions,
+  schema, approvals) are never truncated, which means a payload consisting only of such
+  fields can still exceed its budget — a deliberate trade that is covered by tests.
+  Token figures are estimates, not metered usage (see the evaluation section).
+- The evaluation harness runs on a scripted mock model. Real-model quality metrics are
+  not measured, and provider access is gated behind explicit authorisation.
 
 ## Future Work
 
@@ -968,11 +1120,13 @@ Planned improvements include:
 - moving SQL execution into a restricted container or a separate process
 - persistent vector database support
 - LangSmith tracing and workflow observability
-- expose MCP backend selection through the FastAPI /runs endpoint
-- retrieval and agent-quality benchmarks
+- API authentication, rate limiting and multi-user isolation
+- a real-model evaluation run over the existing harness, once API access and a budget
+  are authorised (the harness, scoring and fault injection already exist)
+- expanding the task set beyond its current 42 tasks (no time-series, three-table joins,
+  or unstructured-text inputs yet)
 - asynchronous analysis jobs and background execution
 - real-time workflow progress streaming
 - cross-source analytical querying with DuckDB
-- authentication and multi-user isolation
 - persistent artifact and knowledge storage
 - configurable RAG retrieval strategies and reranking
