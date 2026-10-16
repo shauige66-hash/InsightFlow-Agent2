@@ -189,17 +189,14 @@ def _budget_guard(*, for_model_request: bool = True) -> None:
     历史上这个函数被定义却从未接入调用路径——预算配置写进了 state，
     但没有任何请求真正被拦下。现在它是 `run_agent_call` 的 `before_request`。
     """
-    from utils.agent_loop import check, check_llm_budget, requests_in_flight
+    from utils.agent_loop import check, check_llm_budget
 
     if for_model_request:
-        # `requests_in_flight()` 是**本次逻辑调用**内已经发出的请求数。
-        # 图会为每个节点复制 state，因此同一节点内部的重试看不到彼此就写入的
-        # 计数——必须显式加上，否则第 2、3 次重试读到的仍是调用开始时的旧值，
-        # 上限形同虚设（实测：上限 3 却发出 4 次请求）。
-        check_llm_budget(
-            _CURRENT_STATE.get() or {},
-            extra_used=requests_in_flight(),
-        )
+        # `llm_calls` 在每次请求**发出前**就地累加，因此同一逻辑调用内部的
+        # 重试读到的已经是"已发出的请求数"。这里不能再另外加一次
+        # `requests_in_flight()`：那会把当前这次请求算两次，导致上限 2 时
+        # 只发出 1 次请求就被判超预算。
+        check_llm_budget(_CURRENT_STATE.get() or {})
         return
 
     check(_CURRENT_STATE.get() or {})
@@ -380,13 +377,10 @@ def _register_request_hooks() -> None:
         state = _CURRENT_STATE.get()
         if state is None:
             return
-        # 同时推进两处：state 里的总量（用于落盘与日志）与本次逻辑调用的
-        # 请求计数（用于同一次调用内部的重试判定）。
+        # 就地累加：同一次逻辑调用内部的后续重试要靠它看到"已经发过几次"，
+        # 正式落盘仍由节点返回的增量完成。
         updates = consume_llm_call(state)
         state[BUDGET_FIELD] = updates[BUDGET_FIELD]
-        from utils.agent_loop import note_request_in_flight
-
-        note_request_in_flight()
 
     set_state_provider(_state)
     set_request_hooks(before=_before, after=_count)

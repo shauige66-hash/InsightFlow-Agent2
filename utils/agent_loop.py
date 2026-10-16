@@ -56,7 +56,6 @@
 
 from __future__ import annotations
 
-import contextvars
 import time
 from dataclasses import dataclass
 from typing import Any
@@ -392,23 +391,18 @@ def check(
             raise BudgetExceeded(scope, used, limit)
 
 
-def check_llm_budget(
-    state: dict[str, Any],
-    *,
-    extra_used: int = 0,
-) -> None:
+def check_llm_budget(state: dict[str, Any]) -> None:
     """进入一次**真实模型请求**前的判定。
 
     只看 `llm_calls`：这一次请求额外消耗的是一个模型调用额度，不该因为
     工具调用或时间预算刚好用尽而被拒绝——那些分项在各自的入口判定
     （`governed_tool_call` 与 `_round_update` 走完整的 `check`）。
 
-    `extra_used` 用于同一次逻辑调用里的多次请求：`state` 里的计数要等节点
-    返回才更新，而图会为每个节点复制 state，因此同一操作内部必须把已经
-    发出的请求数显式加上——否则带上限 1 时第二次请求仍会通过。
+    计数的写入点在每次请求**发出之前**，因此同一次逻辑调用内部的重试
+    读到的就是"已经发过几次"，这里只比较、不再额外加一。
     """
     budget = budget_of(state)
-    used = usage_of(state)["llm_calls"] + max(0, int(extra_used))
+    used = usage_of(state)["llm_calls"]
     if used >= budget.max_llm_calls:
         raise BudgetExceeded("llm_calls", used, budget.max_llm_calls)
 
@@ -493,45 +487,6 @@ def current_state() -> dict[str, Any] | None:
     if provider is None:
         return None
     return provider()
-
-
-#: 当前**逻辑调用**内部已经发出的请求数。
-#:
-#: 为什么需要它：LangGraph 为每个要执行的节点复制一份 state，因此在同一节点
-#: 内部的多次重试之间，节点那份 state 上的就地计数**不会**被观察到——第二次
-#: 判定读到的仍是调用开始时的旧值，于是声明上限 3 时第 3 次重试照样发出
-#: （实测：上限 3、发出 4 次）。
-#:
-#: 因此把"本次逻辑调用已发出的请求数"放在 ContextVar 里：它随执行上下文走，
-#: 不依赖 state 的可见性，也不受线程池或图复制的影响。
-_requests_in_flight: contextvars.ContextVar[int] = contextvars.ContextVar(
-    "insightflow_requests_in_flight", default=0
-)
-
-
-def begin_operation_requests() -> contextvars.Token:
-    """开始一次逻辑调用前调用，返回可用于恢复的 token。"""
-    return _requests_in_flight.set(0)
-
-
-def end_operation_requests(token: contextvars.Token) -> None:
-    """逻辑调用结束后恢复计数。"""
-    _requests_in_flight.reset(token)
-
-
-def requests_in_flight() -> int:
-    """本次逻辑调用已经发出的请求数。"""
-    return _requests_in_flight.get()
-
-
-def note_request_in_flight() -> None:
-    """记一次"本次逻辑调用又发出了一个请求"。
-
-    与 `consume_llm_call` 的区别：后者累加的是**落盘的总量**（state 里的
-    `llm_calls`），本函数累加的是**本次逻辑调用内部**的计数，用于同一节点
-    内部重试之间的判定——图会为每个节点复制 state，所以后者不能靠 state 传递。
-    """
-    _requests_in_flight.set(_requests_in_flight.get() + 1)
 
 
 def set_request_hooks(

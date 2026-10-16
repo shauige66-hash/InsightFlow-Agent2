@@ -4,7 +4,7 @@
 `agent_loop.check_llm_budget` 之间存在重复累计。这里把口径固定下来：
 
 - 判定（`check_llm_budget`）只读，不改 state；
-- 计数（`consume_llm_call` / `note_request_in_flight`）每次真实请求各一次；
+- 计数（`consume_llm_call`）每次真实请求各一次；
 - 判定读到的 `used` 必须等于"已发出的请求数"，因此内部 JSON 重试既不能
   超过额度，也不能提前拒绝仍有额度的请求。
 
@@ -79,37 +79,32 @@ def run_with_retries(tmp_path: Path, *, run_id: str, cap: int, bad_replies: int)
 class TestGuardsAreReadOnly:
     """判定不得累计计数。"""
 
-    def test_check_llm_budget_does_not_change_any_counter(self) -> None:
+    def test_check_llm_budget_does_not_change_the_usage(self) -> None:
         state: dict[str, Any] = {"run_id": "guard-readonly"}
         state.update(initialize(state))
         state[BUDGET_FIELD]["limits"]["max_llm_calls"] = 5
 
         before = al.usage_of(state)
         for _ in range(4):
-            al.check_llm_budget(state, extra_used=0)
+            al.check_llm_budget(state)
 
         assert al.usage_of(state) == before, "判定过程改动了用量"
-        assert al.requests_in_flight() == 0, "判定过程改动了本次调用的请求计数"
 
-    def test_guard_uses_the_in_flight_count_without_writing_it(self) -> None:
-        """同一逻辑调用内的重试判定要显式加上已发出的请求数。"""
-        state: dict[str, Any] = {"run_id": "guard-inflight"}
+    def test_guard_counts_only_the_usage_it_reads(self) -> None:
+        """上限按"已发出的请求数"判定，不额外加上当前这一次。"""
+        state: dict[str, Any] = {"run_id": "guard-boundary"}
         state.update(initialize(state))
         state[BUDGET_FIELD]["limits"]["max_llm_calls"] = 2
 
-        token = al.begin_operation_requests()
-        try:
-            # 已发出 1 次：本次逻辑调用还剩 1 个额度
-            al.note_request_in_flight()
-            al.check_llm_budget(state, extra_used=al.requests_in_flight())
+        # 已发出 1 次：还剩 1 个额度，判定通过
+        state[BUDGET_FIELD]["usage"]["llm_calls"] = 1
+        al.check_llm_budget(state)
 
-            # 已发出 2 次：额度用尽，第 3 次必须被拦下
-            al.note_request_in_flight()
-            with pytest.raises(al.BudgetExceeded) as excinfo:
-                al.check_llm_budget(state, extra_used=al.requests_in_flight())
-            assert excinfo.value.scope == "llm_calls"
-        finally:
-            al.end_operation_requests(token)
+        # 已发出 2 次：额度用尽，下一次请求必须被拦下
+        state[BUDGET_FIELD]["usage"]["llm_calls"] = 2
+        with pytest.raises(al.BudgetExceeded) as excinfo:
+            al.check_llm_budget(state)
+        assert excinfo.value.scope == "llm_calls"
 
 
 class TestCountersAreNotDoubledInTheRealWorkflow:
@@ -124,7 +119,6 @@ class TestCountersAreNotDoubledInTheRealWorkflow:
         assert usage.get("llm_calls") == counting.count, (
             f"用量（{usage.get('llm_calls')}）与真实请求数（{counting.count}）不一致"
         )
-        assert al.requests_in_flight() == 0, "作用域退出后仍有未结算的请求计数"
 
     @pytest.mark.parametrize("cap", [1, 2, 3, 4])
     def test_cap_stops_exactly_at_the_limit(
