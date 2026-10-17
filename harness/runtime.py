@@ -25,6 +25,10 @@ from contextlib import contextmanager
 from typing import Any, Callable, Iterator
 
 from harness import policy
+from harness.context_sources import (
+    inject_context_sources,
+    knowledge_chunk_count,
+)
 from harness.context_manager import (
     TableSelection,
     build_context as build_agent_context,
@@ -174,6 +178,13 @@ class AgentRuntimeHarness:
         "这次只看了哪几张表"，而不是只有总字符数。
         """
         selection = self._selection_for(data_context)
+
+        # 记忆与多轮历史在这里合并进输入字段：Agent 只看到已格式化的文本，
+        # 不接触存储，也不知道它们来自哪张表。
+        fields = dict(fields)
+        state = current_state() or {}
+        injected = inject_context_sources(agent, fields, state)
+
         bounded, report = build_agent_context(
             agent,
             fields,
@@ -181,6 +192,9 @@ class AgentRuntimeHarness:
             history=history,
             task_id=task_id,
             budget=budget,
+            knowledge_chunks=knowledge_chunk_count(fields),
+            memory_entries=injected["memory_entries"],
+            knowledge_cache_hit=bool(state.get("knowledge_cache_hit")),
         )
         publish_context_report(agent, report.to_dict())
         return bounded, report

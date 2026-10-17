@@ -86,6 +86,19 @@ class InsightFlowState(TypedDict, total=False):
     # 计划获批时记下的内容指纹。执行前比对，避免审批后计划被换掉。
     approved_plan_fingerprint: str | None
 
+    # H4：任务级检索证据。按 task_id 保存，修复与精修复用同一批证据；
+    # knowledge_version 变化（文档更新）会让旧证据失效。
+    task_knowledge: dict[str, list[dict]]
+    knowledge_version: str | None
+    # 本轮任务检索是否命中缓存（只用于观测，不参与决策）
+    knowledge_cache_hit: bool
+
+    # 多轮对话：上一轮的意图、最近消息与已完成结果引用，由会话服务写入
+    conversation_context: dict | None
+
+    # 长期记忆：本轮注入的已确认偏好，仅来自用户确认过的条目
+    memories: list[dict]
+
     current_task_index: int  # 当前正在执行的分析任务位置
 
     current_tool: Literal["python", "sql"] | None  # 选择的工具

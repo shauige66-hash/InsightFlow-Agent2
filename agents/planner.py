@@ -82,6 +82,12 @@ PLANNER_PROMPT = """
 
 {retry_hint}
 
+同一会话中之前的内容（仅作为上下文；里面没有结果就不要假设有结果）：
+{conversation_history}
+
+用户已确认的长期偏好（可能与当前指令冲突；冲突时以当前指令为准）：
+{memories}
+
 返回格式：
 
 {{
@@ -126,6 +132,8 @@ def create_analysis_plan(
     chain = prompt | llm | parser
 
     inputs = {
+        "conversation_history": "无",
+        "memories": "无",
         "data_context": json.dumps(
             contexts,
             ensure_ascii=False,

@@ -165,6 +165,11 @@ class ContextReport:
     kept_tables: list[str] = field(default_factory=list)
     excluded_tables: list[str] = field(default_factory=list)
     history_entries: int | None = None
+    # H4：知识证据、长期记忆与缓存命中的可观测字段。它们只描述“注入了多少”，
+    # 不携带内容本身，因此可以安全进日志。
+    knowledge_chunks: int = 0
+    memory_entries: int = 0
+    knowledge_cache_hit: bool = False
 
     @property
     def truncated(self) -> bool:
@@ -204,6 +209,9 @@ class ContextReport:
             "kept_tables": list(self.kept_tables),
             "excluded_tables": list(self.excluded_tables),
             "history_entries": self.history_entries,
+            "knowledge_chunks": self.knowledge_chunks,
+            "memory_entries": self.memory_entries,
+            "knowledge_cache_hit": self.knowledge_cache_hit,
         }
 
 
@@ -494,6 +502,9 @@ def bound_fields(
     kept_tables: list[str] | None = None,
     excluded_tables: list[str] | None = None,
     history_entries: int | None = None,
+    knowledge_chunks: int = 0,
+    memory_entries: int = 0,
+    knowledge_cache_hit: bool = False,
 ) -> tuple[dict[str, Any], ContextReport]:
     """按节点预算压缩一组**命名字段**。
 
@@ -520,6 +531,9 @@ def bound_fields(
         kept_tables=list(kept_tables or []),
         excluded_tables=list(excluded_tables or []),
         history_entries=history_entries,
+        knowledge_chunks=knowledge_chunks,
+        memory_entries=memory_entries,
+        knowledge_cache_hit=knowledge_cache_hit,
     )
 
     preserved_names = NODE_PRESERVE_FIELDS.get(node, frozenset())

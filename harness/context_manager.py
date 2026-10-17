@@ -181,6 +181,9 @@ def build_context(
     history: list[dict[str, Any]] | None = None,
     task_id: str | None = None,
     budget: int | None = None,
+    knowledge_chunks: int = 0,
+    memory_entries: int = 0,
+    knowledge_cache_hit: bool = False,
 ) -> tuple[dict[str, Any], ContextReport]:
     """把一次 Agent 的输入压进预算，并产出可观测的度量。
 
@@ -196,6 +199,9 @@ def build_context(
         kept_tables=list(selection.kept) if selection else None,
         excluded_tables=list(selection.excluded) if selection else None,
         history_entries=len(history) if history is not None else None,
+        knowledge_chunks=knowledge_chunks,
+        memory_entries=memory_entries,
+        knowledge_cache_hit=knowledge_cache_hit,
     )
     return bounded, report
 

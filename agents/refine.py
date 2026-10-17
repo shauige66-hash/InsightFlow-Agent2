@@ -152,6 +152,9 @@ Critic 审查意见：
 
 {retry_hint}
 
+用户已确认的长期偏好（可能与当前指令冲突；冲突时以当前指令为准）：
+{memories}
+
 返回格式：
 
 {{
@@ -191,6 +194,7 @@ def refine_execution_code(
     chain = prompt | llm | parser
 
     inputs = {
+        "memories": "无",
     "task": json.dumps(
         task,
         ensure_ascii=False,

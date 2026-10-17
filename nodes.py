@@ -189,7 +189,12 @@ def _budget_failure(
 
 from utils.run_logger import log_event
 from time import perf_counter
-from rag.knowledge_service import build_and_retrieve_knowledge
+from rag.evidence import citations as evidence_citations
+from services.knowledge_service import (
+    knowledge_contents,
+    retrieve_global,
+    task_knowledge_updates,
+)
 
 # 运行治理通过 Harness 进入：模型调用、工具派发与预算都在那一层，
 # 节点只解释结果。`BudgetExceeded` 仍要在模块级可用——`_with_state`
@@ -251,44 +256,8 @@ def context_node(
 def knowledge_retrieval_node(
     state: InsightFlowState
 ) -> dict:
-
-    knowledge_sources = state.get(
-        "knowledge_sources",
-        []
-    )
-
-    if not knowledge_sources:
-        return {
-            "retrieved_knowledge": [],
-            "retrieved_knowledge_details": []
-        }
-
-    analysis_focus = state.get(
-        "analysis_focus"
-    )
-
-    query = (
-        analysis_focus
-        or "与当前数据分析相关的业务规则、指标定义和术语"
-    )
-
-    retrieved_knowledge_details = (
-        build_and_retrieve_knowledge(
-            knowledge_sources=knowledge_sources,
-            query=query
-        )
-    )
-
-    retrieved_knowledge = [
-        item["content"]
-        for item in retrieved_knowledge_details
-        if item.get("content")
-    ]
-
-    return {
-        "retrieved_knowledge": retrieved_knowledge,
-        "retrieved_knowledge_details": (retrieved_knowledge_details)
-    }
+    """规划前的全局业务知识，让 Planner 理解业务术语与指标定义。"""
+    return retrieve_global(state)
 
 
 #: 首次规划 + 重新规划的总尝试次数。次数上限写进 state 的 `plan_attempts`，
@@ -541,10 +510,11 @@ def execution_node(
             "Current tool is missing."
         )
 
-    retrieved_knowledge = state.get(
-    "retrieved_knowledge",
-    []
-    )
+    # 任务级检索：首次进入该任务时取证据，之后的修复/精修复用同一批
+    evidence, knowledge_updates = task_knowledge_updates(state, task)
+    retrieved_knowledge = [
+        item["content"] for item in evidence if item.get("content")
+    ]
 
     # execution_node 每个任务只进入一次：之后的代码由 repair / refine 产出
     # （图上是 repair→tool_execution、refine→tool_execution，不再回到这里）。
@@ -586,6 +556,7 @@ def execution_node(
     return {
         "current_code": code,
         "completed_operations": _ops,
+        **knowledge_updates,
         **_extra,
     }
 
@@ -799,13 +770,10 @@ def repair_node(
     state: InsightFlowState
 ) -> dict:
 
-    retrieved_knowledge = state.get(
-    "retrieved_knowledge",
-    []
-)
 
     index = state["current_task_index"]
     task = state["analysis_plan"][index]
+    retrieved_knowledge = knowledge_contents(state, task["task_id"])
 
     data_context = HARNESS.task_context(state, task["target_tables"]).tables
 
@@ -1002,12 +970,9 @@ def advance_task_node(
 def critic_node(
     state: InsightFlowState
 ) -> dict:
-    retrieved_knowledge = state.get(
-    "retrieved_knowledge",
-    []
-)
     index = state["current_task_index"]
     task = state["analysis_plan"][index]
+    retrieved_knowledge = knowledge_contents(state, task["task_id"])
 
     data_context = HARNESS.task_context(state, task["target_tables"]).tables
 
@@ -1073,13 +1038,10 @@ def refine_node(
     state: InsightFlowState
 ) -> dict:
     
-    retrieved_knowledge = state.get(
-    "retrieved_knowledge",
-    []
-)
     index = state["current_task_index"]
 
     task = state["analysis_plan"][index]
+    retrieved_knowledge = knowledge_contents(state, task["task_id"])
 
     data_context = HARNESS.task_context(state, task["target_tables"]).tables
 
@@ -1236,6 +1198,26 @@ def failed_task_node(
         ]
     }
 
+def _citations_appendix(state: InsightFlowState) -> str:
+    """报告引用的业务知识来源：能追到文档、页码与片段。"""
+    evidence: list[dict] = []
+    for items in (state.get("task_knowledge") or {}).values():
+        evidence.extend(items or [])
+
+    cited = evidence_citations(evidence)
+    if not cited:
+        return ""
+
+    lines = ["", "## 参考来源", ""]
+    for entry in cited[:10]:
+        page = f"，第 {entry['page']} 页" if entry.get("page") else ""
+        lines.append(
+            f"- {entry['source']}{page}"
+            f"（chunk {str(entry['chunk_id'])[:12]}，相似度 {entry['score']:.3f}）"
+        )
+    return "\\n".join(lines)
+
+
 @_with_state
 def report_node(
     state: InsightFlowState
@@ -1385,8 +1367,13 @@ def report_node(
             }
         )
 
+    # 被引用的业务规则要能追到来源，因此附录由证据生成，而不是让模型复述
+    appendix = _citations_appendix(state)
+
     return {
-        "report_content": report,
+        "report_content": (
+            f"{report.rstrip()}\\n{appendix}" if appendix else report
+        ),
         "completed_operations": _ops,
         **_extra,
     }
