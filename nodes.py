@@ -517,39 +517,18 @@ def _decide_log(
     )
 
 
-def _safe_decision(
-    observation,
-    *,
-    history: list[dict],
-    limits: dict[str, int],
-) -> tuple[dict, dict, dict]:
-    """调用决策模型；输出不可解析时收敛为"结束"，而不是让整张图崩掉。
+def _unparseable_decision(error: Exception) -> tuple[dict, dict, dict]:
+    """决策解析失败时收敛为"结束"，而不是让整张图崩掉。
 
     决策是一次模型请求，解析失败意味着这一次判断没有结论。把异常抛到图上
     会把"模型没按格式回答"变成 Run 崩溃；收敛成 finish 则保留已完成的成果，
     并由策略层记录原因。
     """
-    from utils.llm_retry import StructuredOutputError
-
-    try:
-        proposed, ops, extra = HARNESS.model_call(
-            "decider",
-            attempt_subject("decide", observation.loop_step),
-            lambda: decide_action(
-                observation,
-                history=history,
-                limits=limits,
-                llm=model_for("decider"),
-            ),
-            attempt=observation.loop_step + 1,
-        )
-        return proposed, ops or {}, extra or {}
-    except StructuredOutputError as error:
-        return (
-            {"action": "finish", "reason": f"决策输出不可解析：{str(error)[:200]}"},
-            {},
-            {},
-        )
+    return (
+        {"action": "finish", "reason": f"决策输出不可解析：{str(error)[:200]}"},
+        {},
+        {},
+    )
 
 
 @_with_state
@@ -569,9 +548,22 @@ def decide_node(
     limits = limits_from(state.get("dynamic_limits"))
     history = list(state.get("decision_history") or [])
 
-    proposed, _ops, _extra = _safe_decision(
-        observation, history=history, limits=limits
-    )
+    from utils.llm_retry import StructuredOutputError
+
+    try:
+        proposed, _ops, _extra = HARNESS.model_call(
+            "decider",
+            attempt_subject("decide", observation.loop_step),
+            lambda: decide_action(
+                observation,
+                history=history,
+                limits=limits,
+                llm=model_for("decider"),
+            ),
+            attempt=observation.loop_step + 1,
+        )
+    except StructuredOutputError as error:
+        proposed, _ops, _extra = _unparseable_decision(error)
 
     decision = validate_action(
         observation, proposed, state=state, limits=limits

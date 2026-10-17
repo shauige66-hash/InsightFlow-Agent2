@@ -146,7 +146,10 @@ class TestPostgresDynamicLoopRecovery:
 
         database = tmp_path / "customers.sqlite"
         build_database(database)
-        run_id = "h5-pg-loop"
+        # 每次用独立 thread：共享 PG 里同名线程会让"恢复"变成"复用已完成的运行"
+        import uuid
+
+        run_id = f"h5-pg-loop-{uuid.uuid4().hex[:8]}"
         replies = {
             "planner": {
                 "tasks": [

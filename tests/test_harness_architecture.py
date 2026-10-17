@@ -225,6 +225,9 @@ class TestNodeLayerNoLongerOwnsGovernance:
                 "visualization_planner_node",
                 "plot_generation_node",
                 "plot_repair_node",
+                # H5：观察后的决策与运行期修订同样是一次受治理的模型调用
+                "decide_node",
+                "runtime_replan_node",
             ]
         ), model_nodes
         assert sorted(tool_nodes) == ["plot_execution_node", "tool_execution_node"], (
