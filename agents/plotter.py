@@ -2,7 +2,7 @@
 
 import json
 
-from utils.context_budget import bound_fields, publish_context_report
+from harness.runtime import get_harness
 
 NODE_NAME = "plotter"
 from utils.agent_loop import after_model_request, before_model_request
@@ -179,9 +179,7 @@ def generate_plot_code(
     # P4：按节点预算压缩上下文。
     # 不可压缩字段见 utils.context_budget.NODE_PRESERVE_FIELDS；
     # 错误反馈与任务约束在那里被显式保留。
-    inputs, _context_report = bound_fields(NODE_NAME, inputs)
-    # 度量按执行上下文隔离：并发执行的两个 Run 不会互相覆盖
-    publish_context_report(NODE_NAME, _context_report.to_dict())
+    inputs, _context_report = get_harness().build_context(NODE_NAME, inputs, data_context=data_context)
 
     # prompt 里有 {retry_hint} 占位符，必须提供，否则 PromptTemplate 会直接报
     # 缺少变量。首次尝试留空，重试时把上一次的失败原因回传——temperature 为 0 时

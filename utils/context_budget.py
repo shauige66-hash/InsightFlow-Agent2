@@ -147,17 +147,38 @@ def budget_for(node: str) -> int:
 
 @dataclass
 class ContextReport:
-    """一次上下文构造的度量结果。"""
+    """一次上下文构造的度量结果。
+
+    字符规模之外还记录"选了哪些表、排除了哪些表、带了几条历史"，
+    否则无法回答"这次上下文为什么这么大"。
+
+    `kept_tables` / `excluded_tables` 由调用方按任务级选择填入；
+    直接调用 `bound_fields` 的路径留空，不影响既有用法。
+    """
 
     node: str
     budget_chars: int
     original_chars: int = 0
     final_chars: int = 0
     truncated_fields: list[str] = field(default_factory=list)
+    task_id: str | None = None
+    kept_tables: list[str] = field(default_factory=list)
+    excluded_tables: list[str] = field(default_factory=list)
+    history_entries: int | None = None
 
     @property
     def truncated(self) -> bool:
         return bool(self.truncated_fields)
+
+    @property
+    def over_budget(self) -> bool:
+        """保留字段本身就超预算。
+
+        这类超预算不是 bug：`NODE_PRESERVE_FIELDS` 里的字段（数据 schema、
+        任务约束、错误反馈）宁可超也不压掉。记录下来，避免把它当成
+        "预算没生效"。
+        """
+        return self.final_chars > self.budget_chars
 
     @property
     def estimated_tokens(self) -> int:
@@ -170,6 +191,7 @@ class ContextReport:
     def to_dict(self) -> dict[str, Any]:
         return {
             "node": self.node,
+            "task_id": self.task_id,
             "budget_chars": self.budget_chars,
             "original_chars": self.original_chars,
             "final_chars": self.final_chars,
@@ -178,6 +200,10 @@ class ContextReport:
             "token_estimate_method": f"chars/{CHARS_PER_TOKEN_ESTIMATE}",
             "truncated": self.truncated,
             "truncated_fields": sorted(self.truncated_fields),
+            "over_budget": self.over_budget,
+            "kept_tables": list(self.kept_tables),
+            "excluded_tables": list(self.excluded_tables),
+            "history_entries": self.history_entries,
         }
 
 
@@ -464,6 +490,10 @@ def bound_fields(
     fields: dict[str, Any],
     *,
     budget: int | None = None,
+    task_id: str | None = None,
+    kept_tables: list[str] | None = None,
+    excluded_tables: list[str] | None = None,
+    history_entries: int | None = None,
 ) -> tuple[dict[str, Any], ContextReport]:
     """按节点预算压缩一组**命名字段**。
 
@@ -477,12 +507,19 @@ def bound_fields(
     2. 其余字段按当前体积**比例**分配剩余额度，逐个递归压缩；
     3. 若保留字段本身就超预算，最终结果仍会超——这是刻意的取舍：
        丢掉错误反馈比超预算更糟。
+
+    其余关键字参数只描述"这次选了哪些表、带了几条历史"，写进报告供观测，
+    不影响压缩结果。
     """
     effective = budget if budget is not None else budget_for(node)
     report = ContextReport(
         node=node,
         budget_chars=effective,
         original_chars=_json_length(fields),
+        task_id=task_id,
+        kept_tables=list(kept_tables or []),
+        excluded_tables=list(excluded_tables or []),
+        history_entries=history_entries,
     )
 
     preserved_names = NODE_PRESERVE_FIELDS.get(node, frozenset())

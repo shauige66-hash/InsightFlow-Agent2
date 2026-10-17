@@ -25,9 +25,16 @@ from contextlib import contextmanager
 from typing import Any, Callable, Iterator
 
 from harness import policy
+from harness.context_manager import (
+    TableSelection,
+    build_context as build_agent_context,
+    ensure_known_resources,
+    select_history,
+    select_tables,
+)
 from harness.llm_gateway import LLMGateway, StateNotBound
 from harness.tool_dispatcher import ToolDispatcher, ToolOutcome
-from utils.context_budget import context_report_of
+from utils.context_budget import context_report_of, publish_context_report
 
 #: 当前节点正在处理的 state。
 #:
@@ -120,6 +127,75 @@ class AgentRuntimeHarness:
         度量按执行上下文隔离，并发 Run 不会互相串写；取不到返回空字典。
         """
         return context_report_of(agent)
+
+    # -- 上下文 -----------------------------------------------------------
+
+    def task_context(
+        self,
+        state: dict[str, Any],
+        target_tables: list[str] | tuple[str, ...],
+    ) -> TableSelection:
+        """按任务选出相关表的上下文，不存在的资源会被拒绝。"""
+        return select_tables(state, target_tables)
+
+    def ensure_resources(
+        self,
+        state: dict[str, Any],
+        target_tables: list[str] | tuple[str, ...],
+    ) -> tuple[str, ...]:
+        """只校验资源名，不做选择。给路由这类"还没构造上下文"的步骤用。"""
+        return ensure_known_resources(state, target_tables)
+
+    def history_for_task(
+        self,
+        state: dict[str, Any],
+        *,
+        limit: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """当前任务相关的历史执行摘要（有界、确定性）。"""
+        if limit is None:
+            return select_history(state)
+        return select_history(state, limit=limit)
+
+    def build_context(
+        self,
+        agent: str,
+        fields: dict[str, Any],
+        *,
+        data_context: dict[str, Any] | None = None,
+        history: list[dict[str, Any]] | None = None,
+        task_id: str | None = None,
+        budget: int | None = None,
+    ) -> tuple[dict[str, Any], Any]:
+        """压缩一次 Agent 的输入，并发布这次构造的度量。
+
+        `data_context` 是节点按任务选好的表上下文；这里用它推出"保留/排除"
+        写进报告。排除集合来自当前 Run 的授权上下文，因此报告能说明
+        "这次只看了哪几张表"，而不是只有总字符数。
+        """
+        selection = self._selection_for(data_context)
+        bounded, report = build_agent_context(
+            agent,
+            fields,
+            selection=selection,
+            history=history,
+            task_id=task_id,
+            budget=budget,
+        )
+        publish_context_report(agent, report.to_dict())
+        return bounded, report
+
+    @staticmethod
+    def _selection_for(data_context: dict[str, Any] | None) -> TableSelection | None:
+        if data_context is None:
+            return None
+        kept = tuple(data_context.keys())
+        authorized = (current_state() or {}).get("data_context") or {}
+        return TableSelection(
+            tables=dict(data_context),
+            kept=kept,
+            excluded=tuple(sorted(set(authorized) - set(kept))),
+        )
 
 
 _HARNESS: AgentRuntimeHarness | None = None

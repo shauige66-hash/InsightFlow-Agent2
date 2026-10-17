@@ -154,6 +154,7 @@ class TestNoPromptOrKeyMaterialIsLogged:
 
         assert set(payload) == {
             "node",
+            "task_id",
             "budget_chars",
             "original_chars",
             "final_chars",
@@ -161,5 +162,9 @@ class TestNoPromptOrKeyMaterialIsLogged:
             "token_estimate_method",
             "truncated",
             "truncated_fields",
+            "over_budget",
+            "kept_tables",
+            "excluded_tables",
+            "history_entries",
         }
         assert "prompt" not in json.dumps(payload).lower()

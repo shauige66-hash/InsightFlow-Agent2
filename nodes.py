@@ -357,6 +357,10 @@ def router_node(
 
     task = state["analysis_plan"][index]
 
+    # 路由要按表的来源类型决定工具，因此资源名必须先过校验：
+    # 不存在的表在这里被明确拒绝，而不是变成下游的 KeyError。
+    HARNESS.ensure_resources(state, task["target_tables"])
+
     tool = route_analysis_task(
         task,
         resolve_tables(state)
@@ -392,10 +396,7 @@ def execution_node(
 
     task = state["analysis_plan"][index]
 
-    data_context = {
-        table_name: state["data_context"][table_name]
-        for table_name in task["target_tables"]
-    }
+    data_context = HARNESS.task_context(state, task["target_tables"]).tables
 
     tool = state["current_tool"]
 
@@ -670,10 +671,7 @@ def repair_node(
     index = state["current_task_index"]
     task = state["analysis_plan"][index]
 
-    data_context = {
-        table_name: state["data_context"][table_name]
-        for table_name in task["target_tables"]
-    }
+    data_context = HARNESS.task_context(state, task["target_tables"]).tables
 
     tool = state["current_tool"]
     code = state["current_code"]
@@ -875,10 +873,7 @@ def critic_node(
     index = state["current_task_index"]
     task = state["analysis_plan"][index]
 
-    data_context = {
-        table_name: state["data_context"][table_name]
-        for table_name in task["target_tables"]
-    }
+    data_context = HARNESS.task_context(state, task["target_tables"]).tables
 
     execution_result = state["execution_results"][-1]
 
@@ -894,6 +889,8 @@ def critic_node(
             data_context=data_context,
             execution_result=execution_result,
             retrieved_knowledge=retrieved_knowledge,
+            # 当前任务之前的尝试（有界摘要），用来说明这次结果为什么长这样
+            attempt_history=HARNESS.history_for_task(state),
             llm=model_for("critic"),
         ),
         attempt=review_round + 1,
@@ -948,10 +945,7 @@ def refine_node(
 
     task = state["analysis_plan"][index]
 
-    data_context = {
-        table_name: state["data_context"][table_name]
-        for table_name in task["target_tables"]
-    }
+    data_context = HARNESS.task_context(state, task["target_tables"]).tables
 
     tool = state["current_tool"]
 
@@ -1695,12 +1689,7 @@ def plot_generation_node(
         "target_tables"
     ]
 
-    data_context = {
-        table_name: state[
-            "data_context"
-        ][table_name]
-        for table_name in target_tables
-    }
+    data_context = HARNESS.task_context(state, target_tables).tables
 
     source_task_id = visualization_task[
         "source_task_id"
@@ -2170,12 +2159,7 @@ def plot_repair_node(
         "target_tables"
     ]
 
-    data_context = {
-        table_name: state[
-            "data_context"
-        ][table_name]
-        for table_name in target_tables
-    }
+    data_context = HARNESS.task_context(state, target_tables).tables
 
     source_task_id = visualization_task[
         "source_task_id"

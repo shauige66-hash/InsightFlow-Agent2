@@ -1,7 +1,7 @@
 # 检查分析执行结果是否真正完成了原始分析任务。
 
 import json
-from utils.context_budget import bound_fields, publish_context_report
+from harness.runtime import get_harness
 
 NODE_NAME = "critic"
 from utils.agent_loop import after_model_request, before_model_request
@@ -34,6 +34,12 @@ CRITIC_PROMPT = """
 执行结果：
 
 {execution_result}
+
+本任务之前的尝试（摘要，可能为空）：
+
+{attempt_history}
+
+历史只用于理解这次结果为什么长这样，不能因为之前失败过就放宽判定。
 
 请判断这次执行结果是否真正完成了原始分析任务。
 
@@ -75,6 +81,7 @@ def review_execution_result(
     data_context: dict[str, Any],
     execution_result: ExecutionResult,
     retrieved_knowledge: list[str] | None = None,
+    attempt_history: list[dict[str, Any]] | None = None,
     llm: BaseChatModel | None = None,
 ) -> dict[str, Any]:
 
@@ -116,14 +123,18 @@ def review_execution_result(
         ensure_ascii=False,
         indent=2,
         default=str
+    ),
+    "attempt_history": json.dumps(
+        attempt_history or [],
+        ensure_ascii=False,
+        indent=2,
+        default=str
     )
 }
     # P4：按节点预算压缩上下文。
     # 不可压缩字段见 utils.context_budget.NODE_PRESERVE_FIELDS；
     # 错误反馈与任务约束在那里被显式保留。
-    inputs, _context_report = bound_fields(NODE_NAME, inputs)
-    # 度量按执行上下文隔离：并发执行的两个 Run 不会互相覆盖
-    publish_context_report(NODE_NAME, _context_report.to_dict())
+    inputs, _context_report = get_harness().build_context(NODE_NAME, inputs, data_context=data_context)
 
     def _extract(payload: dict[str, Any]) -> dict[str, Any]:
         """必填字段缺失属于可重试的格式问题，在校验器里抛错才会触发重试。"""

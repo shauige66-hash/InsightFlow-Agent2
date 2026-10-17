@@ -2,7 +2,7 @@
 
 import json
 
-from utils.context_budget import bound_fields, publish_context_report
+from harness.runtime import get_harness
 from utils.agent_loop import after_model_request, before_model_request
 
 NODE_NAME = "reporter"
@@ -139,8 +139,8 @@ def generate_analysis_report(
     # P2-B3 的 `build_preview`：列名 + 行数 + 少量样本），因此正常路径下
     # 不会触发压缩；预算是防止上游给出别的东西时这个节点的 Prompt 失控。
     #
-    # 与其余 Agent 用同一个 `bound_fields`：口径一致才谈得上"逐节点预算"。
-    inputs, context_report = bound_fields(NODE_NAME, inputs)
+    # 与其余 Agent 用同一个 `build_context`：口径一致才谈得上"逐节点预算"。
+    inputs, context_report = get_harness().build_context(NODE_NAME, inputs)
 
     def _require_text(text: object) -> str:
         if not isinstance(text, str) or not text.strip():
@@ -155,7 +155,5 @@ def generate_analysis_report(
         on_request=after_model_request,
     )
 
-    # 度量按执行上下文隔离：并发执行的两个 Run 不会互相覆盖
-    publish_context_report(NODE_NAME, context_report.to_dict())
 
     return result
