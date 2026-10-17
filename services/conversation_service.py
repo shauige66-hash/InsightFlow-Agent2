@@ -175,22 +175,29 @@ class ConversationService:
             turn_payload = _turn_dict(turn)
             knowledge_refs = list(record.knowledge_refs or [])
 
-        # 事务提交之后再启动，避免"Run 已开始但轮次还没落库"
-        self._coordinator.start(
-            run_id,
-            data_sources=dataset_refs,
-            analysis_focus=analysis_focus or content,
-            knowledge_sources=knowledge_refs,
-            require_plan_approval=require_plan_approval,
-            require_report_approval=require_report_approval,
-            sql_backend=sql_backend,
-            conversation_context=self._context_payload(
-                history, dataset_refs=dataset_refs
-            ),
-            memories=self._memories_for(content, dataset_refs=dataset_refs),
-            enable_dynamic_loop=enable_dynamic_loop,
-            dynamic_limits=dynamic_limits,
-        )
+        # 启动可能失败（线程池关闭、后端模式非法、登记写入失败）。轮次与用户
+        # 消息已经落库，如果不收敛状态，这条消息会永远停在 pending——界面上
+        # 既看不到结果，也看不到失败原因。
+        try:
+            self._coordinator.start(
+                run_id,
+                data_sources=dataset_refs,
+                analysis_focus=analysis_focus or content,
+                knowledge_sources=knowledge_refs,
+                require_plan_approval=require_plan_approval,
+                require_report_approval=require_report_approval,
+                sql_backend=sql_backend,
+                conversation_context=self._context_payload(
+                    history, dataset_refs=dataset_refs
+                ),
+                memories=self._memories_for(content, dataset_refs=dataset_refs),
+                enable_dynamic_loop=enable_dynamic_loop,
+                dynamic_limits=dynamic_limits,
+            )
+        except Exception as error:
+            self._mark_start_failed(turn_payload["turn_id"], run_id, error)
+            raise
+
         with storage.session_scope(storage.database_url()) as session:
             repository = self._sessions(session)
             repository.update_turn(turn_payload["turn_id"], status="running")
@@ -201,6 +208,23 @@ class ConversationService:
             "run_id": run_id,
             "deduplicated": False,
         }
+
+    def _mark_start_failed(self, turn_id: str, run_id: str, error: Exception) -> None:
+        """把"启动失败"写进轮次与 Run，而不是让它停在 pending。"""
+        reason = f"启动分析失败：{error}"[:500]
+        with storage.session_scope(storage.database_url()) as session:
+            self._sessions(session).update_turn(
+                turn_id, status="failed", status_reason=reason
+            )
+
+        store = getattr(self._coordinator, "store", None)
+        if store is None:
+            return
+        try:
+            if store.get(run_id) is not None:
+                store.update_status(run_id, "failed", error=reason)
+        except Exception:  # noqa: BLE001 - 收尾失败不应掩盖原始异常
+            logger.warning("记录启动失败时读不到 Run 状态：%s", run_id, exc_info=True)
 
     def resume_run(self, run_id: str, *, resume_value: Any = None) -> dict[str, Any]:
         """恢复同一个 Run（HITL / Checkpoint），不创建新 Turn。"""

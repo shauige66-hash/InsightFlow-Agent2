@@ -129,6 +129,13 @@ def post_message(session_id: str, payload: PostMessageRequest) -> dict[str, Any]
     """提交一条消息：创建新的 Turn 与 Run，立即返回 run_id。"""
     if not payload.content.strip():
         raise HTTPException(status_code=400, detail="消息内容不能为空")
+
+    # 请求本身就非法的输入在这里拒绝：避免先写进一条用户消息和一个轮次，
+    # 再在启动阶段失败，留下一条永远 pending 的记录。
+    from api_runs import _validate_sql_backend
+
+    sql_backend = _validate_sql_backend(payload.sql_backend)
+
     try:
         result = _service().post_message(
             session_id,
@@ -137,7 +144,7 @@ def post_message(session_id: str, payload: PostMessageRequest) -> dict[str, Any]
             analysis_focus=payload.analysis_focus,
             require_plan_approval=payload.require_plan_approval,
             require_report_approval=payload.require_report_approval,
-            sql_backend=payload.sql_backend,
+            sql_backend=sql_backend,
             enable_dynamic_loop=payload.enable_dynamic_loop,
             dynamic_limits=payload.dynamic_limits,
         )

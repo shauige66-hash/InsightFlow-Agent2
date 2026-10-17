@@ -321,9 +321,11 @@ class TestBounds:
         assert result["decision_history"][-1]["action"] == "finish"
         assert result["decision_history"][-1]["forced"] is True
         assert "上限" in (result["termination_reason"] or "")
-        # 决策在上限处收尾：只发生了两次决策，不会继续给第三个任务做判断
+        # 上限处只记录终止决定，不再发决策请求
+        assert factory.calls.count("decider") == 1
         assert len(result["decision_history"]) == 2
-        assert factory.calls.count("decider") == 2
+        # 两个任务都已执行完，上限只终止了"继续决策"，不影响已完成的工作
+        assert result["analysis_status"] == "completed"
 
     def test_repeated_failed_action_falls_back(self, database, tmp_path, monkeypatch) -> None:
         install_tool(monkeypatch, fail_markers={"BROKEN": "python_error"})

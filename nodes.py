@@ -206,6 +206,8 @@ from services.knowledge_service import (
     task_knowledge_updates,
 )
 from agent_loop import (
+    FINISH,
+    ActionDecision,
     build_observation,
     decision_updates,
     limits_from,
@@ -531,6 +533,18 @@ def _unparseable_decision(error: Exception) -> tuple[dict, dict, dict]:
     )
 
 
+def _decision_blocked(observation, limits: dict[str, int]) -> str | None:
+    """在发请求之前判断决策是否还允许继续；返回终止原因或 None。"""
+    if observation.loop_step >= int(limits["max_decision_steps"]):
+        return f"动态决策达到上限 {limits['max_decision_steps']} 步"
+
+    left = (observation.remaining_budget or {}).get("llm_calls")
+    if isinstance(left, int) and left <= 0:
+        return "模型调用预算已耗尽"
+
+    return None
+
+
 @_with_state
 def decide_node(
     state: InsightFlowState
@@ -547,6 +561,27 @@ def decide_node(
     observation = build_observation(state)
     limits = limits_from(state.get("dynamic_limits"))
     history = list(state.get("decision_history") or [])
+
+    # 上限与预算在**发请求之前**判定：达到上限后再问一次模型，问完也一定会
+    # 被策略改写成 finish，那一次请求纯属浪费，而且让"有界"多出一个例外。
+    cooldown = _decision_blocked(observation, limits)
+    if cooldown is not None:
+        decision = ActionDecision(
+            action=FINISH,
+            reason=cooldown,
+            forced=True,
+            observation_fingerprint=observation.fingerprint(),
+        )
+        updates = decision_updates(state, observation, decision)
+        updates["completed_operations"] = {}
+        _decide_log(
+            state,
+            observation=observation,
+            decision=decision,
+            limits=limits,
+            proposed=None,
+        )
+        return updates
 
     from utils.llm_retry import StructuredOutputError
 
@@ -1045,7 +1080,7 @@ def tool_execution_node(
         # 分类随错误一起进 state：路由据此判断是否值得进入修复循环，
         # 而不是去解析错误文案。
         "execution_error_kind": execution.get("error_kind"),
-        # P3-A/B：把这次工具调用的预算计数落盘。不写回的话
+        # 把这次工具调用的预算计数落盘。不写回的话
         # "已消耗"不会进 Checkpoint，恢复后预算就归零了。
         **budget_updates,
     }
@@ -1121,7 +1156,7 @@ def repair_node(
         "current_code": repaired_code,
         "retry_count": retry_count,
         "completed_operations": _ops,
-        # P3-A：进入修复就是一次新的 Reason→Act→Observe→Decide 轮次。
+        # 进入修复就是一次新的 Reason→Act→Observe→Decide 轮次。
         **HARNESS.note_round(state),
         **_extra,
     }
@@ -1407,7 +1442,7 @@ def refine_node(
         "current_code": refined_code,
         "refine_count": refine_count,
         "completed_operations": _ops,
-        # P3-A：进入精修同样是一次新的循环轮次。
+        # 进入精修同样是一次新的循环轮次。
         **HARNESS.note_round(state),
         **_extra,
     }
@@ -1507,7 +1542,7 @@ def _citations_appendix(state: InsightFlowState) -> str:
             f"- {entry['source']}{page}"
             f"（chunk {str(entry['chunk_id'])[:12]}，相似度 {entry['score']:.3f}）"
         )
-    return "\\n".join(lines)
+    return "\n".join(lines)
 
 
 @_with_state
@@ -2374,7 +2409,7 @@ def plot_execution_node(
     # 绘图需要**真实数据**，而大结果在 state 里只留了摘要。
     # 这里按产物引用把完整结果读回来，并校验归属、路径与 sha256：
     # 直接把 `{"__kind__": "externalized"}` 摘要送进容器会画出一张空图，
-    # 而工作流不会报错——这正是 P2-B3 要修掉的静默错误。
+    # 而工作流不会报错——这正是  要修掉的静默错误。
     # 读回的是 JSON 记录，仍不把完整内容写回 state。
     try:
         analysis_result = load_result(
@@ -2713,7 +2748,7 @@ def plot_repair_node(
         "current_plot_code": repaired_code,
         "plot_retry_count": plot_retry_count,
         "completed_operations": _ops,
-        # P3-A：绘图修复是一个独立的有界循环，也计入总轮次。
+        # 绘图修复是一个独立的有界循环，也计入总轮次。
         **HARNESS.note_round(state),
         **_extra,
     }

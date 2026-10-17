@@ -51,7 +51,7 @@ _TERMINAL_KINDS = frozenset(
 DEFAULT_LIMITS: dict[str, int] = {
     # 一次运行最多做几次动态决策（含首次）
     "max_decision_steps": 8,
-    # 运行期重新规划计划（不含 H3 的初始计划生成）
+    # 运行期重新规划计划（不含  的初始计划生成）
     "max_runtime_replans": 2,
     # 每个任务最多补充几次检索
     "max_extra_retrievals": 2,

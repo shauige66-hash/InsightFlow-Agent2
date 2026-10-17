@@ -1,4 +1,4 @@
-"""P3-A：有界 Agent 循环的控制层。
+"""有界 Agent 循环的控制层。
 
 ## 这个模块解决什么
 
@@ -57,6 +57,7 @@
 from __future__ import annotations
 
 import time
+import uuid
 from dataclasses import dataclass
 from typing import Any
 
@@ -65,7 +66,7 @@ BUDGET_FIELD = "execution_budget"
 
 # 预算收敛失败使用的错误分类。归到已有的 `unavailable` 语义下：
 # 预算耗尽不是"代码写错了"，重试同样的代码不会好转，
-# 因此不该进入 Repair——这与 P2-B 对环境类错误的处理一致。
+# 因此不该进入 Repair——这与  对环境类错误的处理一致。
 BUDGET_ERROR_KIND = "unavailable"
 
 #: 两次真实操作之间最多计入的墙上时钟。
@@ -78,6 +79,13 @@ BUDGET_ERROR_KIND = "unavailable"
 #: 取值依据：它必须明显大于单次工具/模型调用的正常耗时（否则正常执行会被少计），
 #: 又要明显小于人工审批的等待时间（否则等待会被误计）。60 秒对两者都有余量。
 MAX_ACTIVE_GAP_SECONDS = 60.0
+
+#: 当前进程的标识，写进预算快照。
+#:
+#: 为什么需要它：单次操作的耗时应当如实计入，但**崩溃前留下的时钟**不能——
+#: 那个 `last_active_at` 可能是几小时前的，恢复后一次累加就能把整份时间预算吃掉。
+#: 因此只在"时钟是本进程打开的"时按真实间隔计费；否则仍按上限封顶。
+_PROCESS_TOKEN = uuid.uuid4().hex
 
 
 class BudgetExceeded(RuntimeError):
@@ -185,6 +193,8 @@ def new_usage() -> dict[str, Any]:
         # 等待越久越接近上限——只是把误差从"精确计入"变成"封顶计入"。
         # 有了它，时钟在结算后就真的停住，等待期间 elapsed 保持不变。
         "clock_open": False,
+        # 打开时钟的进程；为空表示这份时钟来自旧快照或其它进程
+        "clock_token": None,
     }
 
 
@@ -319,11 +329,18 @@ def _accumulate(
 
     last = usage.get("last_active_at")
     if usage.get("clock_open") and isinstance(last, (int, float)):
-        active += min(MAX_ACTIVE_GAP_SECONDS, max(0.0, now - float(last)))
+        gap = max(0.0, now - float(last))
+        # 本进程测量的间隔就是一次操作的真实耗时，不能截断：一次三分钟的工具
+        # 调用只记 60 秒，时间预算就形同虚设。陌生令牌（崩溃遗留）仍封顶。
+        if usage.get("clock_token") == _PROCESS_TOKEN:
+            active += gap
+        else:
+            active += min(MAX_ACTIVE_GAP_SECONDS, gap)
 
     usage["active_seconds"] = active
     usage["last_active_at"] = now
     usage["clock_open"] = open_clock
+    usage["clock_token"] = _PROCESS_TOKEN if open_clock else usage.get("clock_token")
     if usage.get("started_at") is None:
         usage["started_at"] = now
 
@@ -380,9 +397,11 @@ def elapsed_seconds(state: dict[str, Any], *, now: float | None = None) -> float
     last = usage.get("last_active_at")
     if usage.get("clock_open") and isinstance(last, (int, float)):
         current = now if now is not None else time.time()
-        active += min(
-            MAX_ACTIVE_GAP_SECONDS, max(0.0, current - float(last))
-        )
+        gap = max(0.0, current - float(last))
+        if usage.get("clock_token") == _PROCESS_TOKEN:
+            active += gap
+        else:
+            active += min(MAX_ACTIVE_GAP_SECONDS, gap)
 
     return active
 

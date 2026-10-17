@@ -80,17 +80,34 @@ def evidence_from_state(
     return list(stored.get(str(task_id)) or [])
 
 
+def _current_knowledge_version(state: dict[str, Any]) -> str | None:
+    """当前知识源的内容版本；没有知识源时返回 None。"""
+    sources = [str(item) for item in (state.get("knowledge_sources") or [])]
+    if not sources:
+        return None
+    from rag.versioning import knowledge_version
+
+    return knowledge_version(sources)
+
+
 def task_knowledge_updates(
     state: dict[str, Any], task: dict[str, Any], *, focus: str | None = None
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """取任务证据，必要时检索；返回 `(证据, state 增量)`。
 
     已经在 state 里的任务不再检索：修复与精修复用第一次尝试的证据。
-    例外是动态决策要求补充检索（`focus` 非空）：此时用新的问句再查一次，
-    新旧证据按 chunk_id 去重后合并，旧证据不会丢。
+    两种例外：
+
+    - `focus` 非空：动态决策要求补充检索，用新问句再查一次并按 chunk_id 合并；
+    - 知识库版本变了：旧证据必须失效，否则会拿更新前的内容继续分析。
     """
     task_id = str(task.get("task_id"))
     existing = evidence_from_state(state, task_id)
+
+    current_version = _current_knowledge_version(state)
+    stored_version = state.get("knowledge_version")
+    if current_version and stored_version and current_version != stored_version:
+        existing = []
 
     if existing and not focus:
         return existing, {}

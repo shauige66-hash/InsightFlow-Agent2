@@ -124,6 +124,21 @@ def wait_turn(env, turn_id: str, *, timeout: float = 120) -> dict[str, Any]:
 
 
 class TestSessionLifecycle:
+    def test_an_invalid_sql_backend_leaves_no_pending_turn(self, env) -> None:
+        """请求本身非法时应当在写入任何记录之前被拒绝。"""
+        session_id = make_session(env)
+
+        response = env["client"].post(
+            f"/sessions/{session_id}/messages",
+            json={"content": "分析一下", "sql_backend": "quantum"},
+        )
+
+        assert response.status_code == 400, response.text
+        turns = env["client"].get(f"/sessions/{session_id}/turns").json()["turns"]
+        assert turns == [], f"非法请求留下了 {len(turns)} 个轮次"
+        messages = env["client"].get(f"/sessions/{session_id}/messages").json()["messages"]
+        assert messages == []
+
     def test_create_and_read_a_session(self, env) -> None:
         session_id = make_session(env)
 

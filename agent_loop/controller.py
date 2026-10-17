@@ -118,19 +118,77 @@ def decision_updates(
             f"任务 {observation.task_id} 被跳过：{decision.reason}"
         )
     elif decision.action == FINISH:
+        # 提前结束时如果当前任务并没有通过，它就是一个未完成的任务：
+        # 只有把它记进 failed_tasks，收尾状态才会是 partial。否则"模型决定
+        # 不做了"会被下游当成"分析成功完成"。
+        if (
+            observation.validation_passed is not True
+            or observation.execution_success is False
+        ):
+            failed = list(state.get("failed_tasks") or [])
+            if not any(item.get("task_id") == observation.task_id for item in failed):
+                failed.append(
+                    {
+                        "task_id": observation.task_id,
+                        "stage": (
+                            "validation"
+                            if observation.validation_passed is False
+                            else "execution"
+                        ),
+                        "reason": decision.reason or "分析在任务通过前结束",
+                        "error_kind": observation.error_kind,
+                        "code": None,
+                        "retry_count": observation.retry_count,
+                        "refine_count": observation.refine_count,
+                    }
+                )
+                updates["failed_tasks"] = failed
         updates["analysis_status"] = _finish_status(state, observation)
         updates["termination_reason"] = decision.reason or "分析结束"
         updates["dynamic_finished"] = True
+
+        # 提前结束意味着后面还有任务没执行。只把状态写成 partial 不够：
+        # 收尾节点会按 failed_tasks 重新计算状态，未执行的任务必须留痕，
+        # 否则"少做了几项"仍会被报成 completed。
+        plan = state.get("analysis_plan") or []
+        index = int(state.get("current_task_index") or 0)
+        pending = plan[index + 1 :]
+        if pending:
+            failed = list(updates.get("failed_tasks") or state.get("failed_tasks") or [])
+            known = {item.get("task_id") for item in failed}
+            for item in pending:
+                task_id = item.get("task_id")
+                if task_id in known:
+                    continue
+                failed.append(
+                    {
+                        "task_id": task_id,
+                        "stage": "skipped",
+                        "reason": decision.reason or "分析提前结束，任务未执行",
+                        "error_kind": None,
+                        "code": None,
+                        "retry_count": 0,
+                        "refine_count": 0,
+                    }
+                )
+            updates["failed_tasks"] = failed
 
     return updates
 
 
 def _finish_status(state: dict[str, Any], observation: Any) -> str:
-    """结束时的分析状态：还有没跑完的任务就是 partial。"""
+    """结束时的分析状态：当前任务没通过、或还有任务没执行，都是 partial。"""
     plan = state.get("analysis_plan") or []
     index = int(state.get("current_task_index") or 0)
-    unfinished = index < len(plan) and observation.validation_passed is not True
-    if unfinished or (state.get("failed_tasks") or []):
+
+    current_ok = (
+        observation.validation_passed is True
+        and observation.execution_success is not False
+    )
+    # 后面还有任务没跑：即使当前任务通过，也不能算"分析完成"
+    remaining = index + 1 < len(plan)
+
+    if not current_ok or remaining or (state.get("failed_tasks") or []):
         return "partial"
     return "completed"
 
