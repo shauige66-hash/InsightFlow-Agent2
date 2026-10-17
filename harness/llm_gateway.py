@@ -137,10 +137,18 @@ class LLMGateway:
     # ------------------------------------------------------------------
 
     def _before_request(self, attempt: int) -> None:
+        # 不在节点执行上下文里（单独调用某个 Agent）时钩子是空操作：
+        # 那里没有本次 Run 的预算，也不该由这个钩子决定能不能跑。
+        # 真正被治理的入口是 `call_agent`，它在开始前就要求已绑定 state。
+        if self._state_reader() is None:
+            return
         self.budget_guard()
 
     def _after_request(self, attempt: int) -> None:
-        policy.count_model_request(self._current_state())
+        state = self._state_reader()
+        if state is None:
+            return
+        policy.count_model_request(state)
 
     def _current_state(self) -> dict[str, Any]:
         """当前 Run 的 state；未绑定就拒绝。
