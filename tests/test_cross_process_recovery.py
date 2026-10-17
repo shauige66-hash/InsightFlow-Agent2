@@ -1,4 +1,4 @@
-"""P1-F：真实的跨进程恢复。
+"""真实的跨进程恢复。
 
 每个 phase 都由 `scripts/recovery_driver.py` 在**独立 Python 进程**中执行，
 因此"重启恢复"不是在同一进程里换一个 Graph 对象，而是真的重新打开

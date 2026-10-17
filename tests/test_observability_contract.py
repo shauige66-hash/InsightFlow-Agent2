@@ -1,4 +1,4 @@
-"""H1-F：结构化日志需要能回答"哪个 Run、哪个节点、花了多少额度、多久"。
+"""结构化日志需要能回答"哪个 Run、哪个节点、花了多少额度、多久"。
 
 这里固定三条契约：
 
@@ -166,7 +166,7 @@ class TestNoPromptOrKeyMaterialIsLogged:
             "kept_tables",
             "excluded_tables",
             "history_entries",
-            # H4 增加：知识片段数、记忆条数、缓存是否命中。
+            # 增加：知识片段数、记忆条数、缓存是否命中。
             # 都是计数或布尔值，不含任何正文。
             "knowledge_chunks",
             "memory_entries",

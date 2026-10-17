@@ -119,7 +119,7 @@ def create_workflow(checkpointer=None):
         advance_task_node
     )
 
-    # H5：观察 -> 决策 -> 校验 -> 执行。关闭开关时不会被路由到。
+    # 观察 -> 决策 -> 校验 -> 执行。关闭开关时不会被路由到。
     graph.add_node(
         "decide",
         decide_node

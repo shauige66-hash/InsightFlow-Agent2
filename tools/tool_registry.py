@@ -95,7 +95,7 @@ def _get_tool(
     if tool_name == "sql" and backend == "mcp":
         from tools.mcp_sql_tool import create_mcp_sql_tool
 
-        # MCP 后端的授权来自 P1 的权威快照，因此它按 Run 的 state 构造，
+        # MCP 后端的授权来自  的权威快照，因此它按 Run 的 state 构造，
         # 不参与按数据集指纹的缓存：快照变化必须带来新的授权。
         return create_mcp_sql_tool(tables, snapshots=snapshots)
 

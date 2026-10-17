@@ -176,7 +176,7 @@ def generate_plot_code(
             default=str
         )
     }
-    # P4：按节点预算压缩上下文。
+    # 按节点预算压缩上下文。
     # 不可压缩字段见 utils.context_budget.NODE_PRESERVE_FIELDS；
     # 错误反馈与任务约束在那里被显式保留。
     inputs, _context_report = get_harness().build_context(NODE_NAME, inputs, data_context=data_context)
@@ -192,7 +192,7 @@ def generate_plot_code(
         1,
         MAX_GENERATION_ATTEMPTS + 1
     ):
-        # P3：这是本文件自己的重试循环，同样要按真实请求判预算与计数。
+        # 这是本文件自己的重试循环，同样要按真实请求判预算与计数。
         # 两者都放在 invoke 之前，口径与 utils/llm_retry 保持一致。
         before_model_request(attempt)
         after_model_request(attempt)

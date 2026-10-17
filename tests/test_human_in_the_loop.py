@@ -1,4 +1,4 @@
-"""P1-D：Human-in-the-Loop 的真实 interrupt / resume。
+"""Human-in-the-Loop 的真实 interrupt / resume。
 
 用真实的 LangGraph interrupt + Command(resume=...)，不模拟暂停：
 图在审批节点处真正停止执行，恢复时从同一个 Checkpoint 继续。

@@ -133,10 +133,10 @@ def generate_analysis_report(
         )
     }
 
-    # P4：按节点预算压缩上下文。
+    # 按节点预算压缩上下文。
     #
     # 这里的字段已经是**有界预览**（`build_report_execution_previews` 走
-    # P2-B3 的 `build_preview`：列名 + 行数 + 少量样本），因此正常路径下
+    # 的 `build_preview`：列名 + 行数 + 少量样本），因此正常路径下
     # 不会触发压缩；预算是防止上游给出别的东西时这个节点的 Prompt 失控。
     #
     # 与其余 Agent 用同一个 `build_context`：口径一致才谈得上"逐节点预算"。

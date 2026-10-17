@@ -1,4 +1,4 @@
-"""P5：本地评测入口。
+"""本地评测入口。
 
 用法：
     python scripts/run_eval.py --output eval/reports

@@ -1,5 +1,5 @@
-langchain
-langgraph
+langchain>=1.0,<2
+langgraph>=1.0,<2
 # Checkpoint 持久化。固定版本以保证恢复行为可复现：
 # langgraph-checkpoint 4.3.0 要求 langgraph-checkpoint-sqlite >= 3.1
 langgraph-checkpoint-sqlite==3.1.2
@@ -19,6 +19,18 @@ langchain-text-splitters
 langchain-huggingface
 sentence-transformers
 numpy
-# MCP SDK（P2-C：SQL 可经独立 MCP Server 子进程执行）。
+# MCP SDK（SQL 可经独立 MCP Server 子进程执行）。
 # 固定 1.x 线：2.x 把 FastMCP 改名为 MCPServer，迁移需单独评估。
 mcp==1.30.0
+
+# 会话、长期记忆与知识索引的持久化层。
+# 这些是**导入期依赖**：storage/ 在 API 启动时就被加载，缺少任何一个都会
+# 让服务起不来，因此不能只在文档里写"可选"。
+SQLAlchemy>=2.0,<3
+psycopg[binary]>=3.2,<4
+# Redis 只做查询缓存；不引入时不启用缓存即可。
+redis>=5.2,<7
+# 持久化向量索引（PostgreSQL 模式）。local 模式仍用进程内索引。
+pgvector>=0.3,<1
+# LangGraph 官方的 PostgreSQL Checkpointer：不自行实现 Checkpoint 协议。
+langgraph-checkpoint-postgres>=3,<4

@@ -214,7 +214,7 @@ class TestReplanningDoesNotResetBudgetOrLedger:
         )
 
         usage = (result.get("execution_budget") or {}).get("usage") or {}
-        # 重新规划是额外的真实请求，必须计入：计数口径与 H1 一致
+        # 重新规划是额外的真实请求，必须计入：计数口径与  一致
         assert usage["llm_calls"] == counting.count > 0
         assert result["plan_attempts"] == 2
 

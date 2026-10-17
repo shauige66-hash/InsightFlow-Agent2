@@ -151,7 +151,7 @@ def create_analysis_plan(
             else "无"
         ),
     }
-    # P4：按节点预算压缩上下文。
+    # 按节点预算压缩上下文。
     # 不可压缩字段见 utils.context_budget.NODE_PRESERVE_FIELDS；
     # 错误反馈与任务约束在那里被显式保留。
     inputs, _context_report = get_harness().build_context(
@@ -169,7 +169,7 @@ def create_analysis_plan(
         chain,
         inputs,
         validate=_extract,
-        # P3：内部重试的每一次请求也要受预算约束并被计数，
+        # 内部重试的每一次请求也要受预算约束并被计数，
         # 否则声明上限 2 时可能因为解析失败而发出 3 次请求。
         before_request=before_model_request,
         on_request=after_model_request,

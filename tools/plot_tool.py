@@ -1,6 +1,6 @@
 # 执行 Matplotlib 绘图代码，并将生成的图表保存到本次 Run 的目录。
 #
-# P2-A：绘图代码同样在一次性 Docker 容器中执行，本进程不再 exec 任何模型代码。
+# 绘图代码同样在一次性 Docker 容器中执行，本进程不再 exec 任何模型代码。
 # 容器内已安装 fonts-noto-cjk，并把 Noto Sans CJK SC 置于字体首选，
 # 因此中文标题与图例能正常渲染（宿主 Windows 字体在容器内并不存在）。
 

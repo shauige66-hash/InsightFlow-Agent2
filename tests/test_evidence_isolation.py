@@ -1,4 +1,4 @@
-"""H1：测试取证不得改动已跟踪的公开证据文件。
+"""测试取证不得改动已跟踪的公开证据文件。
 
 `test_modelgate_success` 在拆除测试栈前会把成功链路的聚合结果写成 JSON。
 早期实现固定写到 `docs/evidence/modelgate-success.json`，而那份文件已经进仓库，

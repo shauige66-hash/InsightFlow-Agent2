@@ -15,7 +15,8 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-insightflow}
       POSTGRES_DB: ${POSTGRES_DB:-insightflow}
     ports:
-      - "${POSTGRES_PORT:-5433}:5432"
+      # 只绑定回环地址：本地开发依赖不该暴露到局域网
+      - "127.0.0.1:${POSTGRES_PORT:-5433}:5432"
     volumes:
       - insightflow-pgdata:/var/lib/postgresql/data
     healthcheck:
@@ -28,7 +29,7 @@ services:
     image: redis:7-alpine
     command: ["redis-server", "--appendonly", "no", "--save", ""]
     ports:
-      - "${REDIS_PORT:-6380}:6379"
+      - "127.0.0.1:${REDIS_PORT:-6380}:6379"
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s

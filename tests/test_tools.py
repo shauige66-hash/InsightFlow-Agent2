@@ -156,7 +156,7 @@ class TestSqlTool:
         )
 
         assert outcome["success"] is True
-        # P2-B2 起结果带上截断元数据（行数/字节数/是否截断），不再是裸列表
+        # 起结果带上截断元数据（行数/字节数/是否截断），不再是裸列表
         assert outcome["result"]["row_count"] == 3
         assert outcome["result"]["truncated"] is False
         assert len(outcome["result"]["rows"]) == 3
@@ -223,7 +223,7 @@ class TestSqlTool:
 
 class TestToolRegistry:
     def test_available_tools_cover_python_sql_and_plot(self) -> None:
-        # P2-A 起绘图也纳入注册表：三条执行路径都经统一入口，
+        # 起绘图也纳入注册表：三条执行路径都经统一入口，
         # 不再有节点直接构造绘图工具的旁路。
         assert set(available_tools()) == {"python", "sql", "plot"}
 

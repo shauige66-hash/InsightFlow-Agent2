@@ -1,4 +1,4 @@
-"""P2-A：绘图在沙箱中的真实行为。
+"""绘图在沙箱中的真实行为。
 
 重点是"真的画出来了"和"中文没有变成方框"，而不是断言参数串或文件存在性。
 """
@@ -143,7 +143,7 @@ class TestRealPngGeneration:
         outcome = run_plot(code, run_dir=run_dir, filename="result_df.png")
 
         assert outcome.success is True, outcome.error
-        # 绘图模式下 result 约定为图片路径（与 P1 一致），
+        # 绘图模式下 result 约定为图片路径（与  一致），
         # 模型写进 result 的值经 diagnostics 带出
         assert outcome.result.endswith("result_df.png")
         assert outcome.diagnostics.get("model_result") == 2

@@ -1,4 +1,4 @@
-"""P2-D2：报告发布前的人工确认。
+"""报告发布前的人工确认。
 
 P1 只实现了**计划审批**（`approval_gate` / `kind="plan_review"`）。
 `report_publish_gate_node` 与 `report_approval_id` 当时就写好了，

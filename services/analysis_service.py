@@ -161,7 +161,7 @@ def run_analysis(
             "artifacts": [],
             "approvals": [],
             "completed_operations": {},
-            # P3-A：预算从第一轮就写入 state，之后按增量累加。
+            # 预算从第一轮就写入 state，之后按增量累加。
             # 恢复时不重建它（见 utils/agent_loop.initialize）。
             "execution_budget": {
                 "limits": _resolve_budget(budget).to_dict(),
@@ -179,13 +179,13 @@ def run_analysis(
             "plan_attempts": 0,
             "plan_validation_errors": [],
             "approved_plan_fingerprint": None,
-            # H4：任务级证据按 task_id 累积；多轮上下文与长期记忆在首轮写入，
+            # 任务级证据按 task_id 累积；多轮上下文与长期记忆在首轮写入，
             # 恢复时从 Checkpoint 读取，不重新检索也不需要重新注入。
             "task_knowledge": {},
             "knowledge_version": None,
             "conversation_context": conversation_context,
             "memories": list(memories or []),
-            # H5：开关与限制在创建 Run 时写进 state。恢复沿用同一份，
+            # 开关与限制在创建 Run 时写进 state。恢复沿用同一份，
             # 不会因为重新配置把正在进行的循环放宽。
             "enable_dynamic_loop": bool(enable_dynamic_loop),
             "dynamic_limits": limits_from(dynamic_limits),

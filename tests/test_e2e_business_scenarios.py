@@ -1,4 +1,4 @@
-"""P2-D3：真实业务场景端到端。
+"""真实业务场景端到端。
 
 数据全部由本文件生成，落在 `tmp_path` 下，与用户业务库完全隔离。
 
@@ -392,7 +392,7 @@ class TestCsvAnalysis:
         source = build_csv(tmp_path / "sales.csv")
 
         # 必须 `.copy()`：作用域里的 df 与 dfs[...] 是同一份对象，
-        # 原地增删列会污染后续绘图步骤的 result_df（P1 的既有语义）。
+        # 原地增删列会污染后续绘图步骤的 result_df（ 的既有语义）。
         code = "result = df.copy()\n"
 
         result, _recorder = run_workflow(

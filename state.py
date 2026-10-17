@@ -87,7 +87,7 @@ class InsightFlowState(TypedDict, total=False):
     # 计划获批时记下的内容指纹。执行前比对，避免审批后计划被换掉。
     approved_plan_fingerprint: str | None
 
-    # H4：任务级检索证据。按 task_id 保存，修复与精修复用同一批证据；
+    # 任务级检索证据。按 task_id 保存，修复与精修复用同一批证据；
     # knowledge_version 变化（文档更新）会让旧证据失效。
     task_knowledge: dict[str, list[dict]]
     knowledge_version: str | None
@@ -181,7 +181,7 @@ class InsightFlowState(TypedDict, total=False):
     # 是否已经执行过，避免重复写文件或重复调用工具。
     completed_operations: dict[str, dict[str, Any]]
 
-    # P3-A：有界执行的预算快照（上限 + 已用量）。
+    # 有界执行的预算快照（上限 + 已用量）。
     # 放进 state 是**必须的**：预算要跨进程恢复后不重置，
     # 放在进程内存里的话崩溃重启就归零，"有界"名不副实。
     execution_budget: dict[str, Any]
@@ -194,7 +194,7 @@ class InsightFlowState(TypedDict, total=False):
     # 人工对未确认调用的决定（"retry" 表示获准重发）
     llm_retry_granted: str | None
 
-    # ---- H5：运行期动态决策闭环 ----
+    # 运行期动态决策闭环 ----
     # 开关与限制在 Run 创建时写进 state：恢复后沿用同一份，不会因为
     # 重新配置而放宽正在进行的循环。
     enable_dynamic_loop: bool
@@ -208,7 +208,7 @@ class InsightFlowState(TypedDict, total=False):
     # 观察指纹与动作计数用于识别"同样的失败又来了"，防止无界重复
     last_observation_fingerprint: str | None
     action_counts: dict[str, dict[str, int]]
-    # 运行期计划修订：与 H3 的初始计划次数分开计数
+    # 运行期计划修订：与  的初始计划次数分开计数
     plan_revision: int
     runtime_replans: int
     extra_retrievals: int

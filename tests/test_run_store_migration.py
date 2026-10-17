@@ -1,4 +1,4 @@
-"""P2-D1：RunStore 的非破坏性迁移。
+"""RunStore 的非破坏性迁移。
 
 P2-C 之前的 `runs` 表没有 `sql_backend` 列。升级后必须：
 
@@ -22,7 +22,7 @@ import pytest
 
 from services.run_store import RunStore
 
-# P2-C 基线（c1a1802）的建表语句，不含 sql_backend
+# 基线（c1a1802）的建表语句，不含 sql_backend
 LEGACY_SCHEMA = """
 CREATE TABLE IF NOT EXISTS runs (
     run_id        TEXT PRIMARY KEY,

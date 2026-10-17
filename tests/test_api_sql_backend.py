@@ -1,4 +1,4 @@
-"""P2-D1：SQL 后端模式经 HTTP API 的传递、持久化与恢复。
+"""SQL 后端模式经 HTTP API 的传递、持久化与恢复。
 
 覆盖：
 - 请求模型接受 direct / mcp，缺省为 direct（兼容既有客户端）。

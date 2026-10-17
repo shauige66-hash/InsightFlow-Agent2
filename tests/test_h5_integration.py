@@ -147,7 +147,7 @@ class TestScenarioBRemediation:
             ],
         }
 
-        # H5 关闭：固定编排走 refine（不会补检索）
+        # 关闭：固定编排走 refine（不会补检索）
         off, off_factory, off_ms = execute(
             database,
             tmp_path,
@@ -156,7 +156,7 @@ class TestScenarioBRemediation:
             enable=False,
             knowledge=[str(knowledge)],
         )
-        # H5 开启：观察到证据不足，先补充检索再重新执行
+        # 开启：观察到证据不足，先补充检索再重新执行
         on, on_factory, on_ms = execute(
             database,
             tmp_path,

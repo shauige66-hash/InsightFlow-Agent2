@@ -1,4 +1,4 @@
-"""P4：上下文预算与选择。
+"""上下文预算与选择。
 
 ## 解决的三个实际问题
 
@@ -165,7 +165,7 @@ class ContextReport:
     kept_tables: list[str] = field(default_factory=list)
     excluded_tables: list[str] = field(default_factory=list)
     history_entries: int | None = None
-    # H4：知识证据、长期记忆与缓存命中的可观测字段。它们只描述“注入了多少”，
+    # 知识证据、长期记忆与缓存命中的可观测字段。它们只描述“注入了多少”，
     # 不携带内容本身，因此可以安全进日志。
     knowledge_chunks: int = 0
     memory_entries: int = 0

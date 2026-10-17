@@ -317,7 +317,7 @@ insightflow-agent/
 ├── services/      # 分析服务层
 ├── tools/         # Python / SQL / Plot 工具
 ├── utils/         # 报告、重试等通用工具
-├── docs/          # 架构说明与各阶段交付文档
+├── docs/          # 架构说明
 ├── data/          # 示例数据
 ├── api.py         # FastAPI 入口
 ├── main.py        # CLI Demo 入口
@@ -353,7 +353,7 @@ insightflow-agent/
 ├── services/      # 分析服务层
 ├── tools/         # Python / SQL / Plot 工具
 ├── utils/         # 报告、重试等通用工具
-├── docs/          # 架构说明与各阶段交付文档
+├── docs/          # 架构说明
 ├── data/          # 示例数据
 ├── api.py         # FastAPI 入口
 ├── main.py        # CLI Demo 入口
@@ -1129,14 +1129,25 @@ insightflow-agent/
 ├── knowledge/
 │   └── business_rules.md
 │
+├── agent_loop/   # 运行期观察、动作决策与策略校验
+├── planning/     # 计划校验、初始重规划、运行期计划修订
+│
 ├── rag/
+│   ├── cache.py
 │   ├── cache_key.py
 │   ├── chunker.py
 │   ├── config.py
 │   ├── document_loader.py
+│   ├── evidence.py
 │   ├── knowledge_service.py
+│   ├── retrieval.py
 │   ├── retriever.py
-│   └── vector_store.py
+│   ├── task_query.py
+│   ├── vector_store.py
+│   └── versioning.py
+│
+├── storage/      # 会话、记忆、知识索引与迁移
+├── deploy/       # docker compose（PostgreSQL + pgvector、Redis）
 │
 ├── mcp_bridge/
 │   ├── contract.py
@@ -1155,7 +1166,12 @@ insightflow-agent/
 │
 ├── services/
 │   ├── analysis_service.py
+│   ├── conversation_service.py
+│   ├── knowledge_service.py
+│   ├── memory_service.py
 │   ├── run_store.py
+│   ├── run_store_postgres.py
+│   ├── storage_factory.py
 │   └── run_coordinator.py
 │
 ├── tools/
@@ -1183,11 +1199,6 @@ insightflow-agent/
 │
 ├── docs/
 │   ├── architecture.md
-│   ├── p0-delivery.md
-│   ├── p1-delivery.md
-│   ├── p2a-delivery.md
-│   ├── p2b-delivery.md
-│   ├── p2c-delivery.md
 │   └── assets/
 │       ├── insightflow-architecture.png
 │       └── insightflow-architecture-zh.png

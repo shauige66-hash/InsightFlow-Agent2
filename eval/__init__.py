@@ -1,4 +1,4 @@
-"""P5：Agent Evaluation & Reliability Benchmark。
+"""Agent Evaluation & Reliability Benchmark。
 
 模块划分：
 

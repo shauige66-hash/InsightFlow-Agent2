@@ -189,7 +189,7 @@ def create_mcp_sql_tool(
                 raise ValueError(f"Table is not a SQLite resource: {name}")
             resources.append(resource)
 
-        # 授权沿用 P1 的权威快照；没有快照时按本次点名的资源构造，
+        # 授权沿用  的权威快照；没有快照时按本次点名的资源构造，
         # 这样工具在单元测试里也能独立使用。
         authoritative = snapshots if snapshots is not None else _snapshots_of(resources)
 

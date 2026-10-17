@@ -210,7 +210,7 @@ def route_after_visualization_plan(
     return "report"
 
 
-# ---- H5：运行期动态决策 ----
+# 运行期动态决策 ----
 #
 # 关闭 `enable_dynamic_loop` 时，下面这些函数返回的仍是原有的固定分支，
 # 图的结构不变、行为不变；开启后才把路由交给决策节点。

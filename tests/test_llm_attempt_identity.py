@@ -1,4 +1,4 @@
-"""P2-B1：Repair / Refine / Critic / PlotRepair 的多轮模型调用语义。
+"""Repair / Refine / Critic / PlotRepair 的多轮模型调用语义。
 
 背景缺陷（P2-A 已确认）：`llm_operation` 的 subject 只含 task_id / chart_id，
 不区分逻辑尝试。于是：
