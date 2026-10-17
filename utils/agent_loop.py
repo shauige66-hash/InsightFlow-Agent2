@@ -211,15 +211,11 @@ def budget_of(state: dict[str, Any]) -> AgentBudget:
 
 
 def _wait_started_at(state: dict[str, Any]) -> float | None:
-    """老 Checkpoint 里"开始等待人工审批"的时刻，取不到返回 None。
+    """老快照里"开始等待人工审批"的时刻，取不到返回 None。
 
-    `pending_approval` 是审批请求本身（在 `interrupt` 之前写入），它带
-    `created_at`，就是执行停下来等人工的那一刻。迁移时用它可以只折算
-    "等待之前真正执行过的那段"，而不把等待算进执行预算。
-
-    审批完成后 `pending_approval` 被清空，归档记录里只有 `decided_at`
-    （没有请求时刻），因此**无法**再区分等待与执行——那种情况下返回 None，
-    由调用方走保守策略。
+    当前 `interrupt()` 把审批负载放在 Checkpoint 的 task 里，**不写进 state**；
+    因此真实运行中 `state["pending_approval"]` 是 None，这个函数取不到值。
+    保留它是为了那些确实把审批请求写进 state 的旧快照，以及外部注入的场景。
     """
     pending = state.get("pending_approval")
     if isinstance(pending, dict):
@@ -239,14 +235,19 @@ def initialize(state: dict[str, Any]) -> dict[str, Any]:
     `active_seconds`，当时的"已消耗时间"是 `now - started_at`，也就是把
     人工审批的等待一并算了进去。迁移规则：
 
-    - 能证明当时正在等待审批（`pending_approval.created_at` 可用）时，
-      只折算 `created_at - started_at`，等待时间不计入执行预算；
+    - 快照里带着审批请求时刻（`pending_approval.created_at`）时，只折算
+      `created_at - started_at`，等待时间不计入执行预算；
     - 否则按 `now - started_at` 折算，但以 `max_seconds` 封顶。
 
     这是**保守且可解释**的策略，不是精确重建：老格式没有记录执行与等待的
     分界，无法还原真实执行时间。封顶的意义是避免"等待了两小时的老 Run，
-    预算只有 1800 秒，一恢复就立刻失败"——那会让等待时间变成一次性的额度
-    清零。已消耗的时间不会被退回，已归档的审批记录也不改写。
+    预算只有 1800 秒，一恢复就立刻失败"。
+
+    实际生效范围要说清楚：本函数只由 loader 节点调用，而从审批中断处恢复时
+    loader 已经提交过，不会重放，所以那种恢复根本不走迁移——老 Run 的已用
+    时间不会被补记（`tests/test_time_budget_migration.py` 用真实
+    interrupt/resume 固定了这一点）。迁移只在 loader 重放时发生。
+    已归档的审批记录不会被改写。
     """
     payload = state.get(BUDGET_FIELD)
 

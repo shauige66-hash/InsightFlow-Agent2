@@ -29,6 +29,15 @@ from utils.idempotency import run_agent_call
 from utils.run_logger import log_event
 
 
+class StateNotBound(RuntimeError):
+    """模型调用前没有绑定当前 Run 的 state。
+
+    没有 state 就读不到这次 Run 的预算快照与用量，判定会落到默认额度上——
+    等于放过了一个未被该 Run 治理的请求。这种情况应当明确失败，而不是拿空
+    字典继续。
+    """
+
+
 class LLMGateway:
     """编排幂等、账本、预算与追踪。
 
@@ -131,13 +140,22 @@ class LLMGateway:
         self.budget_guard()
 
     def _after_request(self, attempt: int) -> None:
-        state = self._state_reader()
-        if state is None:
-            return
-        policy.count_model_request(state)
+        policy.count_model_request(self._current_state())
 
     def _current_state(self) -> dict[str, Any]:
-        return self._state_reader() or {}
+        """当前 Run 的 state；未绑定就拒绝。
+
+        这个检查守住的是治理本身：没有 state 就没有预算，请求会在默认额度下
+        被放行。正常节点执行由 `_with_state` 的 `bind_state` 绑定，并发 Run
+        各自持有自己的上下文。
+        """
+        state = self._state_reader()
+        if state is None:
+            raise StateNotBound(
+                "模型调用必须在 bind_state 绑定的执行上下文里发起；"
+                "未绑定 state 时无法判定该 Run 的预算"
+            )
+        return state
 
 
-__all__ = ["LLMGateway"]
+__all__ = ["LLMGateway", "StateNotBound"]

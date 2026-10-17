@@ -14,6 +14,8 @@ P3 早期的预算快照只有 `started_at`，没有 `active_seconds`，当时�
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from utils import agent_loop as al
@@ -167,3 +169,120 @@ class TestNewFormatIsUntouched:
         state.update(initialize(state))
         assert usage_of(state)["active_seconds"] == 0.0
         assert usage_of(state)["clock_open"] is False
+
+
+class TestRealInterruptResume:
+    """真实 interrupt / resume 下迁移规则是否可达。
+
+    上面的用例直接构造带 `pending_approval` 的 state，验证的是规则本身。
+    这里跑真实 LangGraph，回答两个问题：审批负载到底落在哪里，
+    以及老格式的预算在恢复时会不会被补记等待时间。
+    """
+
+    def test_the_approval_payload_lives_in_the_task_not_in_state(
+        self, tmp_path: Path
+    ) -> None:
+        from langgraph.checkpoint.sqlite import SqliteSaver
+
+        from ingestion.resources import ResourceResolver
+        from services.analysis_service import read_run_state, run_analysis
+        from tests.conftest import CUSTOMERS_CSV
+        from tests.test_human_in_the_loop import _factory
+
+        run_id = "migration-interrupt"
+
+        with SqliteSaver.from_conn_string(str(tmp_path / "cp.sqlite")) as saver:
+            run_analysis(
+                run_id=run_id,
+                data_sources=[str(CUSTOMERS_CSV)],
+                model_factory=_factory(run_id),
+                checkpointer=saver,
+                resolver=ResourceResolver(),
+                output_root=tmp_path,
+                require_plan_approval=True,
+            )
+
+            config = {"configurable": {"thread_id": run_id}}
+            values = saver.get_tuple(config).checkpoint["channel_values"]
+            assert "pending_approval" not in values, (
+                "state 里出现了审批负载；迁移的等待分支变得可达，需要重新评估该分支"
+            )
+
+            pending = read_run_state(run_id, checkpointer=saver).get("pending_approval") or {}
+            assert pending.get("kind") == "plan_review"
+            # 证据存在，只是在 checkpoint 的 task 里，不在 state 里
+            assert isinstance(pending.get("created_at"), (int, float))
+
+    def test_a_legacy_budget_is_not_charged_the_wait_on_resume(
+        self, tmp_path: Path
+    ) -> None:
+        """老格式预算从审批中断处恢复：等待不计入，整段墙钟也不会被补记。
+
+        loader 已经提交过，恢复时不重放，因此 `initialize` 不会执行；那条
+        "折算墙钟并封顶"的分支在这里不生效。结果是不会因为等待而失败，
+        也不会把等待算进执行时间。
+        """
+        import time
+
+        from langgraph.checkpoint.sqlite import SqliteSaver
+        from langgraph.types import Command
+
+        from ingestion.resources import ResourceResolver
+        from services.analysis_service import run_analysis
+        from tests.conftest import CUSTOMERS_CSV
+        from tests.test_human_in_the_loop import _factory
+        from workflow import create_workflow
+
+        run_id = "migration-legacy-resume"
+        started_at = time.time() - 2.5 * 3600
+
+        with SqliteSaver.from_conn_string(str(tmp_path / "cp.sqlite")) as saver:
+            run_analysis(
+                run_id=run_id,
+                data_sources=[str(CUSTOMERS_CSV)],
+                model_factory=_factory(run_id),
+                checkpointer=saver,
+                resolver=ResourceResolver(),
+                output_root=tmp_path,
+                require_plan_approval=True,
+            )
+
+            config = {"configurable": {"thread_id": run_id}}
+            create_workflow(checkpointer=saver).update_state(
+                config,
+                {
+                    BUDGET_FIELD: {
+                        "limits": AgentBudget(max_seconds=1800.0).to_dict(),
+                        "usage": {
+                            "rounds": 1,
+                            "tool_calls": 0,
+                            "llm_calls": 1,
+                            "started_at": started_at,
+                        },
+                    }
+                },
+            )
+            persisted = saver.get_tuple(config).checkpoint["channel_values"]
+            assert "active_seconds" not in persisted[BUDGET_FIELD]["usage"], (
+                "没有写成老格式，这个用例就不成立"
+            )
+
+            result = run_analysis(
+                run_id=run_id,
+                data_sources=[str(CUSTOMERS_CSV)],
+                model_factory=_factory(run_id),
+                checkpointer=saver,
+                resolver=ResourceResolver(),
+                output_root=tmp_path,
+                resume=Command(resume={"decision": "approve"}),
+                require_plan_approval=True,
+            )
+
+        assert result["analysis_status"] == "completed", result.get("status_reason")
+        usage = usage_of(result)
+        # 计数不被重置
+        assert usage["llm_calls"] >= 1
+        # 2.5 小时的等待没有被算进执行时间，也没有被折算成 1800 秒的封顶值
+        assert elapsed_seconds(result) < 120, (
+            f"等待被计入了执行时间：{elapsed_seconds(result)}"
+        )

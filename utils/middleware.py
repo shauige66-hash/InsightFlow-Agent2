@@ -37,6 +37,7 @@ import time
 from contextlib import contextmanager
 from typing import Any, Iterator
 
+from sandbox.protocol import classify_exception
 from utils.agent_loop import (
     BUDGET_ERROR_KIND,
     BUDGET_FIELD,
@@ -89,7 +90,8 @@ def governed_tool_call(
             gate["error_kind"] = outcome.get("error_kind")
 
     预算耗尽可能发生在进入之前（`check`）——那时会抛 `BudgetExceeded`。
-    工具自身抛异常不受影响：异常照常向上传播，计时与日志在 finally 里完成。
+    调用体自己抛异常时，异常照常向上传播，但这次调用会按错误分类记一条
+    `failed`，不会被当成 `ok`；计时与时钟结算仍在 finally 里完成。
 
     调用结束时会把执行时钟**结算**到当前时刻（`settle_active_time`）：
     这样"距上次操作"的那段尾巴被一次算清，之后停下来等待人工审批的时间
@@ -110,6 +112,14 @@ def governed_tool_call(
 
     try:
         yield results
+    except Exception as error:
+        # 调用体自己抛异常时（`resolve_tables` 失败、工具层没归一化的错误），
+        # 这次调用依然消耗了额度、也依然花了时间，但不能记成 ok——否则日志
+        # 与真实结果相反。分类后继续向上抛，调用方按原语义处理。
+        results["error_kind"] = classify_exception(error)
+        results["error_type"] = type(error).__name__
+        results["error"] = str(error)[:300]
+        raise
     finally:
         duration_ms = round((time.perf_counter() - started) * 1000, 2)
         results["duration_ms"] = duration_ms
@@ -127,7 +137,12 @@ def governed_tool_call(
             node=node,
             event="tool_call",
             status=str(results.get("error_kind") or "ok"),
-            details={"tool": tool, "error_kind": results.get("error_kind")},
+            details={
+                "tool": tool,
+                "error_kind": results.get("error_kind"),
+                "error_type": results.get("error_type"),
+                "error": results.get("error"),
+            },
             duration_ms=duration_ms,
         )
 

@@ -43,14 +43,15 @@ def make_state(run_id: str = "harness-unit", **limits: Any) -> dict[str, Any]:
 
 @pytest.fixture(autouse=True)
 def isolated_trace(tmp_path: Path):
+    output_root = tmp_path / "outputs"
     runtime = RunRuntime(
         run_id="harness-unit",
         model_factory=None,  # type: ignore[arg-type]
         resolver=None,  # type: ignore[arg-type]
-        output_root=tmp_path / "outputs",
+        output_root=output_root,
     )
     with use_runtime(runtime):
-        yield
+        yield output_root
 
 
 class TestPolicyScopes:
@@ -148,6 +149,45 @@ class TestGatewayIsTheOnlyModelPath:
         assert invoked == [], "被拒绝的调用仍执行了请求体"
 
 
+class TestGatewayRefusesUnboundState:
+    """没有 Run 状态时不能替一个"不知道属于谁"的请求做预算判定。"""
+
+    def test_a_model_call_without_bind_state_is_refused(self) -> None:
+        from harness import StateNotBound
+
+        assert harness.current_state() is None, "本用例需要未绑定的上下文"
+
+        invoked: list[int] = []
+        with pytest.raises(StateNotBound):
+            harness.get_harness().model_call("planner", "plan#0", lambda: invoked.append(1))
+
+        assert invoked == [], "未绑定 state 时仍然执行了请求体"
+
+    def test_the_budget_guard_is_refused_when_unbound(self) -> None:
+        from harness import StateNotBound
+
+        assert harness.current_state() is None
+        with pytest.raises(StateNotBound):
+            harness.get_harness().llm.budget_guard()
+
+    def test_an_unbound_call_leaves_no_ledger_entry(self, isolated_trace: Path) -> None:
+        from harness import StateNotBound
+
+        with pytest.raises(StateNotBound):
+            harness.get_harness().model_call("planner", "plan#0", lambda: {"ok": True})
+
+        assert not list((isolated_trace / "llm_ledger").glob("*.jsonl")), (
+            "被拒绝的调用留下了账本记录"
+        )
+
+    def test_a_bound_context_still_works(self) -> None:
+        """绑定完好时行为不变，这个拒绝不是把正常路径一起挡掉。"""
+        state = make_state(run_id="harness-bound")
+        with harness.bind_state(state):
+            assert harness.current_state() is state
+            assert harness.policy.ensure_model_request_allowed(state) is None
+
+
 class TestDispatcherContract:
     def _patch_tool(self, monkeypatch: pytest.MonkeyPatch, execution: dict) -> list:
         invoked: list[tuple] = []
@@ -181,6 +221,95 @@ class TestDispatcherContract:
         usage = (outcome.budget_updates.get(BUDGET_FIELD) or {}).get("usage") or {}
         assert usage["tool_calls"] == 1
         assert usage["clock_open"] is False
+
+    def test_a_raising_invoke_is_logged_as_failed_and_propagates(
+        self, monkeypatch: pytest.MonkeyPatch, isolated_trace: Path
+    ) -> None:
+        """工具层直接抛异常时，日志不能记成 ok。
+
+        `invoke_tool` 自己会把工具失败归一化成结果字典；能抛到这里的是更底层
+        的问题（`resolve_tables` 失败、执行器未捕获的错误）。这时调用体已经
+        消耗了一次额度、也花了时间，日志必须反映真实结果，异常本身继续上抛。
+        """
+        import json
+
+        def boom(tool_name, tables, arguments, *, snapshots=None):
+            raise RuntimeError("tool exploded")
+
+        monkeypatch.setattr(tool_dispatcher, "invoke_tool", boom)
+        monkeypatch.setattr(tool_dispatcher, "resolve_tables", lambda state: {})
+
+        state = make_state(run_id="dispatch-raises")
+
+        with pytest.raises(RuntimeError, match="tool exploded"):
+            harness.get_harness().run_tool(
+                state,
+                node="tool_execution",
+                tool="sql",
+                arguments={"query": "select 1"},
+            )
+
+        # 额度与时间仍然按一次失败调用结算
+        usage = usage_of(state)
+        assert usage["tool_calls"] == 1, "抛异常的调用没有计入工具次数"
+        assert usage["clock_open"] is False, "抛异常的调用没有结算时钟"
+
+        events = [
+            json.loads(line)
+            for line in (isolated_trace / "logs" / "dispatch-raises.jsonl")
+            .read_text(encoding="utf-8")
+            .splitlines()
+            if line.strip()
+        ]
+        tool_events = [item for item in events if item["event"] == "tool_call"]
+        assert tool_events, events
+        record = tool_events[-1]
+        assert record["status"] != "ok", f"失败的调用被记成了 ok：{record}"
+        assert record["status"] == "execution_error"
+        assert record["details"]["error_kind"] == "execution_error"
+        assert record["details"]["error_type"] == "RuntimeError"
+        assert "tool exploded" in record["details"]["error"]
+        assert record["duration_ms"] is not None
+
+    def test_a_raising_resolver_is_logged_as_failed_and_propagates(
+        self, monkeypatch: pytest.MonkeyPatch, isolated_trace: Path
+    ) -> None:
+        """授权资源解析失败同样要落成失败记录。"""
+        import json
+
+        def boom(state):
+            raise RuntimeError("no snapshot")
+
+        monkeypatch.setattr(tool_dispatcher, "resolve_tables", boom)
+        monkeypatch.setattr(
+            tool_dispatcher,
+            "invoke_tool",
+            lambda *a, **k: pytest.fail("解析失败时不应调用工具"),
+        )
+
+        state = make_state(run_id="dispatch-resolver-raises")
+
+        with pytest.raises(RuntimeError, match="no snapshot"):
+            harness.get_harness().run_tool(
+                state,
+                node="plot_execution",
+                tool="plot",
+                arguments={"chart_id": "chart_1"},
+            )
+
+        assert usage_of(state)["tool_calls"] == 1
+        assert usage_of(state)["clock_open"] is False
+
+        events = [
+            json.loads(line)
+            for line in (isolated_trace / "logs" / "dispatch-resolver-raises.jsonl")
+            .read_text(encoding="utf-8")
+            .splitlines()
+            if line.strip()
+        ]
+        record = [item for item in events if item["event"] == "tool_call"][-1]
+        assert record["status"] == "execution_error"
+        assert record["details"]["error"] == "no snapshot"
 
     def test_an_exhausted_budget_never_reaches_the_tool(
         self, monkeypatch: pytest.MonkeyPatch

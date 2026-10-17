@@ -25,7 +25,7 @@ from contextlib import contextmanager
 from typing import Any, Callable, Iterator
 
 from harness import policy
-from harness.llm_gateway import LLMGateway
+from harness.llm_gateway import LLMGateway, StateNotBound
 from harness.tool_dispatcher import ToolDispatcher, ToolOutcome
 from utils.context_budget import context_report_of
 
@@ -136,6 +136,7 @@ def get_harness() -> AgentRuntimeHarness:
 __all__ = [
     "AgentRuntimeHarness",
     "CURRENT_STATE",
+    "StateNotBound",
     "ToolOutcome",
     "bind_state",
     "current_state",

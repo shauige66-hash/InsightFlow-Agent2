@@ -16,6 +16,7 @@ LangGraph 负责拓扑、路由、Checkpoint 与 HITL 中断；Harness 负责一
 
 from harness.runtime import (
     AgentRuntimeHarness,
+    StateNotBound,
     bind_state,
     current_state,
     get_harness,
@@ -23,6 +24,7 @@ from harness.runtime import (
 
 __all__ = [
     "AgentRuntimeHarness",
+    "StateNotBound",
     "bind_state",
     "current_state",
     "get_harness",
