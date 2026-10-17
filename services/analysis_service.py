@@ -36,6 +36,7 @@ def _resolve_budget(budget: AgentBudget | dict[str, Any] | None) -> AgentBudget:
     raise TypeError(f"不支持的预算类型：{type(budget).__name__}")
 
 from utils.idempotency import LlmCallAbandoned
+from agent_loop.policy import limits_from
 from utils.run_logger import create_run_id, log_event
 from workflow import create_workflow
 
@@ -104,6 +105,8 @@ def run_analysis(
     budget: AgentBudget | dict[str, Any] | None = None,
     conversation_context: dict[str, Any] | None = None,
     memories: list[dict[str, Any]] | None = None,
+    enable_dynamic_loop: bool = False,
+    dynamic_limits: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """执行（或恢复）一次完整分析。
 
@@ -182,6 +185,24 @@ def run_analysis(
             "knowledge_version": None,
             "conversation_context": conversation_context,
             "memories": list(memories or []),
+            # H5：开关与限制在创建 Run 时写进 state。恢复沿用同一份，
+            # 不会因为重新配置把正在进行的循环放宽。
+            "enable_dynamic_loop": bool(enable_dynamic_loop),
+            "dynamic_limits": limits_from(dynamic_limits),
+            "loop_step": 0,
+            "decision_history": [],
+            "current_observation": None,
+            "current_action": None,
+            "action_reason": None,
+            "last_observation_fingerprint": None,
+            "action_counts": {},
+            "plan_revision": 0,
+            "runtime_replans": 0,
+            "extra_retrievals": 0,
+            "retrieval_focus": None,
+            "skipped_tasks": [],
+            "dynamic_finished": False,
+            "termination_reason": None,
         }
     elif continue_from_checkpoint:
         # 续跑时也必须把账本里的未确认调用注入：Checkpoint 不会记得上次进程

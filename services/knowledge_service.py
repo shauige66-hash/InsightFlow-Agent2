@@ -52,13 +52,16 @@ def retrieve_global(state: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def retrieve_task(state: dict[str, Any], task: dict[str, Any]) -> RetrievalOutcome:
-    """按任务检索知识；无知识源时返回空结果。"""
+def retrieve_task(
+    state: dict[str, Any], task: dict[str, Any], *, focus: str | None = None
+) -> RetrievalOutcome:
+    """按任务检索知识；`focus` 是补充检索的额外依据。"""
     knowledge_sources = [str(item) for item in (state.get("knowledge_sources") or [])]
     query = build_task_query(
         task,
         analysis_focus=state.get("analysis_focus"),
         previous_context=_previous_user_messages(state),
+        extra_terms=focus,
     )
     if not knowledge_sources:
         return RetrievalOutcome(query=query)
@@ -78,29 +81,39 @@ def evidence_from_state(
 
 
 def task_knowledge_updates(
-    state: dict[str, Any], task: dict[str, Any]
+    state: dict[str, Any], task: dict[str, Any], *, focus: str | None = None
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """取任务证据，必要时检索；返回 `(证据, state 增量)`。
 
     已经在 state 里的任务不再检索：修复与精修复用第一次尝试的证据。
+    例外是动态决策要求补充检索（`focus` 非空）：此时用新的问句再查一次，
+    新旧证据按 chunk_id 去重后合并，旧证据不会丢。
     """
     task_id = str(task.get("task_id"))
     existing = evidence_from_state(state, task_id)
-    if existing:
+
+    if existing and not focus:
         return existing, {}
 
-    outcome = retrieve_task(state, task)
-    evidence = [item.to_dict() for item in outcome.evidence]
+    outcome = retrieve_task(state, task, focus=focus)
+    fresh = [item.to_dict() for item in outcome.evidence]
+    merged = list(existing)
+    seen = {str(item.get("chunk_id")) for item in existing}
+    for item in fresh:
+        if str(item.get("chunk_id")) not in seen:
+            merged.append(item)
+            seen.add(str(item.get("chunk_id")))
+
     updates: dict[str, Any] = {
         "task_knowledge": {
             **(state.get("task_knowledge") or {}),
-            task_id: evidence,
+            task_id: merged,
         },
     }
     if outcome.knowledge_version:
         updates["knowledge_version"] = outcome.knowledge_version
     updates["knowledge_cache_hit"] = outcome.cache_hit
-    return evidence, updates
+    return merged, updates
 
 
 def knowledge_contents(state: dict[str, Any], task_id: str) -> list[str]:

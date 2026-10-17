@@ -40,6 +40,8 @@ class PostMessageRequest(BaseModel):
     require_plan_approval: bool = False
     require_report_approval: bool = False
     sql_backend: str = "direct"
+    enable_dynamic_loop: bool = False
+    dynamic_limits: dict[str, Any] | None = None
 
 
 class MemoryRequest(BaseModel):
@@ -136,6 +138,8 @@ def post_message(session_id: str, payload: PostMessageRequest) -> dict[str, Any]
             require_plan_approval=payload.require_plan_approval,
             require_report_approval=payload.require_report_approval,
             sql_backend=payload.sql_backend,
+            enable_dynamic_loop=payload.enable_dynamic_loop,
+            dynamic_limits=payload.dynamic_limits,
         )
     except KeyError as error:
         raise HTTPException(status_code=404, detail=str(error)) from error

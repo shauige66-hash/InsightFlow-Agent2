@@ -17,6 +17,8 @@ from nodes import (
     refine_node,
     failed_task_node,
     advance_task_node,
+    decide_node,
+    runtime_replan_node,
     report_node,
     artifact_node,
 
@@ -38,6 +40,11 @@ from conditions import (
     route_after_plot_execution,
     route_after_chart_advance,
     route_after_visualization_plan,
+    route_after_tool_execution,
+    route_after_critic_node,
+    route_after_failed_task,
+    route_after_decide,
+    route_after_runtime_replan,
 )
 
 
@@ -110,6 +117,17 @@ def create_workflow(checkpointer=None):
     graph.add_node(
         "advance_task",
         advance_task_node
+    )
+
+    # H5：观察 -> 决策 -> 校验 -> 执行。关闭开关时不会被路由到。
+    graph.add_node(
+        "decide",
+        decide_node
+    )
+
+    graph.add_node(
+        "runtime_replan",
+        runtime_replan_node
     )
 
     graph.add_node(
@@ -208,10 +226,12 @@ def create_workflow(checkpointer=None):
         "tool_execution"
     )
 
+    # 开启动态循环时，执行结果先交给决策节点；关闭时仍是原来的三条固定分支。
     graph.add_conditional_edges(
         "tool_execution",
-        route_after_execution,
+        route_after_tool_execution,
         {
+            "decide": "decide",
             "repair": "repair",
             "critic": "critic",
             "failed": "failed_task",
@@ -225,8 +245,9 @@ def create_workflow(checkpointer=None):
 
     graph.add_conditional_edges(
         "critic",
-        route_after_critic,
+        route_after_critic_node,
         {
+            "decide": "decide",
             "advance": "advance_task",
             "refine": "refine",
             "failed": "failed_task",
@@ -238,9 +259,36 @@ def create_workflow(checkpointer=None):
         "tool_execution"
     )
 
-    graph.add_edge(
+    graph.add_conditional_edges(
         "failed_task",
-        "advance_task"
+        route_after_failed_task,
+        {
+            "decide": "decide",
+            "advance": "advance_task",
+        }
+    )
+
+    graph.add_conditional_edges(
+        "decide",
+        route_after_decide,
+        {
+            "advance": "advance_task",
+            "complete": "visualization_planner",
+            "repair": "repair",
+            "refine": "refine",
+            "execution": "execution",
+            "replan": "runtime_replan",
+        }
+    )
+
+    graph.add_conditional_edges(
+        "runtime_replan",
+        route_after_runtime_replan,
+        {
+            "router": "router",
+            "approval_gate": "approval_gate",
+            "complete": "visualization_planner",
+        }
     )
 
     graph.add_conditional_edges(

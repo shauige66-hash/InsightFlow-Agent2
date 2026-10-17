@@ -129,6 +129,8 @@ class ConversationService:
         require_plan_approval: bool = False,
         require_report_approval: bool = False,
         sql_backend: str = "direct",
+        enable_dynamic_loop: bool = False,
+        dynamic_limits: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """提交一条用户消息：创建 Turn + Run 并异步启动。"""
         with storage.session_scope(storage.database_url()) as session:
@@ -186,6 +188,8 @@ class ConversationService:
                 history, dataset_refs=dataset_refs
             ),
             memories=self._memories_for(content, dataset_refs=dataset_refs),
+            enable_dynamic_loop=enable_dynamic_loop,
+            dynamic_limits=dynamic_limits,
         )
         with storage.session_scope(storage.database_url()) as session:
             repository = self._sessions(session)

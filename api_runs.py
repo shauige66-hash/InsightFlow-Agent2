@@ -102,6 +102,11 @@ class CreateRunRequest(BaseModel):
     # 未开启时报告直接落盘，保持既有全自动行为。
     require_report_approval: bool = False
 
+    # H5 运行期动态决策闭环。默认关闭：原有固定编排保持不变，
+    # 打开后任务执行完会先观察再决定下一步。
+    enable_dynamic_loop: bool = False
+    dynamic_limits: dict[str, Any] | None = None
+
     # SQL 后端模式。默认 direct，与 P2-C 之前的既有客户端行为一致。
     #
     # 只允许这两个**模式名**：Server 启动命令、环境变量、私有配置目录与宿主
@@ -213,6 +218,8 @@ def create_run(payload: CreateRunRequest) -> dict[str, Any]:
         require_plan_approval=payload.require_plan_approval,
         require_report_approval=payload.require_report_approval,
         sql_backend=sql_backend,
+        enable_dynamic_loop=payload.enable_dynamic_loop,
+        dynamic_limits=payload.dynamic_limits,
     )
 
     return {
@@ -221,6 +228,7 @@ def create_run(payload: CreateRunRequest) -> dict[str, Any]:
         "require_plan_approval": payload.require_plan_approval,
         "require_report_approval": payload.require_report_approval,
         "sql_backend": sql_backend,
+        "enable_dynamic_loop": payload.enable_dynamic_loop,
     }
 
 

@@ -174,6 +174,16 @@ def _budget_failure(
             "status_reason": f"执行预算已用尽，未能产出分析计划：{reason}",
         }
 
+    if node == "decide_node":
+        # 决策本身就超预算：不能再决策下去，按"安全收尾"结束，而不是把
+        # 一次预算耗尽记成某个任务失败。
+        return {
+            **common,
+            "analysis_status": "partial",
+            "termination_reason": f"模型预算耗尽，动态决策停止：{reason}",
+            "dynamic_finished": True,
+        }
+
     if node == "execution_node":
         # 图上 `execution → tool_execution` 是一条**无条件**边，因此代码没能
         # 生成时不能什么都不返回：`tool_execution_node` 会去读 `current_code`
@@ -195,6 +205,14 @@ from services.knowledge_service import (
     retrieve_global,
     task_knowledge_updates,
 )
+from agent_loop import (
+    build_observation,
+    decision_updates,
+    limits_from,
+    validate_action,
+)
+from agent_loop.decision import decide_action
+from planning.replan import replan_remaining_tasks
 
 # 运行治理通过 Harness 进入：模型调用、工具派发与预算都在那一层，
 # 节点只解释结果。`BudgetExceeded` 仍要在模块级可用——`_with_state`
@@ -446,6 +464,272 @@ def planner_node(
     }
 
 
+
+#: 运行期重新规划的提示里最多带几条"已完成任务"，避免把整个计划塞进 Prompt
+MAX_REPLAN_CONTEXT_TASKS = 5
+
+
+def _authorized_sources(state: InsightFlowState) -> tuple[set[str], dict[str, str]]:
+    """计划校验用的授权集合与来源类型，与 Planner 用的是同一份。"""
+    authorized = set(state.get("data_context") or {})
+    source_types = {
+        name: snapshot.get("source_type")
+        for name, snapshot in (state.get("table_snapshots") or {}).items()
+        if isinstance(snapshot, dict)
+    }
+    if not source_types:
+        source_types = {
+            name: snapshot.get("source_type")
+            for name, snapshot in (state.get("table_snapshot") or {}).items()
+            if isinstance(snapshot, dict)
+        }
+    return authorized, source_types
+
+
+def _decide_log(
+    state: InsightFlowState,
+    *,
+    observation,
+    decision,
+    limits: dict[str, int],
+    proposed: dict | None,
+) -> None:
+    run_id = state.get("run_id")
+    if run_id is None:
+        return
+    log_event(
+        run_id=run_id,
+        node="decide",
+        event="dynamic_decision",
+        status="success" if not decision.forced else "adjusted",
+        details={
+            "step": observation.loop_step,
+            "task_id": observation.task_id,
+            "plan_revision": observation.plan_revision,
+            "action": decision.action,
+            "proposed": decision.proposed,
+            "forced": decision.forced,
+            "reason": decision.reason,
+            "observation": decision.observation_fingerprint,
+            "limits": limits,
+            "remaining_budget": observation.remaining_budget,
+        },
+    )
+
+
+def _safe_decision(
+    observation,
+    *,
+    history: list[dict],
+    limits: dict[str, int],
+) -> tuple[dict, dict, dict]:
+    """调用决策模型；输出不可解析时收敛为"结束"，而不是让整张图崩掉。
+
+    决策是一次模型请求，解析失败意味着这一次判断没有结论。把异常抛到图上
+    会把"模型没按格式回答"变成 Run 崩溃；收敛成 finish 则保留已完成的成果，
+    并由策略层记录原因。
+    """
+    from utils.llm_retry import StructuredOutputError
+
+    try:
+        proposed, ops, extra = HARNESS.model_call(
+            "decider",
+            attempt_subject("decide", observation.loop_step),
+            lambda: decide_action(
+                observation,
+                history=history,
+                limits=limits,
+                llm=model_for("decider"),
+            ),
+            attempt=observation.loop_step + 1,
+        )
+        return proposed, ops or {}, extra or {}
+    except StructuredOutputError as error:
+        return (
+            {"action": "finish", "reason": f"决策输出不可解析：{str(error)[:200]}"},
+            {},
+            {},
+        )
+
+
+@_with_state
+def decide_node(
+    state: InsightFlowState
+) -> dict:
+    """观察当前任务的实际结果，决定下一步做什么。
+
+    动作先由模型在固定集合里提出，再由 `agent_loop.policy` 按错误类型、
+    计数与预算校验；模型给不出合法动作时这里会安全收尾。
+    """
+    if not state.get("enable_dynamic_loop"):
+        # 图里存在该节点，但关闭时不会被路由到；真的到了这里就按继续处理
+        return {"current_action": "continue"}
+
+    observation = build_observation(state)
+    limits = limits_from(state.get("dynamic_limits"))
+    history = list(state.get("decision_history") or [])
+
+    proposed, _ops, _extra = _safe_decision(
+        observation, history=history, limits=limits
+    )
+
+    decision = validate_action(
+        observation, proposed, state=state, limits=limits
+    )
+    updates = decision_updates(state, observation, decision)
+    updates["completed_operations"] = _ops
+    updates.update(_extra)
+    # 崩溃注入点：模型已经回答、决策尚未提交。恢复后这一节点会重放，
+    # 账本与幂等层决定这次判断要不要重新问一次。
+    _crash_point("h5_decide")
+    _decide_log(
+        state,
+        observation=observation,
+        decision=decision,
+        limits=limits,
+        proposed=proposed if isinstance(proposed, dict) else None,
+    )
+    return updates
+
+
+@_with_state
+def runtime_replan_node(
+    state: InsightFlowState
+) -> dict:
+    """运行期修订剩余任务：只改当前位置及其后，已完成的索引不动。"""
+    index = int(state.get("current_task_index") or 0)
+    plan = list(state.get("analysis_plan") or [])
+    completed = plan[:index]
+    current = plan[index] if index < len(plan) else {}
+    remaining = plan[index + 1 :]
+
+    limits = limits_from(state.get("dynamic_limits"))
+    replans_used = int(state.get("runtime_replans") or 0)
+
+    # 身份由 state 的计数推导：恢复后重放得到同一个 operation_id，
+    # 已经完成的这次修订会被幂等层复用，不会变成一次新的模型请求。
+    tasks, _ops, _extra = HARNESS.model_call(
+        "planner",
+        attempt_subject("replan", replans_used),
+        lambda: replan_remaining_tasks(
+            analysis_focus=state.get("analysis_focus"),
+            completed_tasks=completed[-MAX_REPLAN_CONTEXT_TASKS:],
+            current_task=current,
+            observation=state.get("current_observation")
+            or build_observation(state).to_dict(),
+            remaining_tasks=remaining[:MAX_REPLAN_CONTEXT_TASKS],
+            data_context=state.get("data_context") or {},
+            next_task_number=len(plan) + 1,
+            llm=model_for("planner"),
+        ),
+        attempt=replans_used + 1,
+    )
+
+    authorized, source_types = _authorized_sources(state)
+    validation = validate_plan(
+        tasks, authorized_tables=authorized, source_types=source_types
+    )
+
+    completed_ids = {str(task.get("task_id")) for task in completed}
+    collisions: list[str] = []
+    if validation.ok:
+        collisions = sorted(
+            completed_ids & {str(task.get("task_id")) for task in validation.tasks}
+        )
+
+    run_id = state.get("run_id")
+    if not validation.ok or collisions:
+        reason = (
+            "修订后的任务与已完成任务冲突：" + ", ".join(collisions)
+            if collisions
+            else "修订后的计划未通过校验：" + "；".join(validation.feedback()[:3])
+        )
+        # 当前任务确实没有完成：把它记为失败，收尾状态才是 partial 而不是
+        # completed。"计划被拒"不等于"任务做完了"。
+        failed = list(state.get("failed_tasks") or [])
+        if not any(item.get("task_id") == current.get("task_id") for item in failed):
+            failed.append(
+                {
+                    "task_id": current.get("task_id"),
+                    "stage": "execution",
+                    "reason": reason,
+                    "error_kind": state.get("execution_error_kind"),
+                    "code": state.get("current_code"),
+                    "retry_count": int(state.get("retry_count") or 0),
+                    "refine_count": int(state.get("refine_count") or 0),
+                }
+            )
+        if run_id is not None:
+            log_event(
+                run_id=run_id,
+                node="replan",
+                event="runtime_replan_rejected",
+                status="failed",
+                details={
+                    "attempts": replans_used + 1,
+                    "categories": validation.categories,
+                    "collisions": collisions,
+                },
+            )
+        return {
+            "analysis_plan": plan[:index],
+            "current_task_index": index,
+            "plan_revision": int(state.get("plan_revision") or 0) + 1,
+            "runtime_replans": replans_used + 1,
+            "analysis_status": "partial",
+            "failed_tasks": failed,
+            "termination_reason": reason,
+            "status_reason": reason,
+            "dynamic_finished": True,
+            "replan_base_plan": list(completed),
+            "completed_operations": _ops,
+            **_extra,
+        }
+
+    merged = completed + validation.tasks
+    if run_id is not None:
+        log_event(
+            run_id=run_id,
+            node="replan",
+            event="runtime_replan_applied",
+            status="success",
+            details={
+                "attempts": replans_used + 1,
+                "kept_tasks": [task.get("task_id") for task in completed],
+                "new_tasks": [task.get("task_id") for task in validation.tasks],
+                "plan_revision": int(state.get("plan_revision") or 0) + 1,
+                "requires_approval": bool(state.get("require_plan_approval")),
+            },
+        )
+
+    # 崩溃注入点：新计划已经生成、尚未提交。恢复后修订会被重放，
+    # 幂等身份由 state 的计数推导，因此不会变成一次新的模型请求。
+    _crash_point("h5_runtime_replan")
+    return {
+        "analysis_plan": merged,
+        "current_task_index": index,
+        "plan_revision": int(state.get("plan_revision") or 0) + 1,
+        "runtime_replans": replans_used + 1,
+        # 路由依据在节点里定下来：恢复时 `require_plan_approval` 会被
+        # 增量输入清空（那是为了避免重复中断），不能靠它决定是否要再审一次。
+        "replan_needs_approval": bool(state.get("require_plan_approval")),
+        # 拒绝修订时退回到"已批准且已完成"的前缀，不执行被拒的新任务
+        "replan_base_plan": list(completed),
+        # 新任务按新计划重新开始计数，不继承上一个任务的失败次数
+        "current_tool": None,
+        "current_code": None,
+        "execution_error": None,
+        "execution_error_kind": None,
+        "retry_count": 0,
+        "refine_count": 0,
+        "validation_passed": False,
+        "critic_feedback": None,
+        "retrieval_focus": None,
+        "completed_operations": _ops,
+        **_extra,
+    }
+
+
 def router_node(
     state: InsightFlowState
 ) -> dict:
@@ -510,8 +794,12 @@ def execution_node(
             "Current tool is missing."
         )
 
-    # 任务级检索：首次进入该任务时取证据，之后的修复/精修复用同一批
-    evidence, knowledge_updates = task_knowledge_updates(state, task)
+    # 任务级检索：首次进入该任务时取证据，之后的修复/精修复用同一批。
+    # retrieval_focus 由动态决策在 retrieve_more 时写入：用校验意见或执行
+    # 错误作为补充检索的依据，用完即清，避免下一次执行再次强制检索。
+    evidence, knowledge_updates = task_knowledge_updates(
+        state, task, focus=state.get("retrieval_focus")
+    )
     retrieved_knowledge = [
         item["content"] for item in evidence if item.get("content")
     ]
@@ -521,7 +809,9 @@ def execution_node(
     # 因此这里保持 task_id 作为身份就足够，不需要尝试序号。
     code, _ops, _extra = HARNESS.model_call(
         "executor",
-        task["task_id"],
+        # 补充检索会让执行重新跑一次，但那不是"重放同一逻辑尝试"：
+        # 把 extra_retrievals 编进身份，新证据才会换来新的代码生成。
+        attempt_subject(task["task_id"], int(state.get("extra_retrievals") or 0)),
         lambda: generate_execution_code(
             task=task,
             data_context=data_context,
@@ -556,6 +846,7 @@ def execution_node(
     return {
         "current_code": code,
         "completed_operations": _ops,
+        "retrieval_focus": None,
         **knowledge_updates,
         **_extra,
     }
@@ -751,6 +1042,9 @@ def tool_execution_node(
         != attempt_key
     ]
 
+    # 崩溃注入点：工具已经执行、结果尚未提交。恢复时本节点会被重放，
+    # 工具调用的幂等登记决定要不要再执行一次。
+    _crash_point("h5_after_tool")
     return {
         "execution_results": deduped + [
             execution_result
@@ -984,7 +1278,13 @@ def critic_node(
 
     review, _ops, _extra = HARNESS.model_call(
         "critic",
-        attempt_subject(task["task_id"], review_round),
+        # 与执行使用同一口径：补充检索后的复核是一次新的逻辑尝试，
+        # 否则记录会被当成上一次判定的重放，永远拿到同一个结论。
+        attempt_subject(
+            task["task_id"],
+            review_round,
+            int(state.get("extra_retrievals") or 0),
+        ),
         lambda: review_execution_result(
             task=task,
             data_context=data_context,
@@ -1557,7 +1857,8 @@ def approval_gate_node(
         if task.get("target_tables") and _task_is_sql(state, task)
     ]
 
-    approval_id = plan_approval_id(run_id)
+    revision = int(state.get("plan_revision") or 0)
+    approval_id = plan_approval_id(run_id, revision)
 
     # 已审批过（例如恢复后重放本节点）时不再中断
     existing = _find_approval(state, approval_id)
@@ -1587,6 +1888,8 @@ def approval_gate_node(
             "sql_read_only_enforced": True,
             # 人工批准的是这份计划的具体内容，不是一个模糊的"继续"
             "plan_fingerprint": plan_fingerprint(plan),
+            # 运行期修订会产生新版本：审批界面需要知道这是在批准第几版
+            "plan_revision": revision,
         },
         "created_at": time.time(),
     }
@@ -1698,6 +2001,43 @@ def _apply_decision(
         # 记住"批准的是这一份"，执行前比对；计划被换掉就不执行。
         updates["approved_plan_fingerprint"] = plan_fingerprint(
             state.get("analysis_plan") or []
+        )
+
+    if (
+        field == "plan_approval"
+        and not approved
+        and int(state.get("plan_revision") or 0) > 0
+    ):
+        # 运行期修订被拒：退回"已批准且已完成"的前缀，绝不执行被拒的新任务。
+        # 计划本身不回滚成不可行的旧任务——那些任务已经证明做不出来。
+        base = list(state.get("replan_base_plan") or [])
+        # 被拒的那一版里，当前任务没有完成：记为失败，收尾才是 partial
+        failed = list(state.get("failed_tasks") or [])
+        plan = state.get("analysis_plan") or []
+        index = int(state.get("current_task_index") or 0)
+        current_id = plan[index].get("task_id") if index < len(plan) else None
+        if current_id and not any(item.get("task_id") == current_id for item in failed):
+            failed.append(
+                {
+                    "task_id": current_id,
+                    "stage": "skipped",
+                    "reason": "运行期计划修订未获批准",
+                    "error_kind": state.get("execution_error_kind"),
+                    "code": None,
+                    "retry_count": int(state.get("retry_count") or 0),
+                    "refine_count": int(state.get("refine_count") or 0),
+                }
+            )
+        updates.update(
+            {
+                "analysis_plan": base,
+                "failed_tasks": failed,
+                "plan_revision": int(state.get("plan_revision") or 0) - 1,
+                "analysis_status": "partial" if base else "failed",
+                "run_status": "completed" if base else "failed",
+                "termination_reason": "运行期计划修订未获批准，不执行被拒绝的新任务",
+                "dynamic_finished": True,
+            }
         )
 
     return updates

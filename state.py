@@ -45,7 +45,8 @@ class ExecutionResult(TypedDict):
 
 class TaskFailure(TypedDict):
     task_id: str
-    stage: Literal["execution", "validation"]
+    # `skipped` 由运行期动态决策产生：任务没有被执行完，而是被明确放弃
+    stage: Literal["execution", "validation", "skipped"]
     reason: str
     error_kind: str | None  # execution 阶段的错误分类，便于事后归因
     code: str | None
@@ -192,3 +193,30 @@ class InsightFlowState(TypedDict, total=False):
 
     # 人工对未确认调用的决定（"retry" 表示获准重发）
     llm_retry_granted: str | None
+
+    # ---- H5：运行期动态决策闭环 ----
+    # 开关与限制在 Run 创建时写进 state：恢复后沿用同一份，不会因为
+    # 重新配置而放宽正在进行的循环。
+    enable_dynamic_loop: bool
+    dynamic_limits: dict[str, int]
+    # 决策步数、历史与当前观察。都是可 JSON 序列化的普通结构。
+    loop_step: int
+    decision_history: list[dict[str, Any]]
+    current_observation: dict[str, Any] | None
+    current_action: str | None
+    action_reason: str | None
+    # 观察指纹与动作计数用于识别"同样的失败又来了"，防止无界重复
+    last_observation_fingerprint: str | None
+    action_counts: dict[str, dict[str, int]]
+    # 运行期计划修订：与 H3 的初始计划次数分开计数
+    plan_revision: int
+    runtime_replans: int
+    extra_retrievals: int
+    retrieval_focus: str | None
+    # 修订后的计划是否需要重新审批：在修订节点里定下来，避免依赖会被
+    # 恢复增量清空的 `require_plan_approval`
+    replan_needs_approval: bool
+    replan_base_plan: list[AnalysisTask]
+    skipped_tasks: list[dict[str, Any]]
+    dynamic_finished: bool
+    termination_reason: str | None

@@ -1,0 +1,138 @@
+"""把校验过的动作翻译成 state 增量与图上的下一个节点。
+
+控制器不判断"该做什么"（那是策略与模型的职责），只负责记账：
+步数、历史、动作计数、终止原因、跳过的任务。所有字段都可 JSON 序列化，
+因为整份 state 会进 Checkpoint。
+"""
+
+from __future__ import annotations
+
+from typing import Any
+
+from agent_loop.policy import (
+    CONTINUE,
+    FINISH,
+    REFINE,
+    REPAIR,
+    REPLAN_REMAINING,
+    RETRIEVE_MORE,
+    SKIP_TASK,
+    ActionDecision,
+)
+
+ROUTE_BY_ACTION: dict[str, str] = {
+    CONTINUE: "advance",
+    FINISH: "complete",
+    REPAIR: "repair",
+    REFINE: "refine",
+    RETRIEVE_MORE: "execution",
+    REPLAN_REMAINING: "replan",
+    SKIP_TASK: "advance",
+}
+
+MAX_HISTORY = 20
+
+
+def route_for(action: str | None) -> str:
+    return ROUTE_BY_ACTION.get(str(action or ""), "complete")
+
+
+def _record_action(state: dict[str, Any], task_id: str, action: str) -> dict[str, Any]:
+    counts = {
+        key: dict(value or {})
+        for key, value in (state.get("action_counts") or {}).items()
+    }
+    per_task = counts.setdefault(str(task_id), {})
+    per_task[action] = int(per_task.get(action, 0)) + 1
+    return counts
+
+
+def _skip_entry(observation: Any, decision: ActionDecision) -> dict[str, Any]:
+    stage = "validation" if observation.validation_passed is False else "execution"
+    return {
+        "task_id": observation.task_id,
+        "stage": "skipped",
+        "reason": decision.reason or "任务无法安全完成",
+        "error_kind": observation.error_kind,
+        "code": None,
+        "retry_count": observation.retry_count,
+        "refine_count": observation.refine_count,
+        "inner_stage": stage,
+    }
+
+
+def decision_updates(
+    state: dict[str, Any],
+    observation: Any,
+    decision: ActionDecision,
+) -> dict[str, Any]:
+    """决策节点要写回 state 的内容。"""
+    step = int(observation.loop_step) + 1
+    history = list(state.get("decision_history") or [])
+    history.append(
+        {
+            "step": step,
+            "task_id": observation.task_id,
+            "action": decision.action,
+            "reason": decision.reason,
+            "proposed": decision.proposed,
+            "forced": decision.forced,
+            "observation": decision.observation_fingerprint,
+            "plan_revision": observation.plan_revision,
+        }
+    )
+
+    updates: dict[str, Any] = {
+        "loop_step": step,
+        "decision_history": history[-MAX_HISTORY:],
+        "current_action": decision.action,
+        "action_reason": decision.reason,
+        "current_observation": observation.to_dict(),
+        "last_observation_fingerprint": decision.observation_fingerprint,
+        "action_counts": _record_action(state, observation.task_id, decision.action),
+    }
+
+    if decision.action == RETRIEVE_MORE:
+        updates["extra_retrievals"] = int(state.get("extra_retrievals") or 0) + 1
+        # 用校验意见或执行错误作为补充检索的依据；两者都没有时退回任务目标
+        updates["retrieval_focus"] = (
+            observation.critic_feedback
+            or observation.error_summary
+            or observation.task_goal
+        )
+    elif decision.action == REPAIR:
+        # 修复次数由 repair 节点负责累加（它知道这次修复是否真的发生了）
+        updates["retrieval_focus"] = None
+    elif decision.action == REFINE:
+        updates["retrieval_focus"] = None
+
+    if decision.action == SKIP_TASK:
+        skipped = list(state.get("skipped_tasks") or [])
+        skipped.append(_skip_entry(observation, decision))
+        updates["skipped_tasks"] = skipped
+        # 计入失败任务，让最终状态是 partial 而不是 completed
+        failed = list(state.get("failed_tasks") or [])
+        failed.append(_skip_entry(observation, decision))
+        updates["failed_tasks"] = failed
+        updates["termination_reason"] = (
+            f"任务 {observation.task_id} 被跳过：{decision.reason}"
+        )
+    elif decision.action == FINISH:
+        updates["analysis_status"] = _finish_status(state, observation)
+        updates["termination_reason"] = decision.reason or "分析结束"
+        updates["dynamic_finished"] = True
+
+    return updates
+
+
+def _finish_status(state: dict[str, Any], observation: Any) -> str:
+    """结束时的分析状态：还有没跑完的任务就是 partial。"""
+    plan = state.get("analysis_plan") or []
+    index = int(state.get("current_task_index") or 0)
+    unfinished = index < len(plan) and observation.validation_passed is not True
+    if unfinished or (state.get("failed_tasks") or []):
+        return "partial"
+    return "completed"
+
+
+__all__ = ["MAX_HISTORY", "ROUTE_BY_ACTION", "decision_updates", "route_for"]

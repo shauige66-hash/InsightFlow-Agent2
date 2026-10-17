@@ -208,3 +208,67 @@ def route_after_visualization_plan(
         return "plot_generation"
 
     return "report"
+
+
+# ---- H5：运行期动态决策 ----
+#
+# 关闭 `enable_dynamic_loop` 时，下面这些函数返回的仍是原有的固定分支，
+# 图的结构不变、行为不变；开启后才把路由交给决策节点。
+
+
+def route_after_tool_execution(
+    state: InsightFlowState
+) -> Literal["decide", "repair", "critic", "failed"]:
+    """工具执行完：开启动态循环时先区分"有错"还是"没错"。
+
+    有错就交给决策层（它需要看到错误分类才能判断能不能修）；没错仍要经过
+    Critic，决策层观察到的是"执行结果 + 校验结论"两者，而不是只看执行成功。
+    """
+    if state.get("enable_dynamic_loop"):
+        return "critic" if state.get("execution_error") is None else "decide"
+    return route_after_execution(state)
+
+
+def route_after_critic_node(
+    state: InsightFlowState
+) -> Literal["decide", "advance", "refine", "failed"]:
+    """校验完：开启动态循环时先观察再决定。"""
+    if state.get("enable_dynamic_loop"):
+        return "decide"
+    return route_after_critic(state)
+
+
+def route_after_failed_task(
+    state: InsightFlowState
+) -> Literal["decide", "advance"]:
+    """任务失败记录后：开启动态循环时交给决策层决定跳过还是补救。"""
+    return "decide" if state.get("enable_dynamic_loop") else "advance"
+
+
+def route_after_decide(
+    state: InsightFlowState
+) -> Literal["advance", "complete", "repair", "refine", "execution", "replan"]:
+    """把校验过的动作映射成下一个节点。
+
+    动作名到节点的映射由 `agent_loop.controller` 维护，这里不重复一份表。
+    """
+    from agent_loop import route_for
+
+    return route_for(state.get("current_action"))  # type: ignore[return-value]
+
+
+def route_after_runtime_replan(
+    state: InsightFlowState
+) -> Literal["router", "approval_gate", "complete"]:
+    """修订后的计划：重新审批（如启用）或直接继续执行。
+
+    修订被校验拒绝时节点已经写入 `dynamic_finished`，这里直接收尾，
+    不会带着一份非法计划继续跑。
+    """
+    if state.get("dynamic_finished"):
+        return "complete"
+
+    if state.get("replan_needs_approval"):
+        return "approval_gate"
+
+    return "router"

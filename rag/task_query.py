@@ -15,6 +15,7 @@ def build_task_query(
     *,
     analysis_focus: str | None = None,
     previous_context: Iterable[str] | None = None,
+    extra_terms: str | None = None,
 ) -> str:
     parts: list[str] = []
 
@@ -38,6 +39,12 @@ def build_task_query(
         text = str(item or "").strip()
         if text:
             parts.append(f"上一轮问题：{text}")
+
+    # 补充检索的触发原因：批评意见或执行错误里往往包含"缺什么"的信息，
+    # 直接拼进问句比再问一次模型"你想要什么"更省。
+    extra = (extra_terms or "").strip()
+    if extra:
+        parts.append(f"补充关注：{extra[:200]}")
 
     return "；".join(parts)
 

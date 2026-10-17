@@ -195,6 +195,38 @@ compose 使用 5433 / 6380，避开本机常见的 5432；`insightflow/insightfl
 本地开发默认凭据，不是可直接用于部署的密码。存储健康检查：
 `GET /storage/health`。
 
+## 运行期动态决策（H5）
+
+固定编排只能按预设分支走：执行失败就修三次，校验不过就精修三次，修不好就
+记失败。这些循环不看"结果到底有没有回答用户的问题"。开启
+`enable_dynamic_loop` 后，任务执行完会先观察再决定下一步：
+
+```
+tool_execution → (有错) decide → (没错) critic → decide
+decide → continue | finish | repair | refine | retrieve_more
+       | replan_remaining | skip_task
+```
+
+- **观察**由 state 确定性构造：任务目标、工具、成败、错误分类、校验结论、
+  结果形状（表/标量/几行/哪些列）、证据引用、剩余预算。不带任何数据行，
+  因为它会进 Checkpoint 也会进 Prompt。
+- **决策**是一次受治理的模型请求（经 Harness 计数、账本与幂等），返回结构化
+  的 `{"action", "reason"}`；**动作由确定性策略校验**：权限、授权、环境与
+  预算类错误不允许重试，步数/重规划/补充检索/重复动作都有上限，超出即安全收尾。
+- **补充检索**用校验意见或执行错误拼出新问句，只查当前授权的知识库，新旧证据
+  按 chunk 去重合并；因为是新的逻辑尝试，执行与复核的操作身份会随之变化，
+  否则幂等层会把"再试一次"当成"重放上一次"。
+- **运行期重新规划**只重写当前位置及其后的任务：已完成的索引与产物不动，
+  新任务要过 H3 同样的校验（资源、结构、依赖），并且与已完成任务 ID 冲突
+  直接拒绝。开启计划审批时，修订是**新的一版计划**，会以 `:r<n>` 的审批 ID
+  重新中断；拒绝则退回已完成的前缀，绝不执行被拒的任务。
+- 关闭开关时图结构不变、路由不变，行为与之前完全一致；开关与各项上限在创建
+  Run 时写进 state，恢复后沿用同一份。
+
+代价是真实的：干净任务多一次决策请求；异常任务可能多几次检索或一次修订。
+`tests/test_h5_integration.py` 对比了同一任务的开关两种配置，包含"开启后更贵"
+这一结论。
+
 ## 业务知识 Grounding
 
 InsightFlow 支持使用 Markdown、TXT 和 PDF 等业务知识文档，为数据分析过程提供业务语义和规则约束。
@@ -807,6 +839,48 @@ run with an explicit status instead of reaching the router.
 
 **Approval covers one specific plan.** The approval record carries a content
 fingerprint, checked again before execution; a plan swapped after approval is refused.
+
+## Runtime Decision Loop (H5)
+
+A fixed graph can only follow its branches: three repairs, three refines, then a
+failed task — without ever asking whether the result answered the question. With
+`enable_dynamic_loop`, a task is observed before the next step is chosen:
+
+```
+tool_execution → (error) decide → (ok) critic → decide
+decide → continue | finish | repair | refine | retrieve_more
+       | replan_remaining | skip_task
+```
+
+Observations are built deterministically from state: goal, tool, success, error
+kind, validation verdict, result shape (table/scalar/rows/columns), evidence
+refs and remaining budget. No data rows: observations go into the checkpoint and
+into a prompt.
+
+Decisions are governed model requests (counted, ledgered, idempotent) that return
+a structured action, and a deterministic policy validates it: permission,
+authorization, environment and budget failures are never retried, and steps,
+replans, extra retrievals and repeated actions are each capped, after which the
+run converges safely.
+
+`retrieve_more` re-queries only the authorized knowledge base with a query built
+from the critique or the error, merging evidence by chunk id; because it is a new
+logical attempt, the execution and review identities change with it — otherwise
+idempotency would treat "try again" as "replay the last attempt".
+
+A runtime replan rewrites only the current and remaining tasks. Completed indexes
+and artifacts are untouched, new tasks go through the same validation as the
+initial plan, and ids colliding with completed tasks are refused. Under plan
+approval, a revision is a new plan version with its own `:r<n>` approval id; a
+rejection falls back to the completed prefix and the rejected tasks never run.
+
+With the switch off the graph and routing are exactly as before. The switch and
+its limits are written into state when the run is created and reused on resume.
+
+The cost is real: a clean task pays one extra decision request, and an abnormal
+task may pay for extra retrieval or a replan. `tests/test_h5_integration.py`
+compares both configurations on the same task, including where the loop is
+strictly more expensive.
 
 ## Business Knowledge Grounding
 

@@ -70,13 +70,19 @@ def artifact_operation(run_id: str) -> str:
     return operation_id(run_id, "artifact")
 
 
-def plan_approval_id(run_id: str) -> str:
-    """同一个 Run 的执行前审批只有一个 ID。
+def plan_approval_id(run_id: str, revision: int = 0) -> str:
+    """同一个 Run 的同一版计划只有一个审批 ID。
 
     用固定 ID 而不是随机值：恢复后重新计算必须得到同一个值，
     否则重复审批保护会失效。
+
+    运行期修订（H5）产生新的一版计划，必须换一个 ID：否则重新审批会命中
+    上一版的归档决定而被跳过，等于用旧批准放行新任务。
     """
-    return operation_id(run_id, "approval", "plan_review")
+    base = operation_id(run_id, "approval", "plan_review")
+    if revision <= 0:
+        return base
+    return f"{base}:r{revision}"
 
 
 def report_approval_id(run_id: str) -> str:
