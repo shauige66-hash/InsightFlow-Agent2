@@ -359,13 +359,19 @@ def _isolate_agents(monkeypatch: pytest.MonkeyPatch):
     return monkeypatch
 
 
-def read_context_events(output_root: Path, run_id: str) -> list[dict]:
+def read_log_events(output_root: Path, run_id: str, event: str) -> list[dict]:
     path = output_root / "logs" / f"{run_id}.jsonl"
+    if not path.exists():
+        return []
     return [
         json.loads(line)
         for line in path.read_text(encoding="utf-8").splitlines()
-        if line.strip() and json.loads(line).get("event") == "llm_context"
+        if line.strip() and json.loads(line).get("event") == event
     ]
+
+
+def read_context_events(output_root: Path, run_id: str) -> list[dict]:
+    return read_log_events(output_root, run_id, "llm_context")
 
 
 class TestFiveTableWorkflow:
@@ -428,6 +434,12 @@ class TestFiveTableWorkflow:
                 assert len(kept) == 1, f"{agent} 看到了多余的表：{kept}"
 
     def test_an_unknown_table_never_reaches_execution(self, tmp_path: Path) -> None:
+        """计划里的未知资源被拒绝，绝不会进入执行。
+
+        H3 的校验器在 Planner 之后、路由之前就拦下这份计划；没有执行结果，
+        也没有产物。Context Manager 自己的拒绝行为由
+        `TestTableSelection::test_an_unknown_table_is_rejected_not_skipped` 覆盖。
+        """
         from services.analysis_service import run_analysis
         from tests.test_e2e_business_scenarios import ScriptedFactory
 
@@ -450,14 +462,19 @@ class TestFiveTableWorkflow:
         }
         run_id = "h2-unknown-table"
 
-        with pytest.raises(UnknownTableError) as excinfo:
-            run_analysis(
-                run_id=run_id,
-                data_sources=[str(source)],
-                model_factory=ScriptedFactory(run_id, replies).build(),
-                output_root=tmp_path,
-            )
+        result = run_analysis(
+            run_id=run_id,
+            data_sources=[str(source)],
+            model_factory=ScriptedFactory(run_id, replies).build(),
+            output_root=tmp_path,
+        )
 
-        assert "shop.invented" in str(excinfo.value)
-        # 拒绝发生在执行前：没有执行结果
+        assert result["analysis_status"] == "failed"
+        assert result["analysis_plan"] == []
+        assert result["execution_results"] == []
+        # 拒绝发生在执行前：没有结果产物
         assert not list((tmp_path / run_id).glob("results/*.json"))
+
+        events = read_log_events(tmp_path, run_id, "plan_rejected")
+        assert events, "未知资源没有被记录为计划校验失败"
+        assert "unknown_table" in events[0]["details"]["categories"]

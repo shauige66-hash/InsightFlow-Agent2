@@ -340,17 +340,33 @@ def planner_node(
         if isinstance(snapshot, dict)
     }
 
-    attempts_used = int(state.get("plan_attempts") or 0)
+    # 已经用满次数（例如上一次执行以"计划未通过校验"收尾）就不再尝试：
+    # 恢复不能换来新的重试额度。
+    if int(state.get("plan_attempts") or 0) >= MAX_PLAN_ATTEMPTS:
+        return {
+            "analysis_plan": [],
+            "current_task_index": 0,
+            "analysis_status": "failed",
+            "status_reason": (
+                f"分析计划在 {MAX_PLAN_ATTEMPTS} 次尝试后仍未通过校验"
+            ),
+            "plan_attempts": MAX_PLAN_ATTEMPTS,
+            "plan_validation_errors": list(state.get("plan_validation_errors") or []),
+            "completed_operations": dict(state.get("completed_operations") or {}),
+        }
+
+    attempt_index = 0
     feedback = list(state.get("plan_validation_errors") or [])
     operations = dict(state.get("completed_operations") or {})
     budget_extra: dict = {}
 
-    while attempts_used < MAX_PLAN_ATTEMPTS:
-        attempt_index = attempts_used
-        attempts_used += 1
-
+    while attempt_index < MAX_PLAN_ATTEMPTS:
         # 每次重新规划是独立的逻辑调用：身份里带尝试序号，幂等层不会把
         # 上一次被拒的计划当成这一次的结果复用。
+        #
+        # 序号从 0 开始、不接着 state 里的次数往下排：节点被重放时（例如
+        # 进程崩溃后从入口重新走到这里）必须用同一个身份命中幂等复用，
+        # 否则一次"重放"会变成一次新的模型调用。
         plan, _ops, _extra = HARNESS.model_call(
             "planner",
             attempt_subject("plan", attempt_index),
@@ -365,6 +381,7 @@ def planner_node(
             ),
             attempt=attempt_index + 1,
         )
+        attempt_index += 1
         operations.update(_ops or {})
         budget_extra = _extra or {}
 
@@ -375,7 +392,7 @@ def planner_node(
         )
 
         if validation.ok:
-            _log_plan(run_id, "plan_validated", "success", validation, attempts_used)
+            _log_plan(run_id, "plan_validated", "success", validation, attempt_index)
 
             if validation.is_empty:
                 # 空计划意味着"没有可分析的任务"，不是失败。
@@ -384,7 +401,7 @@ def planner_node(
                     "current_task_index": 0,
                     "analysis_status": "no_tasks",
                     "status_reason": "Planner 未生成任何分析任务",
-                    "plan_attempts": attempts_used,
+                    "plan_attempts": attempt_index,
                     "plan_validation_errors": [],
                     "completed_operations": operations,
                     **_extra,
@@ -411,23 +428,23 @@ def planner_node(
             return {
                 "analysis_plan": validation.tasks,
                 "current_task_index": 0,
-                "plan_attempts": attempts_used,
+                "plan_attempts": attempt_index,
                 "plan_validation_errors": [],
                 "completed_operations": operations,
                 **_extra,
             }
 
         feedback = validation.feedback()
-        _log_plan(run_id, "plan_rejected", "failed", validation, attempts_used)
+        _log_plan(run_id, "plan_rejected", "failed", validation, attempt_index)
 
-        if attempts_used < MAX_PLAN_ATTEMPTS and run_id is not None:
+        if attempt_index < MAX_PLAN_ATTEMPTS and run_id is not None:
             log_event(
                 run_id=run_id,
                 node="planner",
                 event="replan_requested",
                 status="retrying",
                 details={
-                    "attempts": attempts_used,
+                    "attempts": attempt_index,
                     "categories": validation.categories,
                 },
             )
@@ -440,7 +457,7 @@ def planner_node(
             event="replan_exhausted",
             status="failed",
             details={
-                "attempts": attempts_used,
+                "attempts": attempt_index,
                 "categories": sorted({item.split("：")[0] for item in feedback})[:5],
             },
         )
@@ -450,10 +467,10 @@ def planner_node(
         "current_task_index": 0,
         "analysis_status": "failed",
         "status_reason": (
-            f"分析计划在 {attempts_used} 次尝试后仍未通过校验："
+            f"分析计划在 {attempt_index} 次尝试后仍未通过校验："
             + "；".join(feedback[:3])
         ),
-        "plan_attempts": attempts_used,
+        "plan_attempts": attempt_index,
         "plan_validation_errors": feedback,
         "completed_operations": operations,
         **budget_extra,
