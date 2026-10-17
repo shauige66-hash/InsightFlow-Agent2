@@ -94,6 +94,37 @@ InsightFlow 是一个基于 LangGraph 和 LangChain 构建的 Agentic 数据分�
         Markdown / HTML / PDF
 ```
 
+## 运行时治理层（Harness）
+
+LangGraph 负责状态图、路由、Checkpoint 与人工审批中断；`harness/` 负责一次
+**模型调用或工具调用**怎么被执行治理。两层之间只通过少数入口交互，节点不再
+直接接触账本、预算计数或工具治理的上下文管理。
+
+| 模块 | 职责 |
+| --- | --- |
+| `harness/policy.py` | 判定哪些额度、什么时候计数、什么时候结算执行时钟 |
+| `harness/llm_gateway.py` | 模型调用的唯一出口：幂等复用 → 预算判定 → 账本 → 按真实请求计数 |
+| `harness/tool_dispatcher.py` | Python / SQL / Plot 的统一派发：预算与策略检查 → 授权资源解析 → 错误分类 → 时间结算 |
+| `harness/runtime.py` | 组装上述两者，并把当前节点的 state 绑进按执行上下文隔离的 `ContextVar` |
+
+```text
+LangGraph 节点 (nodes.py)
+    |  HARNESS.model_call / HARNESS.run_tool
+    v
+harness.llm_gateway / harness.tool_dispatcher
+    |                          |
+    v                          v
+utils.idempotency          utils.middleware.governed_tool_call
+utils.llm_retry            tools.tool_registry.invoke_tool
+utils.llm_ledger           Docker sandbox / MCP client
+    \                          /
+     +-- utils.agent_loop（预算状态，随 Checkpoint 持久化）
+```
+
+预算只有一份：存在图状态的 `execution_budget` 里，随 Checkpoint 恢复而不重置。
+Harness 不重复实现账本、沙箱或 Checkpoint，只固定调用顺序与边界；
+`tests/test_harness_architecture.py` 用真实的图执行验证节点确实经过这两条入口。
+
 ## 业务知识 Grounding
 
 InsightFlow 支持使用 Markdown、TXT 和 PDF 等业务知识文档，为数据分析过程提供业务语义和规则约束。
@@ -652,6 +683,39 @@ Data Files + Business Knowledge
                       v
          Markdown / HTML / PDF
 ```
+
+## Runtime Harness
+
+LangGraph owns the state graph, routing, checkpoints and human-approval interrupts.
+`harness/` owns how a single **model call or tool call** is governed. The two layers
+meet at a few entry points, so nodes no longer deal with the ledger, request counting
+or tool-governance context management directly.
+
+| Module | Responsibility |
+| --- | --- |
+| `harness/policy.py` | Which budget scopes to check, when to count, when to settle the execution clock |
+| `harness/llm_gateway.py` | The only exit for model calls: idempotent reuse → budget check → ledger → count per real request |
+| `harness/tool_dispatcher.py` | One dispatch for Python / SQL / Plot: policy check → authorised resource resolution → error classification → time settlement |
+| `harness/runtime.py` | Composes the two, and binds the current node's state into a per-execution-context `ContextVar` |
+
+```text
+LangGraph nodes (nodes.py)
+    |  HARNESS.model_call / HARNESS.run_tool
+    v
+harness.llm_gateway / harness.tool_dispatcher
+    |                          |
+    v                          v
+utils.idempotency          utils.middleware.governed_tool_call
+utils.llm_retry            tools.tool_registry.invoke_tool
+utils.llm_ledger           Docker sandbox / MCP client
+    \                          /
+     +-- utils.agent_loop (budget state, persisted in the checkpoint)
+```
+
+There is one budget, held in graph state as `execution_budget` and restored from the
+checkpoint rather than reset. The harness does not reimplement the ledger, the sandbox
+or the checkpoint; it fixes the order and the boundaries. `tests/test_harness_architecture.py`
+drives a real workflow to verify that nodes actually go through these two entries.
 
 ## Business Knowledge Grounding
 

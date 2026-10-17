@@ -5,7 +5,7 @@
 `resolve_tables` 失败、节点被取消），只有直接写进 state 的计数才会留下，
 否则一次崩溃就能白拿一次工具额度，重复崩溃可以无限启动容器。
 
-这与模型请求计数钩子 `nodes._register_request_hooks` 的做法一致：计数先落到
+这与模型请求计数钩子 `harness.llm_gateway.LLMGateway.install_request_hooks` 的做法一致：计数先落到
 当前 state 上，正式的 Checkpoint 提交仍由节点返回的增量完成。
 """
 

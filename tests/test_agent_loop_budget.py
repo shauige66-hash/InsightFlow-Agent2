@@ -372,11 +372,11 @@ class TestMiddlewareBudgets:
         """治理只有一条生效路径，中间件不再有重复实现。
 
         回归：`utils/middleware` 里曾有 `governed_llm_call`（无调用方）、
-        `record_round`（轮次其实走 `nodes._round_update` →
+        `record_round`（轮次其实走 `harness.policy.count_round` →
         `agent_loop.consume_round`）与 `merge_budget`（只有测试在用）。
         两套并行实现会让人误以为它们参与预算执行，因此已删除。
-        模型调用真正生效的路径是 `nodes._governed_agent_call` →
-        `utils/idempotency.run_agent_call`。
+        模型调用真正生效的路径是 `harness.llm_gateway.LLMGateway.call_agent`
+        → `utils/idempotency.run_agent_call`。
         """
         import utils.middleware as middleware
 

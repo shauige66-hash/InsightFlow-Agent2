@@ -1,6 +1,5 @@
 # 定义 LangGraph 工作流节点，负责读取和更新共享 State。
 
-import contextvars
 import functools
 import os
 import time
@@ -23,7 +22,7 @@ from context.context_builder import build_all_contexts
 from agents.planner import create_analysis_plan
 from agents.router import route_analysis_task
 from agents.executor import generate_execution_code
-from tools.tool_registry import available_tools, invoke_tool
+from tools.tool_registry import available_tools
 from agents.repair import repair_execution_code
 from agents.critic import review_execution_result
 from agents.refine import refine_execution_code
@@ -44,7 +43,6 @@ from utils.idempotency import (
     replay_guard,
     report_approval_id,
     attempt_subject,
-    run_agent_call,
 )
 from utils.result_artifacts import (
     ResultArtifactError,
@@ -68,154 +66,24 @@ def _crash_point(name: str) -> None:
         _os._exit(17)
 
 
-def _governed_agent_call(
-    agent: str,
-    subject: str,
-    invoke: Callable[[], Any],
-    *,
-    attempt: int = 1,
-) -> tuple[Any, dict, dict]:
-    """`run_agent_call` 之上再套一层预算治理。
-
-    分工必须说清楚，否则会出现两套互相打架的计数：
-
-    - `utils.idempotency.run_agent_call` 负责**幂等**：
-      同一逻辑调用已完成就复用结果，以及"请求发出但未确认"的人工拦截；
-    - 这里负责**总量**：把**真正发生过上游请求**的调用计入
-      `execution_budget.llm_calls`。
-
-    两者都不替代对方：幂等管"要不要重发"，预算管"还能不能发"。
-
-    命中幂等复用时不计数——那次没有发生模型调用，计进去会让预算虚高。
-    判据来自 `run_agent_call` 的内部标记，标记本身必须**从 state 增量里剔除**，
-    否则会写进 Checkpoint（未声明的键会被 LangGraph 丢掉，但留着会误导阅读）。
-    """
-    payload, operations, extra = run_agent_call(
-        _CURRENT_STATE.get() or {},
-        node=agent,
-        subject=subject,
-        call=invoke,
-        attempt=attempt,
-        # 预算判定放在**幂等复用之后、账本落 started 之前**：
-        # 复用不该消耗额度，而超预算时绝不能往账本写一条 started——
-        # 那会留下一个永远等不到 completed 的记录，恢复时被判成
-        # "未确认的模型调用"并要求人工裁决，于是一个纯粹的预算问题
-        # 变成了人工工单。
-        before_request=_budget_guard,
-    )
-
-    extra = dict(extra or {})
-    invoked = bool(extra.pop("__upstream_invoked__", False))
-    # 操作 ID 与账本、幂等登记用的是同一个值，日志带上它才能把
-    # "这次模型调用"与账本里的 started/completed 对上。它不进 state。
-    operation_id = extra.pop("__operation_id__", None)
-
-    if invoked:
-        # 计数**不在**这里做：真实请求数由 `utils/agent_loop.after_model_request`
-        # 在每次请求前逐次累加（含同一次逻辑调用内部的重试）。
-        # 这里曾经额外 `consume_llm_call` 一次，于是同一次请求被算了两次——
-        # 实测声明上限 3 时实际只发出 2 次请求就判定耗尽。
-        #
-        # 这里只做时钟结算：模型调用已结束，若接着去等人审批，时间不再累积。
-        settled = settle_active_time(_CURRENT_STATE.get() or {})
-        extra[BUDGET_FIELD] = settled[BUDGET_FIELD]
-
-        # P4：把这个 Agent 的上下文度量写进结构化日志。
-        # 各 Agent 在裁剪时把结果放进自己的上下文变量，这里按 agent 名取回。
-        report = _context_report_of(agent)
-        if report:
-            log_event(
-                run_id=(_CURRENT_STATE.get() or {}).get("run_id") or "unknown",
-                node=agent,
-                event="llm_context",
-                status="ok",
-                details={
-                    "subject": subject,
-                    "operation_id": operation_id,
-                    "context": report,
-                },
-            )
-
-    return payload, operations, extra
-
-
-def _context_report_of(agent: str) -> dict:
-    """取回某个 Agent 最近一次上下文裁剪的度量。
-
-    P4 的度量通过 `contextvars.ContextVar` 传递，因此**按执行上下文隔离**：
-    并发执行的两个 Run 各自看到自己的那份，不会互相串写。
-    早期实现把度量放在模块级字典里，两个 Run 并发调用同一个 Agent 时
-    可能把 A 的度量写进 B 的日志。
-
-    取不到就返回空字典（不因为日志缺字段而影响执行）。
-    """
-    from utils.context_budget import context_report_of
-
-    return context_report_of(agent)
-
-
-def _budget_guard() -> None:
-    """进入一次**真实模型请求**前判预算；超了抛 `BudgetExceeded`。
-
-    这是模型预算真正生效的地方。只判不记：计由请求计数钩子完成——命中幂等
-    复用的调用不该被算成新请求。
-
-    只看 `llm_calls`：这一次请求额外消耗的是一个模型调用额度，不该因为工具
-    调用或时间预算刚好用尽就被拒绝；那些分项在各自的入口
-    （`governed_tool_call`、`_round_update`）判定。
-
-    `run_agent_call` 在落账本之前调它一次，`utils.llm_retry` 在每次重发之前
-    再调一次。两次都只读。
-    """
-    from utils.agent_loop import check_llm_budget
-
-    # `llm_calls` 在每次请求**发出前**就地累加，因此同一逻辑调用内部的重试
-    # 读到的已经是"已发出的请求数"，这里只比较、不再额外加一。
-    check_llm_budget(_CURRENT_STATE.get() or {})
-
-
-def _round_update(*, node: str) -> dict:
-    """记一次 Reason→Act→Observe→Decide 轮次。"""
-    from utils.agent_loop import consume_round
-
-    return consume_round(_CURRENT_STATE.get() or {})
-
-
-# 当前节点正在处理的 state。节点函数签名不能带额外参数（LangGraph 会把
-# 参数名当成状态通道），因此这里用 ContextVar 传递，避免改动 19 个节点签名。
-_CURRENT_STATE: contextvars.ContextVar[dict | None] = contextvars.ContextVar(
-    "insightflow_current_state", default=None
-)
-
-
 def _with_state(func: Callable) -> Callable:
-    """把 state 放进 ContextVar，供预算闸门与请求计数钩子读取。
+    """把 state 绑进 Harness 的运行上下文，并统一收敛预算耗尽。
 
     只包装实际调用 Agent 的节点；其余节点不受影响。
 
-    P3-A：同时在这里确保 state 里有一份预算快照。放在这一层是因为
-    所有会消耗预算的节点都被它包着，而 `initialize_budget` 是**幂等**的
-    （已有计数不重置），所以恢复后重复进入不会把预算清零。
-
-    P3 定点修复：`BudgetExceeded` 也在这里统一收敛。预算判定现在接在
-    **真实请求之前**，因此它会从任意一个 Agent 调用点抛出来（10 处）。
-    逐处 catch 既啰嗦又容易漏掉一处，漏掉就意味着预算耗尽变成未分类异常、
-    整个 Run 崩掉而不是安全终止。这一层是所有消耗预算的节点的共同入口，
-    在这里转成"环境类失败"最稳妥：归类为 `unavailable`，不进入 Repair。
+    `BudgetExceeded` 在这里转成"环境类失败"（归类为 `unavailable`，不进入
+    Repair）：预算判定接在真实请求之前，因此它可能从任意一个 Agent 调用点
+    抛出，逐处 catch 既啰嗦又容易漏，漏掉就意味着预算耗尽变成未分类异常、
+    整个 Run 崩掉而不是安全终止。
     """
 
     @functools.wraps(func)
     def wrapper(state: InsightFlowState) -> dict:
-        # 预算是"当前 state 已有则保留、没有才建"的语义。
-        # 这里只在缺字段时补一个 ContextVar 可见的副本，不写回 state——
-        # 写回必须由节点自己的返回值完成，否则会被 LangGraph 当成未声明增量丢弃。
-        token = _CURRENT_STATE.set(state)
-        try:
-            return func(state)
-        except BudgetExceeded as exceeded:
-            return _budget_failure(state, func.__name__, exceeded)
-        finally:
-            _CURRENT_STATE.reset(token)
+        with bind_state(state):
+            try:
+                return func(state)
+            except BudgetExceeded as exceeded:
+                return _budget_failure(state, func.__name__, exceeded)
 
     return wrapper
 
@@ -319,64 +187,17 @@ def _budget_failure(
     return common
 
 
-def _register_request_hooks() -> None:
-    """把预算钩子注册进 `utils/agent_loop`。
-
-    为什么需要这一层：Agent 在**每次真实模型请求**前后都要判预算与计数
-    （内部重试的每一次请求也算），但 Agent 不能 import 节点模块——那会形成
-    `agents → nodes → agents` 的循环依赖。因此节点层把自己的取值方式注册过去。
-
-    `on_request` 直接**就地更新** state 里的用量。这样做是必要的：
-    一次逻辑调用内部可能发出多次请求，而 state 的正式增量要等节点返回才合并；
-    不就地累加的话，第二次请求判定时读到的仍是旧计数，上限 1 也拦不住第 2 次。
-    就地更新改变的是 LangGraph 传入的那份 state 对象，节点返回的增量是它的
-    超集，因此不会互相覆盖。
-    """
-    from utils.agent_loop import (
-        BUDGET_FIELD,
-        consume_llm_call,
-        set_request_hooks,
-        set_state_provider,
-    )
-
-    def _state() -> dict | None:
-        return _CURRENT_STATE.get()
-
-    def _before(attempt: int) -> None:
-        _budget_guard()
-
-    def _count(attempt: int) -> None:
-        state = _CURRENT_STATE.get()
-        if state is None:
-            return
-        # 就地累加：同一次逻辑调用内部的后续重试要靠它看到"已经发过几次"，
-        # 正式落盘仍由节点返回的增量完成。
-        updates = consume_llm_call(state)
-        state[BUDGET_FIELD] = updates[BUDGET_FIELD]
-
-    set_state_provider(_state)
-    set_request_hooks(before=_before, after=_count)
-
-
-_register_request_hooks()
 from utils.run_logger import log_event
 from time import perf_counter
 from rag.knowledge_service import build_and_retrieve_knowledge
 
-# P3：有界执行与统一治理。放在这里而不是散进各节点，
-# 是为了让"预算判定"与"结构化日志"只有一个出口。
-from utils.agent_loop import (
-    BUDGET_ERROR_KIND,
-    BUDGET_FIELD,
-    BudgetExceeded,
-    initialize as initialize_budget,
-    settle_active_time,
-)
-from utils.middleware import governed_tool_call
+# 运行治理通过 Harness 进入：模型调用、工具派发与预算都在那一层，
+# 节点只解释结果。`BudgetExceeded` 仍要在模块级可用——`_with_state`
+# 包装器在导入期就把它写进 except 子句。
+from harness.runtime import bind_state, get_harness
+from utils.agent_loop import BUDGET_ERROR_KIND, BUDGET_FIELD, BudgetExceeded
 
-# `BudgetExceeded` 与预算字段要在模块顶部可用：`_with_state` 包装器在导入期
-# 就把它写进 except 子句，晚于它的局部导入（原先在函数体里）帮不上忙。
-from utils.agent_loop import BudgetExceeded
+HARNESS = get_harness()
 
 # 绘图重试上限。与 `conditions.route_after_plot_execution` 共用同一个常量：
 # 预算耗尽时把计数直接置满，路由就会跳过 plot_repair——重画同一张图
@@ -402,9 +223,9 @@ def loader_node(
 
     return {
         "table_snapshot": snapshots_to_state(snapshots),
-        # P3-A：预算在这里落地。`initialize_budget` 只补缺失字段，
-        # 已有计数原样保留，因此恢复时不会把已消耗的预算清零。
-        **initialize_budget(state),
+        # 预算在这里落地：只补缺失字段，已有计数原样保留，
+        # 因此恢复时不会把已消耗的预算清零。
+        **HARNESS.initialize_budget(state),
     }
 
 
@@ -474,7 +295,7 @@ def planner_node(
         []
     )
 
-    plan, _ops, _extra = _governed_agent_call(
+    plan, _ops, _extra = HARNESS.model_call(
         "planner",
         "plan",
         lambda: create_analysis_plan(
@@ -591,7 +412,7 @@ def execution_node(
     # execution_node 每个任务只进入一次：之后的代码由 repair / refine 产出
     # （图上是 repair→tool_execution、refine→tool_execution，不再回到这里）。
     # 因此这里保持 task_id 作为身份就足够，不需要尝试序号。
-    code, _ops, _extra = _governed_agent_call(
+    code, _ops, _extra = HARNESS.model_call(
         "executor",
         task["task_id"],
         lambda: generate_execution_code(
@@ -709,34 +530,26 @@ def tool_execution_node(
             "execution_error_kind": BUDGET_ERROR_KIND,
         }
 
-    # 参数校验失败与执行失败都从 invoke_tool 以错误字典返回，
-    # 交给 route_after_execution 走修复循环，而不是在这里抛异常终止工作流。
+    # 参数校验失败与执行失败都以错误字典返回，交给 route_after_execution
+    # 走修复循环，而不是在这里抛异常终止工作流。
     arguments = (
         {"table_names": task["target_tables"], "code": code}
         if tool == "python"
         else {"table_names": task["target_tables"], "query": code}
     )
 
-    # 权威数据快照一并传入：MCP 后端据此确定授权集合（哪些 dataset_id 可见），
-    # direct 后端忽略它。不传的话 MCP 只能按本次点名的表临时授权，
-    # 与 P1 的"数据源变化必须失败"语义脱节。
-    #
-    # P3-B：经统一治理层调用。它在真正执行前判一次预算、执行后记一次
-    # 结构化日志与耗时；预算耗尽时抛 BudgetExceeded，这里转成环境类失败，
-    # 由既有的 route_after_execution 走"失败"而不是"修复"（重试不会好转）。
+    # 派发交给 Harness：预算判定、授权资源解析、错误分类与执行时间结算都在
+    # 那一层完成。预算耗尽时它记一条 budget_exceeded 并抛出，这里只决定
+    # 这次失败长成什么样——环境类失败，路由据此不进入修复（重试不会好转）。
     budget_updates: dict = {}
     try:
-        with governed_tool_call(state, node="tool_execution", tool=tool) as gate:
-            execution = invoke_tool(
-                tool,
-                resolve_tables(state),
-                arguments,
-                snapshots=state.get("table_snapshot") or {},
-            )
-            gate["error_kind"] = execution.get("error_kind")
-        # finally 里才结算执行时钟，必须在 with 退出后重读，否则拿到的是
-        # 结算前的 clock_open=True
-        budget_updates = gate.get("budget_updates") or {}
+        outcome = HARNESS.run_tool(
+            state,
+            node="tool_execution",
+            tool=tool,
+            arguments=arguments,
+            context={"task_id": task["task_id"]},
+        )
     except BudgetExceeded as exceeded:
         execution = {
             "success": False,
@@ -744,13 +557,9 @@ def tool_execution_node(
             "error": str(exceeded),
             "error_kind": BUDGET_ERROR_KIND,
         }
-        log_event(
-            run_id=state.get("run_id") or "unknown",
-            node="tool_execution",
-            event="budget_exceeded",
-            status="failed",
-            details={"scope": exceeded.scope, "used": exceeded.used, "limit": exceeded.limit},
-        )
+    else:
+        execution = outcome.execution
+        budget_updates = outcome.budget_updates
 
     run_id = state.get("run_id")
 
@@ -884,7 +693,7 @@ def repair_node(
     # 同一轮修复被 Checkpoint 重放时，入站值相同才算同一次逻辑调用。
     repair_attempt = state.get("retry_count", 0)
 
-    repaired_code, _ops, _extra = _governed_agent_call(
+    repaired_code, _ops, _extra = HARNESS.model_call(
         "repair",
         attempt_subject(task["task_id"], repair_attempt),
         lambda: repair_execution_code(
@@ -925,7 +734,7 @@ def repair_node(
         "retry_count": retry_count,
         "completed_operations": _ops,
         # P3-A：进入修复就是一次新的 Reason→Act→Observe→Decide 轮次。
-        **_round_update(node="repair"),
+        **HARNESS.note_round(state),
         **_extra,
     }
 
@@ -1077,7 +886,7 @@ def critic_node(
     # 否则第二轮评审会复用第一轮的结论，精修循环等于没有校验。
     review_round = state.get("refine_count", 0)
 
-    review, _ops, _extra = _governed_agent_call(
+    review, _ops, _extra = HARNESS.model_call(
         "critic",
         attempt_subject(task["task_id"], review_round),
         lambda: review_execution_result(
@@ -1173,7 +982,7 @@ def refine_node(
 
     refine_attempt = state.get("refine_count", 0)
 
-    refined_code, _ops, _extra = _governed_agent_call(
+    refined_code, _ops, _extra = HARNESS.model_call(
         "refine",
         attempt_subject(task["task_id"], refine_attempt),
         lambda: refine_execution_code(
@@ -1215,7 +1024,7 @@ def refine_node(
         "refine_count": refine_count,
         "completed_operations": _ops,
         # P3-A：进入精修同样是一次新的循环轮次。
-        **_round_update(node="refine"),
+        **HARNESS.note_round(state),
         **_extra,
     }
 
@@ -1390,7 +1199,7 @@ def report_node(
             result_item
         )
 
-    report, _ops, _extra = _governed_agent_call(
+    report, _ops, _extra = HARNESS.model_call(
         "reporter",
         "report",
         lambda: generate_analysis_report(
@@ -1439,11 +1248,10 @@ def report_node(
                 "visualization_count": len(
                     report_visualizations
                 ),
-                # P4：把这次报告上下文的预算与真实用量记进结构化日志，
+                # 这次报告上下文的预算与真实用量记进结构化日志，
                 # 使"上下文用了多少"成为可观察事实而不是猜测。
                 # estimated_tokens 是估算值（无匹配 tokenizer），字段名里已标注。
-                # 度量按执行上下文隔离：并发 Run 之间不会互相串写。
-                "context": _context_report_of("reporter"),
+                "context": HARNESS.context_report("reporter"),
             }
         )
 
@@ -1823,7 +1631,7 @@ def visualization_planner_node(
         )
     )
 
-    visualization_plan, _ops, _extra = _governed_agent_call(
+    visualization_plan, _ops, _extra = HARNESS.model_call(
         "visualizer",
         "plan",
         lambda: create_visualization_plan(
@@ -1960,7 +1768,7 @@ def plot_generation_node(
             "plot_retry_count": MAX_PLOT_RETRIES,
         }
 
-    generation, _ops, _extra = _governed_agent_call(
+    generation, _ops, _extra = HARNESS.model_call(
         "plotter",
         attempt_subject(chart_id, index),
         lambda: generate_plot_code(
@@ -2128,21 +1936,22 @@ def plot_execution_node(
             "completed_operations": completed_operations(state),
         }
 
-    # 绘图与 Python/SQL 走**同一个**治理入口。此前这里直接调用 invoke_tool，
-    # 于是绘图既不计入 tool_calls，也不受预算约束——预算设为 0 时仍会启动
-    # 一个 Docker 容器。绘图是有副作用且开销最大的工具，不能是治理的缺口。
+    # 绘图与 Python/SQL 走同一个派发入口。绘图是开销最大、有副作用的工具，
+    # 因此预算与授权不能在这里被绕开。
     budget_updates: dict = {}
     try:
-        with governed_tool_call(state, node="plot_execution", tool="plot") as gate:
-            execution = invoke_tool("plot", resolve_tables(state), {
+        outcome = HARNESS.run_tool(
+            state,
+            node="plot_execution",
+            tool="plot",
+            arguments={
                 "table_names": target_tables,
                 "chart_id": chart_id,
                 "code": code,
                 "analysis_result": unwrap_records(analysis_result),
-            })
-            gate["error_kind"] = execution.get("error_kind")
-        # 同 tool_execution：时钟在 finally 里结算，退出 with 之后再取
-        budget_updates = gate.get("budget_updates") or {}
+            },
+            context={"chart_id": chart_id},
+        )
     except BudgetExceeded as exceeded:
         # 预算耗尽属于环境类失败：重画同一张图不会好转，因此**不允许**
         # 进入 plot_repair 循环（那会为了重试而再次尝试启动容器）。
@@ -2150,18 +1959,6 @@ def plot_execution_node(
         # 用既有的 plot_retry_count 表达"不再重试"，而不是新增 state 字段：
         # 未在 InsightFlowState 里声明的键会被 LangGraph 静默丢掉，
         # 那样路由读不到标志，还是会把流程送进 plot_repair。
-        log_event(
-            run_id=run_id or "unknown",
-            node="plot_execution",
-            event="budget_exceeded",
-            status="failed",
-            details={
-                "scope": exceeded.scope,
-                "used": exceeded.used,
-                "limit": exceeded.limit,
-                "chart_id": chart_id,
-            },
-        )
         previous_results = [
             result
             for result in state.get("visualization_results", [])
@@ -2182,6 +1979,9 @@ def plot_execution_node(
             # 置满重试计数 → route_after_plot_execution 直接走 advance_chart
             "plot_retry_count": MAX_PLOT_RETRIES,
         }
+    else:
+        execution = outcome.execution
+        budget_updates = outcome.budget_updates
 
     visualization_result = {
         "chart_id": chart_id,
@@ -2423,7 +2223,7 @@ def plot_repair_node(
     # 与 repair 同理：本次绘图修复的身份由入站 plot_retry_count 决定。
     plot_repair_attempt = state.get("plot_retry_count", 0)
 
-    repaired_code, _ops, _extra = _governed_agent_call(
+    repaired_code, _ops, _extra = HARNESS.model_call(
         "plot_repair",
         attempt_subject(chart_id, plot_repair_attempt),
         lambda: repair_plot_code(
@@ -2465,6 +2265,6 @@ def plot_repair_node(
         "plot_retry_count": plot_retry_count,
         "completed_operations": _ops,
         # P3-A：绘图修复是一个独立的有界循环，也计入总轮次。
-        **_round_update(node="plot_repair"),
+        **HARNESS.note_round(state),
         **_extra,
     }

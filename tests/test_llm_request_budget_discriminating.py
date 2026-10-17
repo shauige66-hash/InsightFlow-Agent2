@@ -3,7 +3,7 @@
 覆盖四种情形，全部走生产路径：
 
     run_agent_call → utils.llm_retry 的 before_request / on_request
-                   → nodes._register_request_hooks 的钩子
+                   → harness.llm_gateway 安装的钩子
                    → agent_loop.check_llm_budget / consume_llm_call
 
 - 一次逻辑调用内 2 次请求：不提前耗尽、用量等于真实请求数；
@@ -26,6 +26,7 @@ from typing import Any
 
 import pytest
 
+import harness
 from core.runtime import RunRuntime, use_runtime
 from utils import agent_loop as al
 from utils.agent_loop import BUDGET_FIELD, BudgetExceeded, initialize
@@ -103,13 +104,13 @@ def governed_call(state: dict[str, Any], chain: Any, *, attempt: int = 1):
         subject=f"task_1#r{attempt}",
         call=call,
         attempt=attempt,
-        before_request=nodes._budget_guard,
+        before_request=harness.get_harness().llm.budget_guard,
     )
 
 
 @pytest.fixture
 def node_state(monkeypatch: pytest.MonkeyPatch):
-    """让 `nodes._budget_guard` 读到本用例的 state。
+    """让 `harness.get_harness().llm.budget_guard` 读到本用例的 state。
 
     生产里这份 state 由 `nodes._with_state` 放进 ContextVar；这里替换同一个
     ContextVar，从而在不启动图的前提下驱动真实钩子。
@@ -117,7 +118,7 @@ def node_state(monkeypatch: pytest.MonkeyPatch):
     import nodes
 
     var: contextvars.ContextVar = contextvars.ContextVar("test_current_state")
-    monkeypatch.setattr(nodes, "_CURRENT_STATE", var)
+    monkeypatch.setattr(harness.runtime, "CURRENT_STATE", var)
     return var
 
 
@@ -238,7 +239,7 @@ class TestConcurrentRunsKeepSeparateCounts:
                     on_request=al.after_model_request,
                 )
 
-            token = nodes._CURRENT_STATE.set(state)
+            token = harness.runtime.CURRENT_STATE.set(state)
             try:
                 run_agent_call(
                     state,
@@ -246,7 +247,7 @@ class TestConcurrentRunsKeepSeparateCounts:
                     subject="task_1#r1",
                     call=call,
                     attempt=1,
-                    before_request=nodes._budget_guard,
+                    before_request=harness.get_harness().llm.budget_guard,
                 )
                 results[name] = al.usage_of(state)["llm_calls"]
             except BaseException as error:  # noqa: BLE001
@@ -256,7 +257,7 @@ class TestConcurrentRunsKeepSeparateCounts:
                 except Exception:  # noqa: BLE001
                     pass
             finally:
-                nodes._CURRENT_STATE.reset(token)
+                harness.runtime.CURRENT_STATE.reset(token)
 
         with ThreadPoolExecutor(max_workers=2) as pool:
             futures = [pool.submit(worker, name) for name in ("a", "b")]

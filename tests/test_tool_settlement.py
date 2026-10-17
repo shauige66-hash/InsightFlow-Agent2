@@ -23,6 +23,7 @@ from core.runtime import McpSettings
 from ingestion.resources import ResourceResolver
 from services.analysis_service import run_analysis
 from utils import agent_loop as al
+from harness import tool_dispatcher
 from utils.middleware import governed_tool_call
 
 from tests.test_e2e_business_scenarios import (
@@ -158,7 +159,9 @@ class TestCallSiteReadsTheSettledValue:
         import nodes
 
         step_clock(monkeypatch)
-        real = nodes.governed_tool_call
+        from harness import tool_dispatcher
+
+        real = tool_dispatcher.governed_tool_call
         captured: dict[str, Any] = {}
 
         @contextmanager
@@ -169,7 +172,7 @@ class TestCallSiteReadsTheSettledValue:
             # 出块之后 gate 里才是结算后的那份
             captured["after"] = copy.deepcopy(gate.get("budget_updates") or {})
 
-        monkeypatch.setattr(nodes, "governed_tool_call", spy)
+        monkeypatch.setattr(tool_dispatcher, "governed_tool_call", spy)
 
         source = build_csv(tmp_path / "sales.csv")
         result = run_settlement_workflow(
@@ -205,7 +208,7 @@ class TestToolPathsCloseTheClock:
     ) -> None:
         """节点返回的增量里 clock_open 必须是结算后的 False。
 
-        端到端受影响被后续的模型调用掩盖（`_governed_agent_call` 会重新结算
+        端到端受影响被后续的模型调用掩盖（Harness 的下一次模型调用会重新结算
         一次），因此这里直接检查节点交给 LangGraph 的那份增量。
         """
         import nodes
@@ -214,7 +217,7 @@ class TestToolPathsCloseTheClock:
         from utils.agent_loop import initialize as init_budget
 
         step_clock(monkeypatch)
-        monkeypatch.setattr(nodes, "invoke_tool", fake_tool())
+        monkeypatch.setattr(tool_dispatcher, "invoke_tool", fake_tool())
 
         source = build_csv(tmp_path / "sales.csv")
         state: dict[str, Any] = {
@@ -254,7 +257,7 @@ class TestToolPathsCloseTheClock:
         import nodes
 
         step_clock(monkeypatch)
-        monkeypatch.setattr(nodes, "invoke_tool", fake_tool())
+        monkeypatch.setattr(tool_dispatcher, "invoke_tool", fake_tool())
 
         source = build_csv(tmp_path / "sales.csv")
         result = run_settlement_workflow(

@@ -22,12 +22,12 @@
 **模型调用不在这里。** 它必须与幂等登记、账本的 `started`/`completed`、
 以及"未确认调用需人工裁决"的拦截协同，那些逻辑集中在
 `utils/idempotency.run_agent_call`；预算闸门以 `before_request` 回调的形式
-接进那条路径（见 `nodes._governed_agent_call` 与
+接进那条路径（见 `harness.llm_gateway` 与
 `utils/agent_loop.before_model_request`）。
 
 早期这里还有 `governed_llm_call()`、`record_round()` 与 `merge_budget()`，
 都没有生产调用方：前两个与真正生效的路径重复（轮次计数走
-`nodes._round_update` → `agent_loop.consume_round`），第三个只有测试在用。
+`harness.policy.count_round`），第三个只有测试在用。
 两套并行实现会让人误以为它们参与了治理，已删除。
 """
 
@@ -100,7 +100,7 @@ def governed_tool_call(
     `finally` 里同时就地写入传入的 `state`。工具调用一旦开始就已经消耗了
     额度，调用方若在写回之前抛异常（例如 `resolve_tables` 失败），只有就地
     写入才能让这次消耗留在 state 上，不会因为一次崩溃白拿一次额度。这与
-    模型请求计数钩子（`nodes._register_request_hooks`）的做法一致。
+    模型请求计数钩子（`harness.llm_gateway`）的做法一致。
     """
     check(state)
 

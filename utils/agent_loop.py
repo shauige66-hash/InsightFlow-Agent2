@@ -430,7 +430,7 @@ def check_llm_budget(state: dict[str, Any]) -> None:
 
     只看 `llm_calls`：这一次请求额外消耗的是一个模型调用额度，不该因为
     工具调用或时间预算刚好用尽而被拒绝——那些分项在各自的入口判定
-    （`governed_tool_call` 与 `_round_update` 走完整的 `check`）。
+    （`governed_tool_call` 与轮次入口走完整的 `check`）。
 
     计数的写入点在每次请求**发出之前**，因此同一次逻辑调用内部的重试
     读到的就是"已经发过几次"，这里只比较、不再额外加一。
@@ -490,13 +490,13 @@ def consume_llm_call(state: dict[str, Any]) -> dict[str, Any]:
 # 模型请求钩子：让 Agent 层能在**每次真实请求**前后判预算与计数
 # ---------------------------------------------------------------------------
 
-#: 请求发出前的判定钩子。由节点层注册（那里的 `_budget_guard` 知道如何
-#: 取当前 state）。用注册表而不是让 Agent 直接 import 节点模块，是为了
-#: 避免 Agent → nodes → Agent 的循环依赖。
+#: 请求发出前的判定钩子。由 Harness 注册（它知道如何取当前 state）。
+#: 用注册表而不是让 Agent 直接 import 节点模块，是为了避免
+#: Agent → nodes → Agent 的循环依赖。
 _before_request_hook: Any = None
 _on_request_hook: Any = None
 
-#: 取当前 Run 的 state 的函数，同样由节点层注册。
+#: 取当前 Run 的 state 的函数，同样由 Harness 注册。
 _state_provider: Any = None
 
 

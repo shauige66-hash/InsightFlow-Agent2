@@ -22,6 +22,7 @@ from typing import Any
 
 import pytest
 
+import harness
 from core.runtime import RunRuntime, use_runtime
 from utils import agent_loop as al
 from utils.agent_loop import BUDGET_FIELD, BudgetExceeded, initialize
@@ -74,14 +75,14 @@ class TestConcurrentRunsDoNotShareBudgets:
                     state[BUDGET_FIELD] = updates[BUDGET_FIELD]
                 return {"count": al.usage_of(state)["llm_calls"]}
 
-            token = nodes._CURRENT_STATE.set(state)
+            token = harness.runtime.CURRENT_STATE.set(state)
             try:
                 payload, _ops, _extra = run_agent_call(
                     state,
                     node="planner",
                     subject=f"{run_id}#0",
                     call=call,
-                    before_request=nodes._budget_guard,
+                    before_request=harness.get_harness().llm.budget_guard,
                 )
                 counted[run_id] = int(payload["count"])
             except BaseException as error:  # noqa: BLE001
@@ -91,7 +92,7 @@ class TestConcurrentRunsDoNotShareBudgets:
                 except Exception:  # noqa: BLE001
                     pass
             finally:
-                nodes._CURRENT_STATE.reset(token)
+                harness.runtime.CURRENT_STATE.reset(token)
 
         with ThreadPoolExecutor(max_workers=2) as pool:
             first = pool.submit(worker, "scope-a", 1)
@@ -122,14 +123,14 @@ class TestConcurrentRunsDoNotShareBudgets:
                 state[BUDGET_FIELD] = updates[BUDGET_FIELD]
                 return {"ok": True}
 
-            token = nodes._CURRENT_STATE.set(state)
+            token = harness.runtime.CURRENT_STATE.set(state)
             try:
                 run_agent_call(
                     state,
                     node="planner",
                     subject=f"{run_id}#0",
                     call=call,
-                    before_request=nodes._budget_guard,
+                    before_request=harness.get_harness().llm.budget_guard,
                 )
                 outcomes[run_id] = "ran"
             except BudgetExceeded:
@@ -137,7 +138,7 @@ class TestConcurrentRunsDoNotShareBudgets:
             except BaseException as error:  # noqa: BLE001
                 errors.append(error)
             finally:
-                nodes._CURRENT_STATE.reset(token)
+                harness.runtime.CURRENT_STATE.reset(token)
 
         with ThreadPoolExecutor(max_workers=2) as pool:
             first = pool.submit(worker, "scope-zero", 0)

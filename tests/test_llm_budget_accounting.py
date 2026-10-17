@@ -1,6 +1,6 @@
 """P3 定点修复：模型调用计数的口径与请求计数作用域。
 
-审查怀疑 `nodes._budget_guard`、`_register_request_hooks` 与
+审查怀疑 `budget_guard`、请求计数钩子与
 `agent_loop.check_llm_budget` 之间存在重复累计。这里把口径固定下来：
 
 - 判定（`check_llm_budget`）只读，不改 state；
