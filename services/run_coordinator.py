@@ -153,6 +153,8 @@ class RunCoordinator:
         require_plan_approval: bool,
         require_report_approval: bool = False,
         mcp: McpSettings | None = None,
+        conversation_context: dict[str, Any] | None = None,
+        memories: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         from core.checkpoints import open_checkpointer
 
@@ -170,6 +172,8 @@ class RunCoordinator:
                 require_plan_approval=require_plan_approval,
                 require_report_approval=require_report_approval,
                 mcp=mcp,
+                conversation_context=conversation_context,
+                memories=memories,
             )
 
     def _finalize(self, run_id: str, result: dict[str, Any]) -> dict[str, Any]:
@@ -241,6 +245,8 @@ class RunCoordinator:
         require_plan_approval: bool = False,
         require_report_approval: bool = False,
         sql_backend: str = "direct",
+        conversation_context: dict[str, Any] | None = None,
+        memories: list[dict[str, Any]] | None = None,
     ) -> None:
         """登记并异步启动一次运行。
 
@@ -270,6 +276,8 @@ class RunCoordinator:
                     require_plan_approval=require_plan_approval,
                     require_report_approval=require_report_approval,
                     mcp=mcp,
+                    conversation_context=conversation_context,
+                    memories=memories,
                 )
                 return self._finalize(run_id, result)
             except Exception as error:  # noqa: BLE001 - 失败必须落到 Run 状态

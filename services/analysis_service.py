@@ -102,6 +102,8 @@ def run_analysis(
     resume_value: Any | None = None,
     mcp: McpSettings | None = None,
     budget: AgentBudget | dict[str, Any] | None = None,
+    conversation_context: dict[str, Any] | None = None,
+    memories: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """执行（或恢复）一次完整分析。
 
@@ -174,6 +176,12 @@ def run_analysis(
             "plan_attempts": 0,
             "plan_validation_errors": [],
             "approved_plan_fingerprint": None,
+            # H4：任务级证据按 task_id 累积；多轮上下文与长期记忆在首轮写入，
+            # 恢复时从 Checkpoint 读取，不重新检索也不需要重新注入。
+            "task_knowledge": {},
+            "knowledge_version": None,
+            "conversation_context": conversation_context,
+            "memories": list(memories or []),
         }
     elif continue_from_checkpoint:
         # 续跑时也必须把账本里的未确认调用注入：Checkpoint 不会记得上次进程

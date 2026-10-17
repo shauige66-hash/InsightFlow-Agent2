@@ -10,6 +10,7 @@ from fastapi import (
 from services.analysis_service import run_analysis
 from core.llm import build_model_factory
 from api_runs import register_run_routes
+from api_conversations import register_conversation_routes
 from pathlib import Path
 import shutil
 from utils.run_logger import create_run_id
@@ -56,6 +57,7 @@ app = FastAPI(
 
 # 持久化 Run 生命周期接口（创建 / 查询 / 恢复 / 审批）
 register_run_routes(app)
+register_conversation_routes(app)
 
 # 把 Agent 执行结果转换为 FastAPI 可以返回的 JSON 数据。
 def make_json_safe(
