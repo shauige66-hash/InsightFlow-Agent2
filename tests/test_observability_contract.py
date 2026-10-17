@@ -166,5 +166,10 @@ class TestNoPromptOrKeyMaterialIsLogged:
             "kept_tables",
             "excluded_tables",
             "history_entries",
+            # H4 增加：知识片段数、记忆条数、缓存是否命中。
+            # 都是计数或布尔值，不含任何正文。
+            "knowledge_chunks",
+            "memory_entries",
+            "knowledge_cache_hit",
         }
         assert "prompt" not in json.dumps(payload).lower()

@@ -9,6 +9,7 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+import uuid
 from pathlib import Path
 
 import pytest
@@ -411,7 +412,7 @@ class TestCheckpointResume:
 
         database = tmp_path / "customers.sqlite"
         build_database(database)
-        run_id = "pg-resume"
+        run_id = f"pg-resume-{uuid.uuid4().hex[:8]}"
         replies = {
             "planner": {
                 "tasks": [
@@ -464,7 +465,7 @@ class TestCheckpointResume:
 
         database = tmp_path / "customers.sqlite"
         build_database(database)
-        run_id = "pg-threads"
+        run_id = f"pg-threads-{uuid.uuid4().hex[:8]}"
         replies = {
             "planner": {
                 "tasks": [
