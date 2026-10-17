@@ -195,6 +195,12 @@ from rag.knowledge_service import build_and_retrieve_knowledge
 # 节点只解释结果。`BudgetExceeded` 仍要在模块级可用——`_with_state`
 # 包装器在导入期就把它写进 except 子句。
 from harness.runtime import bind_state, get_harness
+from planning import (
+    current_task,
+    plan_fingerprint,
+    validate_plan,
+    verify_approved_plan,
+)
 from utils.agent_loop import BUDGET_ERROR_KIND, BUDGET_FIELD, BudgetExceeded
 
 HARNESS = get_harness()
@@ -285,6 +291,34 @@ def knowledge_retrieval_node(
     }
 
 
+#: 首次规划 + 重新规划的总尝试次数。次数上限写进 state 的 `plan_attempts`，
+#: 恢复后从已用次数继续，因此崩溃不会换来新的重试额度。
+MAX_PLAN_ATTEMPTS = 3
+
+
+def _log_plan(
+    run_id: str | None,
+    event: str,
+    status: str,
+    validation: Any,
+    attempts: int,
+) -> None:
+    if run_id is None:
+        return
+    log_event(
+        run_id=run_id,
+        node="planner",
+        event=event,
+        status=status,
+        details={
+            "attempts": attempts,
+            "task_count": len(validation.tasks),
+            "categories": validation.categories,
+            "errors": [error.message for error in validation.errors][:5],
+        },
+    )
+
+
 @_with_state
 def planner_node(
     state: InsightFlowState
@@ -295,67 +329,152 @@ def planner_node(
         []
     )
 
-    plan, _ops, _extra = HARNESS.model_call(
-        "planner",
-        "plan",
-        lambda: create_analysis_plan(
-            contexts=state["data_context"],
-            analysis_focus=state.get(
-                "analysis_focus"
-            ),
-            retrieved_knowledge=retrieved_knowledge,
-            llm=model_for("planner"),
-        ),
-    )
-
     run_id = state.get("run_id")
 
+    # 计划必须落在本次 Run 的真实资源上：授权集合用快照的键，
+    # 来源类型决定现有路由能否用同一个工具执行。
+    authorized = set(state.get("data_context") or {})
+    source_types = {
+        name: snapshot.get("source_type")
+        for name, snapshot in (state.get("table_snapshot") or {}).items()
+        if isinstance(snapshot, dict)
+    }
+
+    attempts_used = int(state.get("plan_attempts") or 0)
+    feedback = list(state.get("plan_validation_errors") or [])
+    operations = dict(state.get("completed_operations") or {})
+    budget_extra: dict = {}
+
+    while attempts_used < MAX_PLAN_ATTEMPTS:
+        attempt_index = attempts_used
+        attempts_used += 1
+
+        # 每次重新规划是独立的逻辑调用：身份里带尝试序号，幂等层不会把
+        # 上一次被拒的计划当成这一次的结果复用。
+        plan, _ops, _extra = HARNESS.model_call(
+            "planner",
+            attempt_subject("plan", attempt_index),
+            lambda: create_analysis_plan(
+                contexts=state["data_context"],
+                analysis_focus=state.get(
+                    "analysis_focus"
+                ),
+                retrieved_knowledge=retrieved_knowledge,
+                validation_feedback=feedback,
+                llm=model_for("planner"),
+            ),
+            attempt=attempt_index + 1,
+        )
+        operations.update(_ops or {})
+        budget_extra = _extra or {}
+
+        validation = validate_plan(
+            plan,
+            authorized_tables=authorized,
+            source_types=source_types,
+        )
+
+        if validation.ok:
+            _log_plan(run_id, "plan_validated", "success", validation, attempts_used)
+
+            if validation.is_empty:
+                # 空计划意味着"没有可分析的任务"，不是失败。
+                return {
+                    "analysis_plan": [],
+                    "current_task_index": 0,
+                    "analysis_status": "no_tasks",
+                    "status_reason": "Planner 未生成任何分析任务",
+                    "plan_attempts": attempts_used,
+                    "plan_validation_errors": [],
+                    "completed_operations": operations,
+                    **_extra,
+                }
+
+            if run_id is not None:
+                log_event(
+                    run_id=run_id,
+                    node="planner",
+                    event="plan_created",
+                    status="success",
+                    details={
+                        "task_count": len(validation.tasks),
+                        "task_ids": [
+                            task["task_id"]
+                            for task in validation.tasks
+                        ],
+                        "retrieved_knowledge_count": len(
+                            retrieved_knowledge
+                        )
+                    }
+                )
+
+            return {
+                "analysis_plan": validation.tasks,
+                "current_task_index": 0,
+                "plan_attempts": attempts_used,
+                "plan_validation_errors": [],
+                "completed_operations": operations,
+                **_extra,
+            }
+
+        feedback = validation.feedback()
+        _log_plan(run_id, "plan_rejected", "failed", validation, attempts_used)
+
+        if attempts_used < MAX_PLAN_ATTEMPTS and run_id is not None:
+            log_event(
+                run_id=run_id,
+                node="planner",
+                event="replan_requested",
+                status="retrying",
+                details={
+                    "attempts": attempts_used,
+                    "categories": validation.categories,
+                },
+            )
+
+    # 次数用尽：不再生成计划，也不把无效计划交给 Router/Executor。
     if run_id is not None:
         log_event(
             run_id=run_id,
             node="planner",
-            event="plan_created",
-            status="success",
+            event="replan_exhausted",
+            status="failed",
             details={
-                "task_count": len(plan),
-                "task_ids": [
-                    task["task_id"]
-                    for task in plan
-                ],
-                "retrieved_knowledge_count": len(
-                    retrieved_knowledge
-                )
-            }
+                "attempts": attempts_used,
+                "categories": sorted({item.split("：")[0] for item in feedback})[:5],
+            },
         )
 
-    if not plan:
-        # 空计划意味着"没有可分析的产出"，不是成功。这里显式标注原因，
-        # 否则下游只能看到 failed_tasks == [] 而误判为分析完成。
-        return {
-            "analysis_plan": [],
-            "current_task_index": 0,
-            "analysis_status": "no_tasks",
-            "status_reason": "Planner 未产出任何分析任务",
-            "completed_operations": _ops,
-            **_extra,
-        }
-
     return {
-        "analysis_plan": plan,
+        "analysis_plan": [],
         "current_task_index": 0,
-        "completed_operations": _ops,
-        **_extra,
+        "analysis_status": "failed",
+        "status_reason": (
+            f"分析计划在 {attempts_used} 次尝试后仍未通过校验："
+            + "；".join(feedback[:3])
+        ),
+        "plan_attempts": attempts_used,
+        "plan_validation_errors": feedback,
+        "completed_operations": operations,
+        **budget_extra,
     }
-
 
 
 def router_node(
     state: InsightFlowState
 ) -> dict:
 
-    index = state["current_task_index"]
+    # 执行前确认：现在这份计划就是人工批准的那一份
+    verify_approved_plan(state)
 
-    task = state["analysis_plan"][index]
+    task = current_task(
+        state.get("analysis_plan"),
+        state.get("current_task_index"),
+    )
+
+    if task is None:
+        # 计划为空或索引越界都走这里：明确失败，而不是 IndexError
+        raise ValueError("路由阶段没有可执行任务：计划为空或索引越界")
 
     # 路由要按表的来源类型决定工具，因此资源名必须先过校验：
     # 不存在的表在这里被明确拒绝，而不是变成下游的 KeyError。
@@ -1462,6 +1581,8 @@ def approval_gate_node(
             # 明确告知：含 SQL 的任务同样只读，审批不会提升权限
             "contains_sql_tasks": bool(sql_task_ids),
             "sql_read_only_enforced": True,
+            # 人工批准的是这份计划的具体内容，不是一个模糊的"继续"
+            "plan_fingerprint": plan_fingerprint(plan),
         },
         "created_at": time.time(),
     }
@@ -1560,7 +1681,7 @@ def _apply_decision(
     else:
         reason = "分析计划未获批准"
 
-    return {
+    updates = {
         field: record_entry,
         "approvals": approvals,
         "pending_approval": None,
@@ -1568,6 +1689,14 @@ def _apply_decision(
         "analysis_status": None if approved else "failed",
         "status_reason": reason,
     }
+
+    if field == "plan_approval" and approved:
+        # 记住"批准的是这一份"，执行前比对；计划被换掉就不执行。
+        updates["approved_plan_fingerprint"] = plan_fingerprint(
+            state.get("analysis_plan") or []
+        )
+
+    return updates
 
 
 def report_publish_gate_node(

@@ -78,6 +78,14 @@ class InsightFlowState(TypedDict, total=False):
 
     analysis_plan: list[AnalysisTask]  # Planner Agent 生成的分析计划
 
+    # 计划校验与有界重新规划。`plan_attempts` 进 Checkpoint，因此恢复后
+    # 不会把次数限制重置；`plan_validation_errors` 是下一次重新规划的依据。
+    plan_attempts: int
+    plan_validation_errors: list[str]
+
+    # 计划获批时记下的内容指纹。执行前比对，避免审批后计划被换掉。
+    approved_plan_fingerprint: str | None
+
     current_task_index: int  # 当前正在执行的分析任务位置
 
     current_tool: Literal["python", "sql"] | None  # 选择的工具

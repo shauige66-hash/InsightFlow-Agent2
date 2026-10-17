@@ -72,6 +72,12 @@ PLANNER_PROMPT = """
 13. 每个任务必须包含
     task_id、description、target_tables、expected_output。
 
+14. 上一次计划被程序校验拒绝的原因（首次规划为“无”）：
+
+{validation_feedback}
+
+若上面列出了原因，本次必须针对这些原因修正，不要原样重复同一份计划。
+
 只返回合法 JSON，不要输出其他文字。
 
 {retry_hint}
@@ -95,6 +101,7 @@ def create_analysis_plan(
     contexts: dict[str, dict[str, Any]],
     analysis_focus: str | None = None,
     retrieved_knowledge: list[str] | None = None,
+    validation_feedback: list[str] | None = None,
     llm: BaseChatModel | None = None,
 ) -> list[AnalysisTask]:
 
@@ -128,7 +135,13 @@ def create_analysis_plan(
         "analysis_focus": (
             analysis_focus or "未指定"
         ),
-        "retrieved_knowledge": knowledge_text
+        "retrieved_knowledge": knowledge_text,
+        # 上一次计划被校验拒绝的原因；首次规划为空
+        "validation_feedback": (
+            "\n".join(f"- {item}" for item in validation_feedback)
+            if validation_feedback
+            else "无"
+        ),
     }
     # P4：按节点预算压缩上下文。
     # 不可压缩字段见 utils.context_budget.NODE_PRESERVE_FIELDS；

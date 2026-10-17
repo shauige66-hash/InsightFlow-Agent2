@@ -125,6 +125,24 @@ utils.llm_ledger           Docker sandbox / MCP client
 Harness 不重复实现账本、沙箱或 Checkpoint，只固定调用顺序与边界；
 `tests/test_harness_architecture.py` 用真实的图执行验证节点确实经过这两条入口。
 
+## 任务级上下文与计划校验
+
+**上下文按任务选，而不是按节点截断。** `harness/context_manager.py` 依据当前
+Agent 与当前任务挑出相关表：Planner 看全部授权资源（它要判断可行性），Executor、
+Repair、Critic、Refine 只看本任务的表，Plotter 只看图表关联的表。目标表必须是
+本次 Run 的真实资源名（`sales.orders`，不是 SQLite 内部的 `orders`），不存在的
+表会被明确拒绝。样本行有上限，schema 与行数原样保留——压掉列名只会让模型写出
+查不到的字段。
+
+**计划先校验，再执行。** `planning/validator.py` 不调用模型，只按结构化字段判断
+计划能否执行：任务形状、`task_id` 唯一性、目标表是否属于本次 Run、来源类型能否
+被现有路由落到单一工具（全 sqlite 走 SQL、全 DataFrame 走 Python）。校验失败时
+最多重新规划 3 次，次数随 Checkpoint 保存，恢复不会重新给满额度；用尽后以明确
+状态收尾，无效计划不会交给 Router 或 Executor。
+
+**审批的是具体的那份计划。** 审批记录里带计划的内容指纹，执行前比对；审批之后
+计划被替换会直接拒绝执行，而不是按另一份计划继续。
+
 ## 业务知识 Grounding
 
 InsightFlow 支持使用 Markdown、TXT 和 PDF 等业务知识文档，为数据分析过程提供业务语义和规则约束。
@@ -716,6 +734,27 @@ There is one budget, held in graph state as `execution_budget` and restored from
 checkpoint rather than reset. The harness does not reimplement the ledger, the sandbox
 or the checkpoint; it fixes the order and the boundaries. `tests/test_harness_architecture.py`
 drives a real workflow to verify that nodes actually go through these two entries.
+
+## Task-level Context and Plan Validation
+
+**Context is selected per task, not truncated per node.** `harness/context_manager.py`
+picks the tables that belong to the current agent and task: the planner sees every
+authorised resource (it has to judge feasibility), while the executor, repair, critic
+and refine see only their own task's tables and the plotter only the chart's. Target
+tables must be real resource names from the run (`sales.orders`, not the SQLite
+internal `orders`); unknown tables are refused. Sample rows are capped while schema
+and row counts are preserved — dropping column names only makes the model write
+queries for columns that do not exist.
+
+**Plans are validated before they run.** `planning/validator.py` calls no model; it
+checks structure, unique task ids, whether target tables belong to this run, and
+whether the source types can be routed to a single tool (all sqlite to SQL, all
+DataFrame to Python). A rejected plan is regenerated at most three times, the count
+lives in the checkpoint so a resume cannot refill it, and an exhausted plan ends the
+run with an explicit status instead of reaching the router.
+
+**Approval covers one specific plan.** The approval record carries a content
+fingerprint, checked again before execution; a plan swapped after approval is refused.
 
 ## Business Knowledge Grounding
 

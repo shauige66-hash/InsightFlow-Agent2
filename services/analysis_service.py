@@ -170,6 +170,10 @@ def run_analysis(
             "require_plan_approval": require_plan_approval,
             "require_report_approval": require_report_approval,
             "pending_llm_calls": list(runtime.unconfirmed_llm_calls),
+            # 计划校验与重新规划的次数随 Checkpoint 走，恢复后不会重置
+            "plan_attempts": 0,
+            "plan_validation_errors": [],
+            "approved_plan_fingerprint": None,
         }
     elif continue_from_checkpoint:
         # 续跑时也必须把账本里的未确认调用注入：Checkpoint 不会记得上次进程
