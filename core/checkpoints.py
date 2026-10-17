@@ -1,15 +1,17 @@
 """Checkpoint 存储。
 
-使用 LangGraph 自带的 SQLite Checkpointer：本地文件、零外部服务，
-适合单机部署；接口按 `BaseCheckpointSaver` 编程，将来换 PostgreSQL
-只需要替换这里的构造函数。
+两种后端，接口都是 LangGraph 的 `BaseCheckpointSaver`：
 
-持久化模式说明：
-- `SqliteSaver` 默认 `WRITE` 模式，每个 super-step 提交一次，
-  进程被强杀时最后一次提交之后的进度会丢失，恢复时从最后提交点继续。
-  这是"至少一次"而非"恰好一次"，因此副作用必须配幂等键（见 utils/idempotency.py）。
-- 数据库文件放在 V2 自己的 `outputs/` 下，不碰 ModelGate 的 PostgreSQL，
-  也不引入新的数据库服务。
+- **SQLite**（`local` 模式）：单文件、零外部服务，适合单机与测试；
+- **PostgreSQL**（`postgres` 模式）：用官方 `PostgresSaver`，不自己实现协议。
+
+SQLite 上的旧 Checkpoint **不会**自动迁移到 PostgreSQL：两种后端是不同的
+表结构与不同的写入方。切到 `postgres` 模式后，旧 Run 应当继续用 `local`
+模式读取，或者在明确知情的前提下重新开始——这里不会把一个不存在的 thread
+静默当成"没有进度"，`/runs/{id}` 会返回空状态，调用方能看出区别。
+
+副作用语义不变：每个 super-step 提交一次，进程被强杀时丢失最后一次提交之后
+的进度，因此写操作仍需幂等键（见 utils/idempotency.py）。
 """
 
 from __future__ import annotations
@@ -29,15 +31,39 @@ def checkpoint_path(root: Path | str = "outputs") -> Path:
     return Path(root) / "checkpoints" / "insightflow.sqlite"
 
 
+def _postgres_url() -> str | None:
+    """当前配置需要 PostgreSQL Checkpoint 时返回 libpq 连接串。"""
+    import storage
+
+    config = storage.current_config()
+    if not config.is_postgres:
+        return None
+    # LangGraph 的适配器用 psycopg 直连，不接受 SQLAlchemy 的 +psycopg 方言前缀
+    return storage.database_url().replace("postgresql+psycopg://", "postgresql://", 1)
+
+
 @contextmanager
 def open_checkpointer(
     path: Path | str | None = None,
+    *,
+    url: str | None = None,
 ) -> Iterator[BaseCheckpointSaver]:
-    """打开持久化 Checkpointer，退出时关闭连接。
+    """打开 Checkpointer，退出时关闭连接。
 
-    每次调用新建一个连接，因此"进程重启后重新打开同一个文件"就是真实的恢复路径，
+    每次调用新建连接，因此"进程重启后重新打开同一个存储"就是真实的恢复路径，
     而不是依赖进程内的内存状态。
     """
+    database_url = url or _postgres_url()
+
+    if database_url is not None:
+        from langgraph.checkpoint.postgres import PostgresSaver
+
+        with PostgresSaver.from_conn_string(database_url) as saver:
+            # 建表是幂等的；放在这里保证第一次使用时 schema 就绪
+            saver.setup()
+            yield saver
+        return
+
     database = Path(path) if path is not None else DEFAULT_CHECKPOINT_PATH
     database.parent.mkdir(parents=True, exist_ok=True)
 
@@ -46,10 +72,17 @@ def open_checkpointer(
 
 
 def list_checkpoint_threads(path: Path | str | None = None) -> list[str]:
-    """列出已有 checkpoint 的 thread_id。
+    """列出已有 checkpoint 的 thread_id（运维排查用）。"""
+    database_url = _postgres_url()
+    if database_url is not None:
+        import psycopg
 
-    用于运维排查：确认某个 run 是否有可恢复的状态。
-    """
+        with psycopg.connect(database_url) as connection:
+            rows = connection.execute(
+                "SELECT DISTINCT thread_id FROM checkpoints ORDER BY thread_id"
+            ).fetchall()
+        return [row[0] for row in rows]
+
     import sqlite3
 
     database = Path(path) if path is not None else DEFAULT_CHECKPOINT_PATH
@@ -61,3 +94,8 @@ def list_checkpoint_threads(path: Path | str | None = None) -> list[str]:
             "SELECT DISTINCT thread_id FROM checkpoints ORDER BY thread_id"
         ).fetchall()
     return [row[0] for row in rows]
+
+
+def checkpoint_backend() -> str:
+    """当前 Checkpoint 后端名，供健康检查与报告使用。"""
+    return "postgres" if _postgres_url() is not None else "sqlite"

@@ -22,6 +22,7 @@ from fastapi import APIRouter, FastAPI, HTTPException, status
 from pydantic import BaseModel, Field
 
 from core.checkpoints import open_checkpointer
+from services import storage_factory as _storage_factory
 from core.llm import build_model_factory
 from core.runtime import SqlBackend
 from services.analysis_service import read_run_state
@@ -64,7 +65,8 @@ def _ensure_singletons() -> tuple[RunStore, RunCoordinator]:
     global run_store, coordinator
 
     if run_store is None:
-        run_store = RunStore(OUTPUT_ROOT / "runs" / "runs.sqlite")
+        # 由存储模式决定：local 是 SQLite，postgres 是 PostgreSQL
+        run_store = _storage_factory.run_store(OUTPUT_ROOT)
     if coordinator is None:
         coordinator = RunCoordinator(
             run_store,

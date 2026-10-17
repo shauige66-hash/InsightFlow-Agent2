@@ -143,6 +143,58 @@ Repair、Critic、Refine 只看本任务的表，Plotter 只看图表关联的�
 **审批的是具体的那份计划。** 审批记录里带计划的内容指纹，执行前比对；审批之后
 计划被替换会直接拒绝执行，而不是按另一份计划继续。
 
+## 任务级检索、持久化与多轮对话
+
+**知识按任务检索，而不是每次把整个知识库塞进 Prompt。** 规划前仍做一次全局
+检索让 Planner 理解业务术语；计划通过校验后，每个任务用自己的问句
+（描述 + 期望产出 + 目标表 + 分析重点 + 上一轮问题）检索一次。同一任务的
+Executor、Repair、Critic、Refine 复用这批证据，不重复检索。检索结果带
+`chunk_id`、文档、页码、分数、`knowledge_version` 与 embedding 模型版本，
+报告末尾的来源附录由这些证据生成，不是让模型复述。
+
+分数方向统一为"越大越相关"：进程内索引返回余弦相似度，pgvector 的余弦距离
+在检索层换算成 `1 - distance`。两条路径共用绝对阈值，另外要求不低于最高分的
+75%，否则一个小知识库里所有片段都会过线，"按任务检索"就退化成"人人一份"。
+
+**两种运行模式**（`INSIGHTFLOW_STORAGE`）：
+
+| | `local`（默认） | `postgres` |
+|---|---|---|
+| Run 登记 | SQLite 文件 | PostgreSQL `runs` 表 |
+| LangGraph Checkpoint | SQLite 文件 | 官方 `PostgresSaver` |
+| 知识索引 | 进程内向量库 | pgvector 表 + hnsw 索引 |
+| 会话 / 长期记忆 | 同一个 SQLite 文件 | PostgreSQL 表 |
+| Redis 缓存 | 可选 | 可选 |
+
+SQLite 模式的旧 Checkpoint 不会被自动迁移到 PostgreSQL：两者表结构不同，
+切换后旧 Run 应当继续用 `local` 模式读取。这里不会把不存在的 thread 静默
+当成"没有进度"。
+
+**缓存只缓存可重算的东西。** Redis 存查询向量与检索结果，键包含命名空间、
+知识版本、问句哈希、embedding 模型版本、`top_k`、阈值与后端；文档一变版本就变，
+旧键自然失效。Redis 不可用时回退到持久化索引，但来源缺失、权限不符这类问题
+在进缓存之前就抛错，不会被降级绕过。
+
+**会话与记忆是两套东西。** `conversation_sessions/turns/messages` 记录说过什么，
+`long_term_memories` 只存经用户确认、可跨会话复用的偏好与定义。新消息创建新的
+Turn 与新的 Run；`resume` 只用于继续同一个 Run 的 HITL / Checkpoint。轮次的
+展示状态从权威 Run 存储同步，反向不成立；助手消息只在报告真实存在时写入。
+
+记忆写入默认是候选，确认后才注入上下文；明显包含凭据或过长（更像一次分析
+结果）的内容会被拒绝。当前没有真实身份认证，`owner` 来自服务端配置的单用户
+演示标识——多用户部署必须换成可信身份来源。
+
+### 本地依赖
+
+```bash
+docker compose -f deploy/compose.yaml up -d     # PostgreSQL 16 + pgvector、Redis 7
+cp .env.example .env                            # 按需填写模型网关与存储配置
+```
+
+compose 使用 5433 / 6380，避开本机常见的 5432；`insightflow/insightflow` 是
+本地开发默认凭据，不是可直接用于部署的密码。存储健康检查：
+`GET /storage/health`。
+
 ## 业务知识 Grounding
 
 InsightFlow 支持使用 Markdown、TXT 和 PDF 等业务知识文档，为数据分析过程提供业务语义和规则约束。
