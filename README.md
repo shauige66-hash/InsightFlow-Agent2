@@ -306,21 +306,29 @@ InsightFlow 会自动完成：
 ## 项目结构
 
 ```text
-insightflow-agent/
+insightflow-agent2/
 ├── agents/        # 各类分析 Agent
+├── agent_loop/    # 运行期观察、动作决策与策略校验
+├── planning/      # 计划校验、初始重规划、运行期计划修订
+├── harness/       # 执行治理：模型调用、工具派发、预算、上下文选择
 ├── context/       # 自适应数据上下文
 ├── ingestion/     # CSV / Excel / SQLite 数据加载
 ├── knowledge/     # 示例业务知识
-├── rag/           # Business Knowledge RAG
+├── rag/           # 业务知识检索、证据与缓存
+├── storage/       # 会话、长期记忆、知识索引与迁移
 ├── mcp_bridge/    # MCP Server / Client（stdio）与 Run 级数据授权
 ├── sandbox/       # Docker 执行沙箱（镜像、宿主执行器、容器入口）
-├── services/      # 分析服务层
+├── services/      # 分析、会话、记忆与知识服务层
 ├── tools/         # Python / SQL / Plot 工具
 ├── utils/         # 报告、重试等通用工具
 ├── docs/          # 架构说明
+├── deploy/        # docker compose（PostgreSQL + pgvector、Redis）
 ├── data/          # 示例数据
 ├── api.py         # FastAPI 入口
+├── api_runs.py    # Run 接口
+├── api_conversations.py  # 会话与长期记忆接口
 ├── main.py        # CLI Demo 入口
+├── conditions.py  # 条件路由
 ├── nodes.py       # LangGraph 节点
 ├── state.py       # 工作流共享状态
 └── workflow.py    # LangGraph 工作流定义
@@ -328,35 +336,55 @@ insightflow-agent/
 
 主要模块职责：
 
-- `agents/`：负责分析规划、代码生成、错误修复、结果验证、结果优化和可视化规划
+- `agents/`：负责分析规划、代码生成、错误修复、结果验证、结果优化、可视化与报告撰写
+- `agent_loop/`：负责运行期观察、动作决策与确定性策略校验
+- `planning/`：负责计划校验、初始重规划与运行期计划修订
+- `harness/`：所有模型与工具调用、预算、上下文选择与度量的唯一入口
+- `storage/`：负责会话、长期记忆、知识索引与数据库迁移
 - `ingestion/`：负责加载 CSV、Excel 和 SQLite 数据
 - `context/`：负责生成适合 Agent 使用的数据上下文
 - `rag/`：负责业务知识文档加载、切分、Embedding、检索、相关性过滤和缓存
 - `tools/`：负责 Python、SQL 和绘图代码的调用与结果归一化
 - `sandbox/`：负责 Python 与绘图代码的容器化执行（镜像构建、宿主侧执行器、容器入口）
-- `services/`：封装完整分析流程，供 CLI 和 FastAPI 共同调用
+- `services/`：封装分析、会话、记忆与知识服务，供 CLI 和 FastAPI 共同调用
+- `mcp_bridge/`：MCP Server / Client（stdio）与 Run 级数据授权
+- `profiling/`：数据画像与 schema 推断
+- `deploy/`：本地开发依赖的 docker compose
 - `nodes.py`：定义 LangGraph 工作流中的节点逻辑
+- `conditions.py`：条件路由（含动态决策的开关分支）
 - `workflow.py`：负责节点连接、条件路由和工作流构建
 - `state.py`：定义各 Agent 共享的工作流状态
 - `api.py`：提供 FastAPI 接口
-- `main.py`：提供本地 Demo 启动入口## 项目结构
+- `api_runs.py`：Run 创建、查询、恢复与审批接口
+- `api_conversations.py`：会话、轮次与长期记忆接口
+- `main.py`：提供本地 Demo 启动入口
+
+## 项目结构
 
 ```text
-insightflow-agent/
+insightflow-agent2/
 ├── agents/        # 各类分析 Agent
+├── agent_loop/    # 运行期观察、动作决策与策略校验
+├── planning/      # 计划校验、初始重规划、运行期计划修订
+├── harness/       # 执行治理：模型调用、工具派发、预算、上下文选择
 ├── context/       # 自适应数据上下文
 ├── ingestion/     # CSV / Excel / SQLite 数据加载
 ├── knowledge/     # 示例业务知识
-├── rag/           # Business Knowledge RAG
+├── rag/           # 业务知识检索、证据与缓存
+├── storage/       # 会话、长期记忆、知识索引与迁移
 ├── mcp_bridge/    # MCP Server / Client（stdio）与 Run 级数据授权
 ├── sandbox/       # Docker 执行沙箱（镜像、宿主执行器、容器入口）
-├── services/      # 分析服务层
+├── services/      # 分析、会话、记忆与知识服务层
 ├── tools/         # Python / SQL / Plot 工具
 ├── utils/         # 报告、重试等通用工具
 ├── docs/          # 架构说明
+├── deploy/        # docker compose（PostgreSQL + pgvector、Redis）
 ├── data/          # 示例数据
 ├── api.py         # FastAPI 入口
+├── api_runs.py    # Run 接口
+├── api_conversations.py  # 会话与长期记忆接口
 ├── main.py        # CLI Demo 入口
+├── conditions.py  # 条件路由
 ├── nodes.py       # LangGraph 节点
 ├── state.py       # 工作流共享状态
 └── workflow.py    # LangGraph 工作流定义
@@ -364,17 +392,27 @@ insightflow-agent/
 
 主要模块职责：
 
-- `agents/`：负责分析规划、代码生成、错误修复、结果验证、结果优化和可视化规划
+- `agents/`：负责分析规划、代码生成、错误修复、结果验证、结果优化、可视化与报告撰写
+- `agent_loop/`：负责运行期观察、动作决策与确定性策略校验
+- `planning/`：负责计划校验、初始重规划与运行期计划修订
+- `harness/`：所有模型与工具调用、预算、上下文选择与度量的唯一入口
+- `storage/`：负责会话、长期记忆、知识索引与数据库迁移
 - `ingestion/`：负责加载 CSV、Excel 和 SQLite 数据
 - `context/`：负责生成适合 Agent 使用的数据上下文
 - `rag/`：负责业务知识文档加载、切分、Embedding、检索、相关性过滤和缓存
 - `tools/`：负责 Python、SQL 和绘图代码的调用与结果归一化
 - `sandbox/`：负责 Python 与绘图代码的容器化执行（镜像构建、宿主侧执行器、容器入口）
-- `services/`：封装完整分析流程，供 CLI 和 FastAPI 共同调用
+- `services/`：封装分析、会话、记忆与知识服务，供 CLI 和 FastAPI 共同调用
+- `mcp_bridge/`：MCP Server / Client（stdio）与 Run 级数据授权
+- `profiling/`：数据画像与 schema 推断
+- `deploy/`：本地开发依赖的 docker compose
 - `nodes.py`：定义 LangGraph 工作流中的节点逻辑
+- `conditions.py`：条件路由（含动态决策的开关分支）
 - `workflow.py`：负责节点连接、条件路由和工作流构建
 - `state.py`：定义各 Agent 共享的工作流状态
 - `api.py`：提供 FastAPI 接口
+- `api_runs.py`：Run 创建、查询、恢复与审批接口
+- `api_conversations.py`：会话、轮次与长期记忆接口
 - `main.py`：提供本地 Demo 启动入口
 
 ## API 接口
@@ -1109,7 +1147,7 @@ vs correctness) and `faults.json`.
 ## Project Structure
 
 ```text
-insightflow-agent/
+insightflow-agent2/
 ├── agents/
 │   ├── planner.py
 │   ├── executor.py
@@ -1117,7 +1155,21 @@ insightflow-agent/
 │   ├── repair.py
 │   ├── refine.py
 │   ├── visualizer.py
-│   └── plot_repair.py
+│   ├── plotter.py
+│   ├── plot_repair.py
+│   └── reporter.py
+│
+├── harness/
+│   ├── runtime.py
+│   ├── llm_gateway.py
+│   ├── tool_dispatcher.py
+│   ├── policy.py
+│   ├── context_manager.py
+│   └── context_sources.py
+│
+├── profiling/
+│   ├── profiler.py
+│   └── schema.py
 │
 ├── context/
 │   └── context_builder.py
@@ -1209,7 +1261,9 @@ insightflow-agent/
 │
 ├── api.py
 ├── api_runs.py
+├── api_conversations.py
 ├── main.py
+├── conditions.py
 ├── nodes.py
 ├── state.py
 ├── workflow.py
