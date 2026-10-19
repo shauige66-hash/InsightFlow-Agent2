@@ -40,59 +40,37 @@ InsightFlow 是一个基于 LangGraph 和 LangChain 构建的 Agentic 数据分�
 
 ## Agentic 工作流
 
-![InsightFlow Architecture](./docs/assets/insightflow-architecture-zh.png)
+> 图由 `docs/architecture.md` 的同一份结构维护；改动图请直接改这里，不要再引入图片副本。
 
-```text
-数据文件 + 业务知识
-        |
-        v
-     数据加载
-        |
-        v
-   自适应数据上下文
-        |
-        v
-    业务知识 RAG
-        |
-        v
-      Planner
-        |
-        v
- Python / SQL Router
-        |
-        v
-      Executor
-        |
-        v
-    Tool Execution
-      /        \
-    失败        成功
-     |          |
-     v          v
-   Repair      Critic
-     |        /      \
-     |      不通过     通过
-     |       |          |
-     +----> Refine      |
-              \         /
-               v       v
-               下一任务
-                  |
-                  v
-          Visualization Planner
-                  |
-                  v
-            Plot Generation
-                  |
-                  v
-             Plot Execution
-                  |
-                  v
-                Report
-                  |
-                  v
-        Markdown / HTML / PDF
+```mermaid
+flowchart TD
+    IN["数据文件 / 业务知识 / 用户问题"] --> LOAD["loader：解析数据源，写表快照"]
+    LOAD --> CTX["context：数据上下文"]
+    CTX --> GLOBAL["knowledge：规划前全局检索"]
+    GLOBAL --> PLAN["planner：生成结构化任务"]
+    PLAN --> VALID{"计划校验：结构 / ID / 授权表 / 来源类型"}
+    VALID -- "不合法（最多 3 次）" --> PLAN
+    VALID -- "合法" --> NEED{"需要人工审批?"}
+    NEED -- "是" --> GATE["approval_gate：计划指纹 + 版本号"]
+    NEED -- "否" --> ROUTER["router：按来源选 SQL / Python"]
+    GATE -- "批准" --> ROUTER
+    GATE -- "拒绝" --> STOP["结束，不产出交付物"]
+    ROUTER --> EXEC["execution：任务级检索 + 生成代码"]
+    EXEC --> TOOL["tool_execution：Docker 沙箱 / MCP SQL（只读）"]
+    TOOL -- "执行错误" --> DECIDE
+    TOOL -- "成功" --> CRITIC["critic：结果是否回答任务"]
+    CRITIC --> DECIDE{"decide：观察 → 决策 → 策略校验"}
+    DECIDE -- "repair / refine / retrieve_more" --> EXEC
+    DECIDE -- "replan_remaining" --> REPLAN["runtime_replan：只改未执行任务"]
+    REPLAN --> ROUTER
+    DECIDE -- "continue / skip_task" --> ADVANCE["advance：推进到下一任务"]
+    ADVANCE --> ROUTER
+    ADVANCE -- "全部完成" --> VIZ["visualization_planner → plot"]
+    DECIDE -- "finish" --> VIZ
+    VIZ --> REPORT["report：含来源附录"]
+    REPORT --> ARTIFACT["artifact：md / html / pdf"]
 ```
+
 
 ## 运行时治理层（Harness）
 
@@ -770,59 +748,10 @@ Users can upload structured datasets and optional business knowledge documents. 
 
 ## Agentic Workflow
 
-![InsightFlow Architecture](docs/assets/insightflow-architecture.png)
+> The workflow diagram is kept in one place: see the **Agentic 工作流** section
+> above (rendered from the same graph) or [docs/architecture.md](docs/architecture.md)
+> for the layered view. Keeping a second copy is how the previous diagram went stale.
 
-```text
-Data Files + Business Knowledge
-              |
-              v
-        Data Ingestion
-              |
-              v
-       Adaptive Context
-              |
-              v
-    Business Knowledge RAG
-              |
-              v
-           Planner
-              |
-              v
-      Python / SQL Router
-              |
-              v
-          Executor
-              |
-              v
-        Tool Execution
-          /       \
-       Error      Success
-         |           |
-         v           v
-       Repair      Critic
-         |        /      \
-         |     Reject    Pass
-         |       |         |
-         +----> Refine     |
-                   \       /
-                    v     v
-                  Next Task
-                      |
-                      v
-          Visualization Planner
-                      |
-                      v
-             Plot Generation
-                      |
-                      v
-              Plot Execution
-                      |
-                      v
-                   Report
-                      |
-                      v
-         Markdown / HTML / PDF
-```
 
 ## Runtime Harness
 
@@ -1250,10 +1179,7 @@ insightflow-agent2/
 │   └── run_eval.py
 │
 ├── docs/
-│   ├── architecture.md
-│   └── assets/
-│       ├── insightflow-architecture.png
-│       └── insightflow-architecture-zh.png
+│   └── architecture.md
 │
 ├── data/
 │   ├── customers.csv
