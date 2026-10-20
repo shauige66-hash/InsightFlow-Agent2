@@ -484,6 +484,33 @@ python scripts/real_model_smoke.py  # 真实模型跑一次完整分析，打印
 `real_model_smoke.py` 成功后输出：运行状态、决策次数、模型请求数、工具调用数、
 报告路径、图表数量；失败时按原因给出下一步，而不是只丢一个堆栈。
 
+### 回归（可定时）
+
+模型行为会随提示词、版本与温度漂移，脚本化模型看不出这些。回归脚本用固定的
+问题与数据重复跑，并把指标记进历史：
+
+```bash
+python scripts/real_model_regression.py                   # 快用例（约 2 分钟）
+python scripts/real_model_regression.py --include-retail  # 加上 1.7 万行零售案例
+```
+
+每次输出与上一次的差异（`图表 2 → 3`、`模型请求 26 → 32`），状态非 `completed`
+或图表产出少于计划时返回非零退出码，可直接接定时任务。
+
+Windows 下已经注册了一个每天 02:00 的计划任务：
+
+```powershell
+# 手动触发一次
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\run_nightly.ps1
+
+# 查看 / 删除计划任务
+schtasks /Query /TN "InsightFlow Real-Model Regression"
+schtasks /Delete /TN "InsightFlow Real-Model Regression" /F
+```
+
+日志写在 `_local_audit` 目录（仓库外），按时间戳命名，含退出码与 stderr。
+它依赖本机 ModelGate 在运行；网关不在时回归会失败并记录原因，这本身也是要看的信号。
+
 ## 飞书通知（可选）
 
 配置一个群机器人地址后，Run 的状态变化会推送成卡片：分析完成、分析失败、以及"需要你确认"。
