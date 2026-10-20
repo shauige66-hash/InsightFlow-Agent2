@@ -74,7 +74,18 @@ def configure(workdir: Path, *, mock_llm: bool) -> None:
     run_db = workdir / "runs" / "runs.sqlite"
     checkpoint = workdir / "checkpoints.sqlite"
 
-    store = RunStore(run_db)
+    # 存储后端跟着配置走，不能在脚本里写死 SQLite：postgres 模式下若仍然用
+    # SQLite，Run 记录会落到工作目录，而 /storage/health 报的是 postgres——
+    # 两边不一致，排查时会被误导（真实部署时就踩到过）。
+    import storage
+    from services import storage_factory
+
+    if storage.current_config().is_postgres:
+        store = storage_factory.run_store(workdir)
+        checkpoint_arg = None  # 让协调器用默认的 PostgreSQL checkpointer
+    else:
+        store = RunStore(run_db)
+        checkpoint_arg = checkpoint
 
     factory_spec = os.environ.get("INSIGHTFLOW_MODEL_FACTORY")
     if factory_spec:
@@ -91,7 +102,7 @@ def configure(workdir: Path, *, mock_llm: bool) -> None:
     coordinator = RunCoordinator(
         store,
         output_root=workdir,
-        checkpointer_path=checkpoint,
+        checkpointer_path=checkpoint_arg,
         model_factory_builder=builder,
         # Server 模块、超时与私有目录由宿主固定；HTTP 请求只能选模式
         mcp_settings=McpSettings(),
@@ -100,7 +111,8 @@ def configure(workdir: Path, *, mock_llm: bool) -> None:
     api_runs.run_store = store
     api_runs.coordinator = coordinator
     api_runs.OUTPUT_ROOT = workdir
-    api_runs.CHECKPOINT_PATH = checkpoint
+    if checkpoint_arg is not None:
+        api_runs.CHECKPOINT_PATH = checkpoint_arg
 
 
 def main() -> int:

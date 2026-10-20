@@ -455,6 +455,9 @@ PUBLIC_STATE_FIELDS = (
     # 是必需信息，而两者都不包含数据行或模型提示词，可以安全外露。
     "decision_history",
     "execution_budget",
+    # 没能生成的图表：报告会列出来，接口也应当能看到——否则"少了一张图"
+    # 只能翻服务器日志。
+    "failed_charts",
 )
 
 
