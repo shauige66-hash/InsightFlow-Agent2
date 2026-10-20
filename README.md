@@ -439,6 +439,35 @@ INSIGHTFLOW_API_KEYS=key-for-alice:alice,key-for-bob:bob
 报告与图表路由保持公开：浏览器点链接时不会带 Authorization 头，而 run_id 是随机生成的，
 读不到别人的 id 就取不到内容。
 
+## 部署（Docker Compose）
+
+一套编排把 API、PostgreSQL(pgvector) 与 Redis 一起起来：
+
+```bash
+cp .env.example .env
+# 填 DEEPSEEK_API_KEY；要给别人用就再填 INSIGHTFLOW_API_KEYS（格式见上节）
+python -c "import secrets; print(secrets.token_urlsafe(24))"   # 生成 token
+
+docker compose -f deploy/compose.app.yaml up -d --build
+curl http://127.0.0.1:8080/health
+curl http://127.0.0.1:8080/storage/health   # 应显示 mode=postgres
+```
+
+默认只发布到 `127.0.0.1:8080`（`API_PORT` 可改）。对外提供服务时在前面加反向代理做
+HTTPS，不要把 8000 直接暴露到公网。
+
+数据落在三个命名卷：`pgdata`（数据库）、`outputs`（报告与图表）、`uploads`（用户上传）。
+
+**两个已知限制**（写在编排注释里，不藏着）：
+
+1. 分析代码在 Docker 沙箱里执行，容器内的 API 需要访问宿主 Docker 才能 `docker run`。
+   Linux 下把 `api.volumes` 里那行 `/var/run/docker.sock` 取消注释即可；Docker Desktop
+   （Windows/macOS）无法把 socket 传进容器，建议本机直接跑 API。
+2. 镜像**不装浏览器**。PDF 导出需要 Chrome/Edge/Chromium，容器里通常没有——
+   这时报告仍会产出 Markdown 与 HTML，只是没有 PDF，日志里记为 `degraded`。
+   要 PDF 就把 Chromium 装进镜像（`playwright install --with-deps chromium`），
+   代价是镜像大几百 MB。
+
 ## 飞书通知（可选）
 
 配置一个群机器人地址后，Run 的状态变化会推送成卡片：分析完成、分析失败、以及"需要你确认"。

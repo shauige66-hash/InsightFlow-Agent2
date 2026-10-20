@@ -1798,13 +1798,22 @@ def artifact_node(
         )
     )
 
-    pdf_path = save_pdf_report(
-        html_path,
-        output_path=str(
-            output_dir
-            / "analysis_report.pdf"
+    # PDF 导出依赖本机浏览器（Chrome/Edge/Playwright Chromium）。容器或精简环境
+    # 里可能一个都没有；那不该让整个分析在最后一步失败——Markdown 与 HTML 已经是
+    # 可交付的报告，缺一个 PDF 属于"降级",不是"失败"。
+    pdf_path = None
+    pdf_reason = None
+    try:
+        pdf_path = save_pdf_report(
+            html_path,
+            output_path=str(
+                output_dir
+                / "analysis_report.pdf"
+            )
         )
-    )
+    except Exception as error:  # noqa: BLE001 - 导出是尽力而为
+        pdf_reason = f"{type(error).__name__}: {error}"
+        pdf_path = None
 
     # 文件已全部落盘，但"已完成"登记还没提交到 Checkpoint。
     # 这一刻崩溃即可验证文件与 Checkpoint 的一致性边界。
@@ -1814,11 +1823,12 @@ def artifact_node(
         run_id=run_id,
         node="artifact",
         event="report_artifacts_saved",
-        status="success",
+        status="success" if pdf_path else "degraded",
         details={
             "markdown_path": markdown_path,
             "html_path": html_path,
-            "pdf_path": pdf_path
+            "pdf_path": pdf_path,
+            "pdf_skipped_reason": pdf_reason,
         }
     )
 
@@ -1856,11 +1866,7 @@ def artifact_node(
 
     artifacts = (
         previous_artifacts
-        + [
-            markdown_path,
-            html_path,
-            pdf_path
-        ]
+        + [path for path in (markdown_path, html_path, pdf_path) if path]
     )
 
     # 生命周期与产物登记一起写入同一个 state 增量，保证"完成"与"已登记"一致

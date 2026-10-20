@@ -1,0 +1,75 @@
+# 部署用编排：API + PostgreSQL(pgvector) + Redis。
+#
+#   cp .env.example .env        # 填 DEEPSEEK_API_KEY 与 INSIGHTFLOW_API_KEYS
+#   docker compose -f deploy/compose.app.yaml up -d --build
+#
+# 与 dev 的 deploy/compose.yaml 的区别：那份只起本地开发依赖，API 在你本机跑；
+# 这份把 API 也装进容器，用 PostgreSQL 存会话/记忆/知识，Redis 做检索缓存。
+#
+# 已知限制（写在 README 里，不藏着）：
+# 分析代码在 Docker 沙箱里执行，容器内的 API 需要访问宿主 Docker 才能 `docker run`。
+# Linux 下把下面 api.volumes 里的 docker.sock 取消注释即可；Windows/macOS 的
+# Docker Desktop 不支持把 socket 传进容器，建议本机直接跑 API，或用纯 SQL 分析。
+
+name: insightflow
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-insightflow}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-insightflow}
+      POSTGRES_DB: ${POSTGRES_DB:-insightflow}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-insightflow} -d ${POSTGRES_DB:-insightflow}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "no", "--save", ""]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  api:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      INSIGHTFLOW_STORAGE: postgres
+      INSIGHTFLOW_DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-insightflow}:${POSTGRES_PASSWORD:-insightflow}@postgres:5432/${POSTGRES_DB:-insightflow}
+      INSIGHTFLOW_REDIS_ENABLED: "true"
+      INSIGHTFLOW_REDIS_URL: redis://redis:6379/0
+      INSIGHTFLOW_OWNER: ${INSIGHTFLOW_OWNER:-local-demo}
+      # 留空即单用户演示模式；设置了就强制 Bearer 鉴权
+      INSIGHTFLOW_API_KEYS: ${INSIGHTFLOW_API_KEYS:-}
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
+      DEEPSEEK_BASE_URL: ${DEEPSEEK_BASE_URL:-https://api.deepseek.com/v1}
+      DEEPSEEK_MODEL: ${DEEPSEEK_MODEL:-deepseek-chat}
+      FEISHU_WEBHOOK_URL: ${FEISHU_WEBHOOK_URL:-}
+      FEISHU_SIGN_SECRET: ${FEISHU_SIGN_SECRET:-}
+    ports:
+      # 只绑回环：前面要放反向代理再对外
+      - "127.0.0.1:${API_PORT:-8080}:8000"
+    volumes:
+      - outputs:/app/outputs
+      - uploads:/app/uploads
+      # 需要容器内执行 Python 分析时在 Linux 上取消注释：
+      # - /var/run/docker.sock:/var/run/docker.sock
+    restart: unless-stopped
+
+volumes:
+  pgdata:
+  outputs:
+  uploads:
