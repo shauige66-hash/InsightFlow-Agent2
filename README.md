@@ -468,6 +468,22 @@ HTTPS，不要把 8000 直接暴露到公网。
    要 PDF 就把 Chromium 装进镜像（`playwright install --with-deps chromium`），
    代价是镜像大几百 MB。
 
+## 验证真实模型
+
+工程链路可以用脚本化模型验证，但"模型能不能把数据变成结论"只能由真实调用回答。
+两步：
+
+```bash
+python scripts/check_model.py       # 一次 4 token 的请求，区分 401 / 402 / 模型名错
+python scripts/real_model_smoke.py  # 真实模型跑一次完整分析，打印可核对的事实
+```
+
+`check_model.py` 会把失败原因翻译成人话：`401` 是 key 无效（与网络无关），
+`402` 是余额不足，`404` 多半是 base_url 少了 `/v1`。
+
+`real_model_smoke.py` 成功后输出：运行状态、决策次数、模型请求数、工具调用数、
+报告路径、图表数量；失败时按原因给出下一步，而不是只丢一个堆栈。
+
 ## 飞书通知（可选）
 
 配置一个群机器人地址后，Run 的状态变化会推送成卡片：分析完成、分析失败、以及"需要你确认"。
