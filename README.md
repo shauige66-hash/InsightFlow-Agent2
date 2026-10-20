@@ -8,6 +8,15 @@ InsightFlow 是一个基于 LangGraph 和 LangChain 构建的 Agentic 数据分�
 
 用户可以上传结构化数据集以及可选的业务知识文档。InsightFlow 能够自动理解数据、规划分析任务、选择执行工具、生成并执行代码、修复执行错误、验证分析逻辑、生成可视化结果，并最终输出完整分析报告。
 
+## 文档
+
+| 文档 | 内容 | 适合谁 |
+|---|---|---|
+| [技术说明书](docs/technical-spec.md)（[PDF](docs/technical-spec.pdf)） | 业务需求、功能实现、架构与选型理由、出错补救、工程化与安全、已知限制 | 负责人评审 |
+| [项目说明](docs/overview.md)（[PDF](docs/overview.pdf)） | 两页速览：问题、做法、证据、局限 | 面试 / 初次了解 |
+| [案例研究](docs/case-study.md) | 真实数据集上的业务场景、标准答案与对照实验 | 判断业务价值 |
+| [架构说明](docs/architecture.md) | 分层、节点路径、有界循环、存储模式 | 改代码前 |
+
 ## 核心能力
 
 - 支持 CSV、Excel 和 SQLite 多种数据源
