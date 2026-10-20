@@ -41,11 +41,22 @@ def test_options_list_the_seed_files() -> None:
     client = TestClient(api.app)
     payload = client.get("/ui-options").json()
 
-    assert "customers.csv" in payload["data_sources"]
-    assert "business_rules.md" in payload["knowledge_sources"]
-    # 只暴露固定目录里的文件名，不暴露绝对路径
+    assert "data/customers.csv" in payload["data_sources"]
+    assert "knowledge/business_rules.md" in payload["knowledge_sources"]
+    # 必须是相对项目根目录的 POSIX 路径：POST /runs 按工作目录解析
     for name in payload["data_sources"] + payload["knowledge_sources"]:
-        assert "/" not in name and "\\" not in name
+        assert not name.startswith("/")
+        assert ":" not in name
+        assert ".." not in name
+        assert "\\" not in name
+
+
+def test_options_reach_into_the_case_subdirectory() -> None:
+    """`data/retail/` 里的案例数据也要能被选到，否则界面上看不到。"""
+    client = TestClient(api.app)
+    payload = client.get("/ui-options").json()
+
+    assert "data/retail/orders_eu_2011.csv" in payload["data_sources"]
 
 
 def test_report_html_is_404_for_an_unknown_run() -> None:
@@ -53,3 +64,21 @@ def test_report_html_is_404_for_an_unknown_run() -> None:
     response = client.get("/runs/run_does_not_exist/report.html")
 
     assert response.status_code == 404
+
+
+class TestRunArtifactRoute:
+    """报告用相对路径引用图片，所以这个路由必须能取到它们——但不能变成任意读文件。"""
+
+    def test_a_missing_chart_is_404(self) -> None:
+        client = TestClient(api.app)
+        assert client.get("/runs/run_does_not_exist/chart_1.png").status_code == 404
+
+    def test_only_images_are_served(self) -> None:
+        client = TestClient(api.app)
+        assert client.get("/runs/run_x/analysis_report.html").status_code == 404
+        assert client.get("/runs/run_x/runs.sqlite").status_code == 404
+
+    def test_path_traversal_is_refused(self) -> None:
+        client = TestClient(api.app)
+        # 编码后的 ../ 由 Starlette 解码后进入路径参数；即使命中也不得读到目录外文件
+        assert client.get("/runs/run_x/..%2F..%2Fapi.py").status_code == 404

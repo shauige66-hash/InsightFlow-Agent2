@@ -287,3 +287,41 @@ class TestDefect5ConversationStartWindow:
             f"启动失败后轮次仍是 {turns[0]['status']}"
         )
         assert turns[0]["status_reason"]
+
+
+class TestDefect7ChartsMissingFromReport:
+    """图表生成了，报告里却没有引用它——读者看到的是一份没有图的"图文报告"。"""
+
+    def test_the_report_embeds_generated_charts(self) -> None:
+        import nodes
+
+        state = {
+            "visualization_results": [
+                {
+                    "chart_id": "chart_1",
+                    "title": "月度 GMV",
+                    "path": "outputs/run_x/chart_1.png",
+                }
+            ]
+        }
+
+        appendix = nodes._charts_appendix(state, "# 报告\n\n正文没有任何图片。")
+
+        assert "## 图表" in appendix
+        assert "![月度 GMV](chart_1.png)" in appendix
+
+    def test_a_referenced_chart_is_not_duplicated(self) -> None:
+        import nodes
+
+        state = {
+            "visualization_results": [
+                {"chart_id": "chart_1", "path": "outputs/run_x/chart_1.png"}
+            ]
+        }
+
+        assert nodes._charts_appendix(state, "正文已引用 ![图](chart_1.png)") == ""
+
+    def test_a_run_without_charts_adds_no_section(self) -> None:
+        import nodes
+
+        assert nodes._charts_appendix({}, "# 报告") == ""

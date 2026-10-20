@@ -72,24 +72,44 @@ _WEB_DIR = Path(__file__).resolve().parent / "web"
 _PROJECT_DIR = Path(__file__).resolve().parent
 
 
-def _list_relative(directory: Path, extensions: set[str]) -> list[str]:
-    """列出目录下（不递归）符合条件的相对路径，按名称排序。"""
+def _list_relative(
+    root: Path,
+    directory: Path,
+    extensions: set[str],
+    *,
+    limit: int = 200,
+) -> list[str]:
+    """列出目录下符合条件的文件，返回**相对项目根目录**的 POSIX 路径。
+
+    必须是相对项目根目录的路径：`POST /runs` 按服务进程的工作目录解析相对路径，
+    只给裸文件名（`customers.csv`）会解析到仓库根目录而 400。
+    递归是为了让 `data/retail/` 这类子目录里的案例数据也能在界面上选到。
+    """
     if not directory.is_dir():
         return []
-    names = [
-        item.name
-        for item in sorted(directory.iterdir())
-        if item.is_file() and item.suffix.lower() in extensions
-    ]
-    return names
+
+    found: list[str] = []
+    for path in sorted(directory.rglob("*")):
+        if not path.is_file() or path.suffix.lower() not in extensions:
+            continue
+        relative = path.relative_to(root)
+        # 跳过隐藏目录/文件，避免把 .git 或临时目录暴露出去
+        if any(part.startswith(".") for part in relative.parts):
+            continue
+        found.append(relative.as_posix())
+        if len(found) >= limit:
+            break
+    return found
 
 
 @app.get("/ui-options")
 def ui_options() -> dict[str, list[str]]:
     """界面上可选的示例数据与知识文件。只读，且限定在两个固定目录内。"""
     return {
-        "data_sources": _list_relative(_PROJECT_DIR / "data", DATA_EXTENSIONS),
-        "knowledge_sources": _list_relative(_PROJECT_DIR / "knowledge", KNOWLEDGE_EXTENSIONS),
+        "data_sources": _list_relative(_PROJECT_DIR, _PROJECT_DIR / "data", DATA_EXTENSIONS),
+        "knowledge_sources": _list_relative(
+            _PROJECT_DIR, _PROJECT_DIR / "knowledge", KNOWLEDGE_EXTENSIONS
+        ),
     }
 
 
@@ -392,3 +412,30 @@ def download_report(
         media_type="application/pdf",
         filename=f"{run_id}_report.pdf"
     )
+
+# ------------------------------------------------------------------ 报告图片
+#
+# 报告正文用相对路径引用 `chart_1.png`：这样用文件方式打开 HTML（导出 PDF 时）
+# 也能显示图片；通过 HTTP 看报告时，相对路径会被解析成这个路由，所以服务端也
+# 必须能取到那些文件。
+#
+# 放在文件末尾是有意的：Starlette 按注册顺序匹配，earlier 的 `/runs/{run_id}/report`
+# 等字面路由必须先命中，否则会被这里的 `{filename}` 抢走。
+#
+# 只放行图片，且不接受任何路径分隔符——否则就成了"按 run_id 读任意文件"。
+
+@app.get("/runs/{run_id}/{filename}", include_in_schema=False)
+def run_artifact(run_id: str, filename: str) -> FileResponse:
+    import api_runs
+
+    name = filename.strip()
+    if not name or "/" in name or "\\" in name or ".." in name or name.startswith("."):
+        raise HTTPException(status_code=404, detail="不允许的文件名")
+    if Path(name).suffix.lower() not in {".png", ".svg", ".jpg", ".jpeg", ".webp"}:
+        raise HTTPException(status_code=404, detail="只提供图片产物")
+
+    candidate = Path(api_runs.OUTPUT_ROOT) / run_id / name
+    if not candidate.is_file():
+        raise HTTPException(status_code=404, detail=f"产物不存在：{name}")
+
+    return FileResponse(path=str(candidate))

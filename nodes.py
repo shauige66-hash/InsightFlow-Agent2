@@ -1545,6 +1545,29 @@ def _citations_appendix(state: InsightFlowState) -> str:
     return "\n".join(lines)
 
 
+def _charts_appendix(state: InsightFlowState, report: str) -> str:
+    """把生成的图表嵌进报告。
+
+    图表是工作流产出的真实文件，报告里却没有它们的引用时，读者只能看到一个
+    没有图的"图文报告"。模型有时会把图片写进正文，有时不会；这里兜底：只补
+    那些正文里还没提到的图，避免重复。
+    """
+    lines: list[str] = []
+    for item in state.get("visualization_results") or []:
+        path = item.get("path")
+        if not path:
+            continue
+        name = Path(str(path)).name
+        if name in report:
+            continue
+        title = item.get("title") or item.get("chart_id") or "图表"
+        lines.append(f"![{title}]({name})")
+
+    if not lines:
+        return ""
+    return "\n".join(["", "## 图表", "", *lines])
+
+
 @_with_state
 def report_node(
     state: InsightFlowState
@@ -1696,10 +1719,12 @@ def report_node(
 
     # 被引用的业务规则要能追到来源，因此附录由证据生成，而不是让模型复述
     appendix = _citations_appendix(state)
+    charts = _charts_appendix(state, report)
+    suffix = f"{appendix}{charts}"
 
     return {
         "report_content": (
-            f"{report.rstrip()}\\n{appendix}" if appendix else report
+            f"{report.rstrip()}\n{suffix}" if suffix else report
         ),
         "completed_operations": _ops,
         **_extra,
