@@ -355,3 +355,16 @@ class TestDefect8FailedChartsHidden:
 
         assert nodes._failed_charts_appendix({}) == ""
         assert nodes._failed_charts_appendix({"failed_charts": []}) == ""
+
+
+class TestFailedChartsReachTheState:
+    """`failed_charts` 必须写进真实 state。
+
+    上一轮只在节点里返回这个键，却没在 `InsightFlowState` 里声明——LangGraph 会
+    过滤掉未声明的键，报告于是依然不提失败的图表，而纯函数用例发现不了。
+    """
+
+    def test_the_state_schema_declares_failed_charts(self) -> None:
+        from state import InsightFlowState
+
+        assert "failed_charts" in InsightFlowState.__annotations__

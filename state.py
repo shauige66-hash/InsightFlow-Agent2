@@ -177,6 +177,11 @@ class InsightFlowState(TypedDict, total=False):
     plot_error: str | None  # 当前图表执行错误
     plot_retry_count: int  # 绘图失败后的修复次数
 
+    # 没能生成的图表（chart_id / 来源任务 / 原因）。
+    # 必须声明在这里：LangGraph 会丢弃 state 结构里没有的键，节点写进去等于没写，
+    # 报告于是永远不会提到"少了一张图"。
+    failed_charts: list[dict[str, Any]]
+
     # 副作用幂等登记：操作 ID -> 完成记录。恢复时据此判断某个副作用
     # 是否已经执行过，避免重复写文件或重复调用工具。
     completed_operations: dict[str, dict[str, Any]]

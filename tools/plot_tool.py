@@ -18,14 +18,16 @@ from utils.result_artifacts import to_jsonable
 
 CHART_ID_PATTERN = re.compile(r"[A-Za-z0-9\_-]+")
 
-# 沙箱已经注入了这些模块（pd / np / plt），但模型几乎总会先写一行
+# 沙箱已经注入了这些模块（pd / np / mtick / plt），但模型几乎总会先写几行
 # `import pandas as pd`——沙箱禁用 __import__，于是这类"完全等价的 import"
 # 会让绘图在第一步就失败。执行前把它们剥掉：限制没有放松（真正的动态导入仍被
 # 拒绝），只是不让一行多余的 import 毁掉整张图。
 _PROVIDED_IMPORTS = re.compile(
     r"^[ \t]*(?:"
-    r"import[ \t]+(?:pandas|numpy|matplotlib\.pyplot|matplotlib)(?:[ \t]+as[ \t]+\w+)?"
-    r"|from[ \t]+(?:pandas|numpy|matplotlib\.pyplot)(?:\.\w+)?[ \t]+import[ \t]+[\w, \t\*\(\)]+"
+    r"import[ \t]+(?:pandas|numpy|matplotlib\.ticker|matplotlib\.pyplot|matplotlib)"
+    r"(?:[ \t]+as[ \t]+\w+)?"
+    r"|from[ \t]+(?:pandas|numpy|matplotlib\.ticker|matplotlib\.pyplot)(?:\.\w+)?"
+    r"[ \t]+import[ \t]+[\w, \t\*\(\)]+"
     r")[ \t]*\r?\n?",
     re.MULTILINE,
 )

@@ -16,6 +16,7 @@ from typing import Any
 
 import pandas as pd
 import numpy as np
+import matplotlib.ticker as mtick
 
 # 可用的内置函数白名单。
 #
@@ -192,6 +193,7 @@ def build_plot_scope(
         "dfs": dfs,
         "pd": pd,
         "np": np,
+        "mtick": mtick,
         "plt": plt,
         "analysis_result": analysis_result,
         "result_df": build_result_dataframe(analysis_result),
