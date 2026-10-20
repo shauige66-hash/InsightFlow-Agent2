@@ -508,8 +508,9 @@ schtasks /Query /TN "InsightFlow Real-Model Regression"
 schtasks /Delete /TN "InsightFlow Real-Model Regression" /F
 ```
 
-日志写在 `_local_audit` 目录（仓库外），按时间戳命名，含退出码与 stderr。
-它依赖本机 ModelGate 在运行；网关不在时回归会失败并记录原因，这本身也是要看的信号。
+日志默认写在系统临时目录（可用 `INSIGHTFLOW_NIGHTLY_LOG_DIR` 指定），按时间戳命名，
+含退出码与 stderr。它依赖本机 ModelGate 在运行；网关不在时回归会失败并记录原因，
+这本身也是要看的信号。
 
 ## 飞书通知（可选）
 

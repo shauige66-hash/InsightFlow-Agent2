@@ -31,7 +31,8 @@ from core.llm import CallContext, create_llm
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 MODELGATE_ROOT = Path(
-    os.getenv("MODELGATE_ROOT", r"G:\AI-Projects\modelgate-original")
+    # 默认按"与仓库同级"的目录约定查找；换机器时用 MODELGATE_ROOT 覆盖。
+    os.getenv("MODELGATE_ROOT", str(PROJECT_ROOT.parent / "modelgate-original"))
 )
 MODELGATE_COMPOSE = MODELGATE_ROOT / "docker-compose.test.yml"
 

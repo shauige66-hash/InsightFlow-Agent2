@@ -27,10 +27,12 @@ from services.analysis_service import run_analysis  # noqa: E402
 from utils.run_logger import create_run_id  # noqa: E402
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
+# 历史默认落在仓库内的 outputs/（已 gitignore）：
+# 把某台机器的私有目录写进代码，对别人毫无意义，也是不该公开的路径。
 DEFAULT_HISTORY = Path(
     os.getenv(
         "INSIGHTFLOW_REGRESSION_LOG",
-        r"G:\AI-Projects\_local_audit\insightflow-agent2\real-model-runs.jsonl",
+        str(PROJECT_ROOT / "outputs" / "real-model-runs.jsonl"),
     )
 )
 
