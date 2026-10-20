@@ -18,7 +18,9 @@ import shutil
 from utils.run_logger import create_run_id
 from fastapi.responses import FileResponse
 from pydantic import WithJsonSchema
-from typing import Annotated
+from typing import Annotated, Any
+from datetime import datetime
+from uuid import uuid4
 import pandas as pd
 import numpy as np
 
@@ -70,6 +72,72 @@ register_conversation_routes(app)
 
 _WEB_DIR = Path(__file__).resolve().parent / "web"
 _PROJECT_DIR = Path(__file__).resolve().parent
+
+# 上传落盘的位置与上限。单个文件 20 MB：足够放几十万行 CSV，
+# 又不至于让人把整个数据库导进来当"数据分析"。
+UPLOAD_DIR = _PROJECT_DIR / "uploads"
+MAX_UPLOAD_BYTES = 20 * 1024 * 1024
+ALLOWED_UPLOAD_SUFFIXES = DATA_EXTENSIONS | KNOWLEDGE_EXTENSIONS
+
+
+def _safe_upload_name(raw: str) -> str:
+    """只保留文件名本身：去掉目录部分与首尾空白。
+
+    不信任客户端给的名字：`../../api.py` 这类会被 `Path(...).name` 削成
+    `api.py`，再由后缀白名单挡一次；扩展名之外不做任何字符替换，是为了保住
+    中文文件名。
+    """
+    name = Path(str(raw or "").replace("\\", "/")).name.strip()
+    return name
+
+
+@app.post("/api/uploads", status_code=201)
+def upload_dataset(file: UploadFile = File(...)) -> dict[str, Any]:
+    """接收一个数据或知识文件，返回可直接用于 `POST /runs` 的相对路径。"""
+    name = _safe_upload_name(getattr(file, "filename", "") or "")
+    if not name:
+        raise HTTPException(status_code=400, detail="缺少文件名")
+
+    suffix = Path(name).suffix.lower()
+    if suffix not in ALLOWED_UPLOAD_SUFFIXES:
+        allowed = "、".join(sorted(ALLOWED_UPLOAD_SUFFIXES))
+        raise HTTPException(status_code=400, detail=f"不支持的文件类型：{suffix or '(无扩展名)'}；允许：{allowed}")
+
+    folder = UPLOAD_DIR / datetime.now().strftime("%Y%m%d")
+    folder.mkdir(parents=True, exist_ok=True)
+    target = folder / f"{uuid4().hex[:8]}-{name}"
+
+    written = 0
+    try:
+        with target.open("wb") as handle:
+            while True:
+                chunk = file.file.read(1024 * 1024)
+                if not chunk:
+                    break
+                written += len(chunk)
+                if written > MAX_UPLOAD_BYTES:
+                    handle.close()
+                    target.unlink(missing_ok=True)
+                    raise HTTPException(
+                        status_code=413,
+                        detail=f"文件超过 {MAX_UPLOAD_BYTES // (1024 * 1024)} MB 上限",
+                    )
+                handle.write(chunk)
+    except HTTPException:
+        raise
+    except OSError as error:
+        target.unlink(missing_ok=True)
+        raise HTTPException(status_code=500, detail=f"写入失败：{error}") from error
+
+    if written == 0:
+        target.unlink(missing_ok=True)
+        raise HTTPException(status_code=400, detail="文件为空")
+
+    return {
+        "name": name,
+        "path": target.relative_to(_PROJECT_DIR).as_posix(),
+        "size_bytes": written,
+    }
 
 
 def _list_relative(

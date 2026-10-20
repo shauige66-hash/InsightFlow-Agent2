@@ -91,11 +91,19 @@
       <label class="field">
         <span>数据文件（可多选）</span>
         <div class="files" id="data-files"><span class="empty">读取中…</span></div>
+        <div class="row" style="margin-top:6px">
+          <input type="file" id="upload-data" multiple accept=".csv,.xlsx,.db,.sqlite,.sqlite3" style="font-size:12px">
+        </div>
+        <div class="muted" id="upload-data-status" style="font-size:12px"></div>
       </label>
 
       <label class="field">
         <span>业务知识（可多选，Markdown / TXT / PDF）</span>
         <div class="files" id="knowledge-files"><span class="empty">读取中…</span></div>
+        <div class="row" style="margin-top:6px">
+          <input type="file" id="upload-knowledge" multiple accept=".md,.txt,.pdf" style="font-size:12px">
+        </div>
+        <div class="muted" id="upload-knowledge-status" style="font-size:12px"></div>
       </label>
 
       <label class="field">
@@ -206,6 +214,50 @@ function renderFiles(containerId, files, prefix) {
 
 function picked(containerId) {
   return Array.prototype.slice.call(el(containerId).querySelectorAll("input:checked")).map(function (n) { return n.value; });
+}
+
+// 上传成功后把文件直接加进对应列表并勾上，用户不用再找一遍
+function addOption(containerId, path) {
+  const box = el(containerId);
+  const empty = box.querySelector(".empty");
+  if (empty) { box.innerHTML = ""; }
+  const label = document.createElement("label");
+  const input = document.createElement("input");
+  input.type = "checkbox";
+  input.value = path;
+  input.checked = true;
+  label.appendChild(input);
+  label.appendChild(document.createTextNode(" " + path));
+  box.insertBefore(label, box.firstChild);
+}
+
+async function uploadFiles(inputId, listId, statusId) {
+  const input = el(inputId);
+  const status = el(statusId);
+  if (!input.files || !input.files.length) { return; }
+
+  status.textContent = "上传中…";
+  let ok = 0;
+  const failures = [];
+
+  for (const file of Array.from(input.files)) {
+    const form = new FormData();
+    form.append("file", file);
+    try {
+      const result = await api("/api/uploads", { method: "POST", body: form });
+      addOption(listId, result.path);
+      ok += 1;
+    } catch (error) {
+      failures.push(file.name + "：" + error.message);
+    }
+  }
+
+  input.value = "";
+  status.textContent = ok ? "已上传 " + ok + " 个文件" + (failures.length ? "；失败 " + failures.length + " 个" : "") : "";
+  if (failures.length) {
+    const box = el("submit-error");
+    box.textContent = failures.join("\n");
+  }
 }
 
 async function submitRun() {
@@ -396,6 +448,12 @@ async function refreshList() {
 
 el("btn-run").addEventListener("click", submitRun);
 el("btn-refresh").addEventListener("click", refreshList);
+el("upload-data").addEventListener("change", function () {
+  uploadFiles("upload-data", "data-files", "upload-data-status");
+});
+el("upload-knowledge").addEventListener("change", function () {
+  uploadFiles("upload-knowledge", "knowledge-files", "upload-knowledge-status");
+});
 loadOptions();
 refreshList();
 </script>
