@@ -31,6 +31,8 @@ if TYPE_CHECKING:  # pragma: no cover - 仅用于类型标注
     from core.runtime import McpSettings
 
 RUN_STATUSES = (
+    # queued：已登记、等待 worker 抢占（只有队列模式会用到）
+    "queued",
     "pending",
     "running",
     "waiting_approval",

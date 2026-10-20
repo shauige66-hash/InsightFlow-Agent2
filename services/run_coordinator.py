@@ -279,20 +279,25 @@ class RunCoordinator:
         memories: list[dict[str, Any]] | None = None,
         enable_dynamic_loop: bool = False,
         dynamic_limits: dict[str, Any] | None = None,
-    ) -> None:
-        """登记并异步启动一次运行。
+        record_exists: bool = False,
+        wait: bool = False,
+    ) -> Any:
+        """登记并启动一次运行。
 
-        后端模式在登记时写定并持久化：恢复时按它重建，而不是按恢复进程的
-        默认值——否则一个 mcp 模式的 Run 会在恢复时悄悄变成 direct。
+        `record_exists`：队列模式下 Run 记录已由 API 建好（状态 queued），worker
+        抢占后不应再 `create` 一次，否则会把已有记录覆盖掉。
+        `wait`：在 worker 进程里直接于当前线程执行，不投递线程池——worker 本身
+        就是那个"后台"，再套一层线程只会让关闭信号更难处理。
         """
-        self.store.create(
-            run_id,
-            data_sources=data_sources,
-            analysis_focus=analysis_focus,
-            sql_backend=sql_backend,
-            require_plan_approval=require_plan_approval,
-            require_report_approval=require_report_approval,
-        )
+        if not record_exists:
+            self.store.create(
+                run_id,
+                data_sources=data_sources,
+                analysis_focus=analysis_focus,
+                sql_backend=sql_backend,
+                require_plan_approval=require_plan_approval,
+                require_report_approval=require_report_approval,
+            )
         self.store.update_status(run_id, "running")
 
         mcp = self._settings_for(sql_backend)
@@ -320,7 +325,11 @@ class RunCoordinator:
             finally:
                 self.executor._stop_heartbeat(run_id)
 
+        if wait:
+            return work()
+
         self.executor.submit(run_id, work)
+        return None
 
     def resume(self, run_id: str, *, resume_value: Any = None) -> None:
         """从最后提交的 Checkpoint 继续执行。

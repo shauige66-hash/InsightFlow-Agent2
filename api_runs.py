@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import os
 import re
 from pathlib import Path
 from typing import Any
@@ -147,6 +148,27 @@ def _validate_sql_backend(value: str) -> str:
         ) from None
 
 
+def _execution_mode() -> str:
+    """inline（默认，进程内线程池）或 queue（PostgreSQL 队列 + 独立 worker）。
+
+    队列需要 PostgreSQL：`SKIP LOCKED` 是抢占的唯一可靠手段，SQLite 没有。
+    配错了在请求时明确报 400/500，而不是悄悄退回 inline——否则部署方会以为
+    任务进了队列，实际全压在一个进程里。
+    """
+    mode = (os.getenv("INSIGHTFLOW_EXECUTION") or "inline").strip().lower()
+    if mode not in ("inline", "queue"):
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"INSIGHTFLOW_EXECUTION 只能是 inline 或 queue，收到 {mode!r}",
+        )
+    if mode == "queue" and not _storage_factory.storage.current_config().is_postgres:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="queue 执行模式需要 INSIGHTFLOW_STORAGE=postgres",
+        )
+    return mode
+
+
 def _validate_run_id(run_id: str) -> str:
     if not RUN_ID_PATTERN.match(run_id):
         raise HTTPException(
@@ -210,16 +232,47 @@ def create_run(payload: CreateRunRequest) -> dict[str, Any]:
             detail="至少需要一个数据源",
         )
 
+    request_payload = {
+        "data_sources": data_sources,
+        "analysis_focus": payload.analysis_focus,
+        "knowledge_sources": payload.knowledge_sources,
+        "require_plan_approval": payload.require_plan_approval,
+        "require_report_approval": payload.require_report_approval,
+        "sql_backend": sql_backend,
+        "enable_dynamic_loop": payload.enable_dynamic_loop,
+        "dynamic_limits": payload.dynamic_limits,
+    }
+
+    if _execution_mode() == "queue":
+        # 队列模式：只登记 + 入队，执行交给 worker 进程。
+        # 这样 API 重启不会带走正在跑的任务，也不会在请求线程里跑分析。
+        from services import run_queue
+
+        run_queue.ensure_schema()
+        coordinator = get_coordinator()
+        coordinator.store.create(
+            run_id,
+            data_sources=data_sources,
+            analysis_focus=payload.analysis_focus,
+            sql_backend=sql_backend,
+            require_plan_approval=payload.require_plan_approval,
+            require_report_approval=payload.require_report_approval,
+        )
+        coordinator.store.update_status(run_id, "queued")
+        run_queue.enqueue(run_id, request_payload)
+
+        return {
+            "run_id": run_id,
+            "status": "queued",
+            "require_plan_approval": payload.require_plan_approval,
+            "require_report_approval": payload.require_report_approval,
+            "sql_backend": sql_backend,
+            "enable_dynamic_loop": payload.enable_dynamic_loop,
+        }
+
     get_coordinator().start(
         run_id,
-        data_sources=data_sources,
-        analysis_focus=payload.analysis_focus,
-        knowledge_sources=payload.knowledge_sources,
-        require_plan_approval=payload.require_plan_approval,
-        require_report_approval=payload.require_report_approval,
-        sql_backend=sql_backend,
-        enable_dynamic_loop=payload.enable_dynamic_loop,
-        dynamic_limits=payload.dynamic_limits,
+        **request_payload,
     )
 
     return {

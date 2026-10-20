@@ -52,6 +52,8 @@ services:
       INSIGHTFLOW_REDIS_ENABLED: "true"
       INSIGHTFLOW_REDIS_URL: redis://redis:6379/0
       INSIGHTFLOW_OWNER: ${INSIGHTFLOW_OWNER:-local-demo}
+      # inline：Run 在 API 进程内跑（默认）；queue：入队，由 worker 执行
+      INSIGHTFLOW_EXECUTION: ${INSIGHTFLOW_EXECUTION:-inline}
       # 留空即单用户演示模式；设置了就强制 Bearer 鉴权
       INSIGHTFLOW_API_KEYS: ${INSIGHTFLOW_API_KEYS:-}
       DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
@@ -67,6 +69,37 @@ services:
       - uploads:/app/uploads
       # 需要容器内执行 Python 分析时在 Linux 上取消注释：
       # - /var/run/docker.sock:/var/run/docker.sock
+    restart: unless-stopped
+
+  # 队列模式的执行者。只在 INSIGHTFLOW_EXECUTION=queue 时启动：
+  #   INSIGHTFLOW_EXECUTION=queue docker compose -f deploy/compose.app.yaml up -d
+  # 它可以横向扩多个副本——抢占用 SKIP LOCKED，不会重复执行同一个 Run。
+  worker:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    profiles: ["queue"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    command: ["python", "scripts/run_worker.py"]
+    environment:
+      INSIGHTFLOW_STORAGE: postgres
+      INSIGHTFLOW_DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-insightflow}:${POSTGRES_PASSWORD:-insightflow}@postgres:5432/${POSTGRES_DB:-insightflow}
+      INSIGHTFLOW_EXECUTION: queue
+      INSIGHTFLOW_REDIS_ENABLED: "true"
+      INSIGHTFLOW_REDIS_URL: redis://redis:6379/0
+      INSIGHTFLOW_OWNER: ${INSIGHTFLOW_OWNER:-local-demo}
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
+      DEEPSEEK_BASE_URL: ${DEEPSEEK_BASE_URL:-https://api.deepseek.com/v1}
+      DEEPSEEK_MODEL: ${DEEPSEEK_MODEL:-deepseek-chat}
+      FEISHU_WEBHOOK_URL: ${FEISHU_WEBHOOK_URL:-}
+      FEISHU_SIGN_SECRET: ${FEISHU_SIGN_SECRET:-}
+    volumes:
+      - outputs:/app/outputs
+      - uploads:/app/uploads
     restart: unless-stopped
 
 volumes:
