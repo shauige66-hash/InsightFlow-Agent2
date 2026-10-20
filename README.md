@@ -393,6 +393,18 @@ insightflow-agent2/
 - `api_conversations.py`：会话、轮次与长期记忆接口
 - `main.py`：提供本地 Demo 启动入口
 
+## 操作界面
+
+除了接口和 CLI，服务自带一个零构建的单页控制台：启动后访问 `http://127.0.0.1:8123/ui/`。
+
+![InsightFlow 控制台](./docs/demo/demo-console.png)
+
+它只做四件事——选数据与业务知识、填分析问题、看运行状态与预算、在需要时审批并打开报告。
+页面本身是 `web/index.html`（原生 JS，无 CDN 依赖，可离线使用），由 API 挂载在 `/ui`；
+配套只有两个只读端点：`/ui-options`（列出 `data/` 与 `knowledge/` 下的示例文件）和
+`/runs/{run_id}/report.html`（同一份报告的 HTML 版本）。所有写操作仍走既有接口，
+页面不持有任何额外权限。
+
 ## API 接口
 
 InsightFlow 基于 FastAPI 提供健康检查、数据分析和报告下载接口。

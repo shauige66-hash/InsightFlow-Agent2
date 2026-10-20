@@ -12,6 +12,8 @@ from core.llm import build_model_factory
 from api_runs import register_run_routes
 from api_conversations import register_conversation_routes
 from pathlib import Path
+from fastapi.responses import RedirectResponse
+from fastapi.staticfiles import StaticFiles
 import shutil
 from utils.run_logger import create_run_id
 from fastapi.responses import FileResponse
@@ -58,6 +60,63 @@ app = FastAPI(
 # 持久化 Run 生命周期接口（创建 / 查询 / 恢复 / 审批）
 register_run_routes(app)
 register_conversation_routes(app)
+
+# ---------------------------------------------------------------- 操作界面
+#
+# 项目本身是纯接口的：没有这层时，唯一"能用"的入口是 Swagger 表单。这里挂一个
+# 零构建的单页（web/index.html）和它需要的两个只读端点，不改动任何既有接口。
+#
+# 只读是刻意的：页面能列目录、能看报告，但不能写文件、不能执行任意路径。
+
+_WEB_DIR = Path(__file__).resolve().parent / "web"
+_PROJECT_DIR = Path(__file__).resolve().parent
+
+
+def _list_relative(directory: Path, extensions: set[str]) -> list[str]:
+    """列出目录下（不递归）符合条件的相对路径，按名称排序。"""
+    if not directory.is_dir():
+        return []
+    names = [
+        item.name
+        for item in sorted(directory.iterdir())
+        if item.is_file() and item.suffix.lower() in extensions
+    ]
+    return names
+
+
+@app.get("/ui-options")
+def ui_options() -> dict[str, list[str]]:
+    """界面上可选的示例数据与知识文件。只读，且限定在两个固定目录内。"""
+    return {
+        "data_sources": _list_relative(_PROJECT_DIR / "data", DATA_EXTENSIONS),
+        "knowledge_sources": _list_relative(_PROJECT_DIR / "knowledge", KNOWLEDGE_EXTENSIONS),
+    }
+
+
+@app.get("/", include_in_schema=False)
+def ui_root() -> RedirectResponse:
+    return RedirectResponse(url="/ui/")
+
+
+@app.get("/runs/{run_id}/report.html", include_in_schema=False)
+def report_html(run_id: str) -> FileResponse:
+    """同一份报告的 HTML 版本：浏览器里直接读，比下载 PDF 更适合演示。"""
+    import api_runs
+
+    report_path = Path(api_runs.OUTPUT_ROOT) / run_id / "analysis_report.html"
+    if not report_path.exists():
+        raise HTTPException(
+            status_code=404,
+            detail=f"该运行没有 HTML 报告：{run_id}",
+        )
+    return FileResponse(
+        path=str(report_path),
+        media_type="text/html; charset=utf-8",
+    )
+
+
+if _WEB_DIR.is_dir():
+    app.mount("/ui", StaticFiles(directory=str(_WEB_DIR), html=True), name="ui")
 
 # 把 Agent 执行结果转换为 FastAPI 可以返回的 JSON 数据。
 def make_json_safe(

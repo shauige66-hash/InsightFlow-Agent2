@@ -1,0 +1,403 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>InsightFlow · 数据分析 Agent</title>
+<style>
+  :root {
+    --bg: #f6f7f9;
+    --card: #ffffff;
+    --line: #e3e6ea;
+    --text: #1f2328;
+    --muted: #6b7280;
+    --accent: #2563eb;
+    --ok: #16a34a;
+    --warn: #d97706;
+    --bad: #dc2626;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 14px/1.6 "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
+  }
+  header {
+    padding: 18px 24px; background: var(--card); border-bottom: 1px solid var(--line);
+    display: flex; align-items: baseline; gap: 12px;
+  }
+  header h1 { margin: 0; font-size: 17px; font-weight: 600; }
+  header span { color: var(--muted); font-size: 12px; }
+  main {
+    display: grid; grid-template-columns: 380px minmax(0, 1fr);
+    gap: 18px; padding: 18px 24px; align-items: start;
+  }
+  @media (max-width: 900px) { main { grid-template-columns: 1fr; } }
+  .card {
+    background: var(--card); border: 1px solid var(--line); border-radius: 10px;
+    padding: 16px; margin-bottom: 18px;
+  }
+  .card h2 { margin: 0 0 12px; font-size: 13px; font-weight: 600; color: var(--muted); letter-spacing: .3px; }
+  label.field { display: block; margin-bottom: 12px; }
+  label.field > span { display: block; font-size: 12px; color: var(--muted); margin-bottom: 4px; }
+  textarea, input[type=text] {
+    width: 100%; padding: 8px 10px; border: 1px solid var(--line); border-radius: 6px;
+    font: inherit; background: #fff; color: var(--text); resize: vertical;
+  }
+  textarea { min-height: 84px; }
+  .files { max-height: 168px; overflow: auto; border: 1px solid var(--line); border-radius: 6px; padding: 6px 8px; }
+  .files label { display: block; font-size: 13px; padding: 2px 0; }
+  .opts label { display: block; font-size: 13px; margin: 4px 0; }
+  button {
+    font: inherit; border-radius: 6px; border: 1px solid var(--line); background: #fff;
+    padding: 7px 14px; cursor: pointer;
+  }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 600; }
+  button:disabled { opacity: .5; cursor: default; }
+  button.ok { border-color: var(--ok); color: var(--ok); }
+  button.bad { border-color: var(--bad); color: var(--bad); }
+  .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  .badge {
+    display: inline-block; padding: 2px 8px; border-radius: 999px;
+    font-size: 12px; background: #eef2ff; color: var(--accent);
+    white-space: nowrap;
+  }
+  .badge.ok { background: #e8f7ee; color: var(--ok); }
+  .badge.bad { background: #fdecec; color: var(--bad); }
+  .badge.warn { background: #fdf3e3; color: var(--warn); }
+  .kv { display: grid; grid-template-columns: 96px 1fr; gap: 4px 10px; font-size: 13px; }
+  .kv dt { color: var(--muted); }
+  .kv dd { margin: 0; word-break: break-all; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--line); }
+  th { color: var(--muted); font-weight: 600; font-size: 12px; }
+  td.time { white-space: nowrap; }
+  .muted { color: var(--muted); }
+  .empty { color: var(--muted); font-size: 13px; }
+  code { background: #f2f4f7; padding: 1px 5px; border-radius: 4px; font-size: 12px; }
+  .err { color: var(--bad); font-size: 13px; white-space: pre-wrap; }
+</style>
+</head>
+<body>
+<header>
+  <h1>InsightFlow</h1>
+  <span>结构化数据分析 Agent · 本地演示</span>
+</header>
+
+<main>
+  <section>
+    <div class="card">
+      <h2>新建分析</h2>
+
+      <label class="field">
+        <span>数据文件（可多选）</span>
+        <div class="files" id="data-files"><span class="empty">读取中…</span></div>
+      </label>
+
+      <label class="field">
+        <span>业务知识（可多选，Markdown / TXT / PDF）</span>
+        <div class="files" id="knowledge-files"><span class="empty">读取中…</span></div>
+      </label>
+
+      <label class="field">
+        <span>分析问题</span>
+        <textarea id="focus">分析不同地区的高价值客户表现，并比较各地区高价值客户的销售贡献。</textarea>
+      </label>
+
+      <div class="opts">
+        <label><input type="checkbox" id="opt-dynamic" checked> 开启动态决策（Observe → Decide → Act）</label>
+        <label><input type="checkbox" id="opt-plan"> 计划执行前需要我审批</label>
+        <label><input type="checkbox" id="opt-report"> 报告发布前需要我审批</label>
+      </div>
+
+      <div class="row" style="margin-top:12px">
+        <button class="primary" id="btn-run">开始分析</button>
+        <button id="btn-refresh" type="button">刷新运行列表</button>
+      </div>
+      <div class="err" id="submit-error"></div>
+    </div>
+
+    <div class="card">
+      <h2>最近运行</h2>
+      <div id="run-list"><span class="empty">暂无运行</span></div>
+    </div>
+  </section>
+
+  <section>
+    <div class="card">
+      <h2>当前运行</h2>
+      <div id="current"><span class="empty">提交一次分析后，这里会显示进度、决策与报告。</span></div>
+    </div>
+    <div class="card" id="budget-card" style="display:none">
+      <h2>执行预算</h2>
+      <div id="budget"></div>
+    </div>
+    <div class="card" id="decisions-card" style="display:none">
+      <h2>决策历史</h2>
+      <div id="decisions"></div>
+    </div>
+  </section>
+</main>
+
+<script>
+const state = { runId: null, timer: null, options: null };
+
+const STATUS_TEXT = {
+  running: "执行中", waiting_approval: "等待审批", completed: "已完成",
+  partial: "部分完成", failed: "失败", rejected: "已拒绝", interrupted: "已中断"
+};
+const STATUS_CLASS = {
+  completed: "ok", partial: "warn", failed: "bad", rejected: "bad",
+  waiting_approval: "warn", running: "", interrupted: "warn"
+};
+
+function el(id) { return document.getElementById(id); }
+function esc(v) {
+  return String(v == null ? "" : v)
+    .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+// created_at / updated_at 是 epoch 秒（浮点），直接显示会是一串数字。
+function fmtTime(value) {
+  if (value == null || value === "") { return "-"; }
+  if (typeof value === "number" || /^\d+(\.\d+)?$/.test(String(value))) {
+    const ms = Number(value) * 1000;
+    const d = new Date(ms);
+    if (!isNaN(d.getTime())) {
+      const pad = function (n) { return String(n).padStart(2, "0"); };
+      return d.getFullYear() + "-" + pad(d.getMonth() + 1) + "-" + pad(d.getDate()) +
+             " " + pad(d.getHours()) + ":" + pad(d.getMinutes()) + ":" + pad(d.getSeconds());
+    }
+  }
+  return String(value);
+}
+
+async function api(path, init) {
+  const res = await fetch(path, init);
+  const text = await res.text();
+  let data = null;
+  try { data = text ? JSON.parse(text) : null; } catch (e) { data = text; }
+  if (!res.ok) {
+    const detail = data && data.detail ? data.detail : text;
+    throw new Error(res.status + " " + (typeof detail === "string" ? detail : JSON.stringify(detail)));
+  }
+  return data;
+}
+
+async function loadOptions() {
+  try {
+    const data = await api("/ui-options");
+    state.options = data;
+    renderFiles("data-files", data.data_sources, "data/");
+    renderFiles("knowledge-files", data.knowledge_sources, "knowledge/");
+  } catch (error) {
+    el("data-files").innerHTML = '<span class="err">读取失败：' + esc(error.message) + "</span>";
+    el("knowledge-files").innerHTML = "";
+  }
+}
+
+function renderFiles(containerId, files, prefix) {
+  const box = el(containerId);
+  if (!files || !files.length) { box.innerHTML = '<span class="empty">没有可用文件</span>'; return; }
+  box.innerHTML = files.map(function (f, i) {
+    const checked = i === 0 ? " checked" : "";
+    return '<label><input type="checkbox" value="' + esc(f) + '"' + checked + "> " + esc(f) + "</label>";
+  }).join("");
+}
+
+function picked(containerId) {
+  return Array.prototype.slice.call(el(containerId).querySelectorAll("input:checked")).map(function (n) { return n.value; });
+}
+
+async function submitRun() {
+  const btn = el("btn-run");
+  const errorBox = el("submit-error");
+  errorBox.textContent = "";
+  const dataSources = picked("data-files");
+  if (!dataSources.length) { errorBox.textContent = "请至少选择一个数据文件"; return; }
+
+  btn.disabled = true;
+  btn.textContent = "提交中…";
+  try {
+    const payload = {
+      data_sources: dataSources,
+      knowledge_sources: picked("knowledge-files"),
+      analysis_focus: el("focus").value.trim(),
+      enable_dynamic_loop: el("opt-dynamic").checked,
+      require_plan_approval: el("opt-plan").checked,
+      require_report_approval: el("opt-report").checked
+    };
+    const created = await api("/runs", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload)
+    });
+    state.runId = created.run_id;
+    watchRun(created.run_id);
+    refreshList();
+  } catch (error) {
+    errorBox.textContent = "提交失败：" + error.message;
+  } finally {
+    btn.disabled = false;
+    btn.textContent = "开始分析";
+  }
+}
+
+function badge(status) {
+  const cls = STATUS_CLASS[status] || "";
+  return '<span class="badge ' + cls + '">' + esc(STATUS_TEXT[status] || status) + "</span>";
+}
+
+// 待审批摘要是个对象（计划任务、指纹、是否需要 SQL 权限确认），不是一句话。
+function approvalDetail(summary) {
+  if (!summary || typeof summary !== "object") {
+    return summary ? '<div class="muted" style="margin-top:6px">' + esc(summary) + "</div>" : "";
+  }
+  let html = "";
+  const tasks = summary.tasks || [];
+  if (tasks.length) {
+    html += '<div style="margin-top:8px"><div class="muted">共 ' + tasks.length + " 个任务：</div><ul style=\"margin:4px 0 0 18px\">" +
+      tasks.map(function (t) {
+        const tables = (t.target_tables || []).join("、");
+        return "<li>" + esc(t.description || t.task_id) +
+               (tables ? ' <span class="muted">（' + esc(tables) + "）</span>" : "") + "</li>";
+      }).join("") + "</ul></div>";
+  }
+  const notes = [];
+  if (summary.contains_sql_tasks !== undefined) {
+    notes.push(summary.contains_sql_tasks ? "含 SQL 任务" : "无 SQL 任务");
+  }
+  if (summary.sql_read_only_enforced) { notes.push("SQL 只读已强制"); }
+  if (summary.plan_revision) { notes.push("计划版本 " + summary.plan_revision); }
+  if (notes.length) {
+    html += '<div class="muted" style="margin-top:6px">' + esc(notes.join(" · ")) + "</div>";
+  }
+  if (summary.plan_fingerprint) {
+    html += '<div class="muted" style="margin-top:4px">指纹 <code>' +
+            esc(String(summary.plan_fingerprint).slice(0, 16)) + "…</code></div>";
+  }
+  return html;
+}
+
+async function watchRun(runId) {
+  if (state.timer) { clearInterval(state.timer); state.timer = null; }
+  const tick = function () { refreshRun(runId); };
+  tick();
+  state.timer = setInterval(tick, 2500);
+}
+
+async function refreshRun(runId) {
+  let data;
+  try {
+    data = await api("/runs/" + encodeURIComponent(runId));
+  } catch (error) {
+    el("current").innerHTML = '<span class="err">读取运行状态失败：' + esc(error.message) + "</span>";
+    return;
+  }
+  const run = data.run || {};
+  const st = run.status || "unknown";
+  const pending = run.pending_approval || null;
+
+  let html = "";
+  html += '<div class="row" style="margin-bottom:10px">' + badge(st) +
+          ' <code>' + esc(run.run_id || runId) + "</code></div>";
+
+  if (run.error) { html += '<div class="err" style="margin-bottom:10px">' + esc(run.error) + "</div>"; }
+
+  if (st === "waiting_approval" && pending) {
+    html += '<div style="margin:10px 0;padding:12px;border:1px solid #f0d9a8;background:#fffaf0;border-radius:6px">' +
+            "<div><b>需要你确认：</b>" +
+            esc(pending.kind === "report_publish" ? "报告发布" : "计划执行") + "</div>" +
+            approvalDetail(pending.summary) +
+            '<div class="row" style="margin-top:10px">' +
+            '<button class="ok" onclick="decide(\'' + esc(runId) + "','approve')\">批准</button>" +
+            '<button class="bad" onclick="decide(\'' + esc(runId) + "','reject')\">拒绝</button>" +
+            "</div></div>";
+  }
+
+  html += '<dl class="kv">' +
+          "<dt>数据源</dt><dd>" + esc((run.data_sources || []).join("、")) + "</dd>" +
+          "<dt>开始时间</dt><dd>" + esc(fmtTime(run.created_at)) + "</dd>" +
+          "<dt>更新时间</dt><dd>" + esc(fmtTime(run.updated_at)) + "</dd>" +
+          "</dl>";
+
+  if (st === "completed" || st === "partial") {
+    html += '<div class="row" style="margin-top:12px">' +
+            '<a href="/runs/' + encodeURIComponent(runId) + '/report.html" target="_blank" rel="noopener">' +
+            '<button class="primary">打开报告</button></a>' +
+            '<a href="/runs/' + encodeURIComponent(runId) + '/report" target="_blank" rel="noopener">' +
+            "<button>下载 PDF</button></a>" +
+            "</div>";
+  }
+
+  el("current").innerHTML = html;
+
+  const st_state = data.state || {};
+  renderBudget(st_state.execution_budget);
+  renderDecisions(st_state.decision_history);
+
+  if (st === "completed" || st === "partial" || st === "failed" || st === "rejected") {
+    if (state.timer) { clearInterval(state.timer); state.timer = null; }
+  }
+}
+
+function renderBudget(budget) {
+  if (!budget || !budget.usage) { el("budget-card").style.display = "none"; return; }
+  const u = budget.usage;
+  const limits = budget.limits || {};
+  el("budget-card").style.display = "";
+  const rows = [
+    ["模型请求", u.llm_calls, limits.max_llm_calls],
+    ["工具调用", u.tool_calls, limits.max_tool_calls],
+    ["循环轮次", u.rounds, limits.max_rounds],
+    ["执行时间", Math.round(u.active_seconds || 0) + " s", (limits.max_seconds || "-") + " s"]
+  ];
+  el("budget").innerHTML = "<table><thead><tr><th>项</th><th>已用</th><th>上限</th></tr></thead><tbody>" +
+    rows.map(function (r) {
+      return "<tr><td>" + esc(r[0]) + "</td><td>" + esc(r[1] == null ? "-" : r[1]) + "</td><td>" + esc(r[2] == null ? "-" : r[2]) + "</td></tr>";
+    }).join("") + "</tbody></table>";
+}
+
+function renderDecisions(history) {
+  if (!history || !history.length) { el("decisions-card").style.display = "none"; return; }
+  el("decisions-card").style.display = "";
+  el("decisions").innerHTML = "<table><thead><tr><th>步</th><th>任务</th><th>动作</th><th>原因</th></tr></thead><tbody>" +
+    history.map(function (d) {
+      return "<tr><td>" + esc(d.step) + "</td><td>" + esc(d.task_id || "-") + "</td><td>" +
+             esc(d.action) + (d.forced ? "（强制）" : "") + "</td><td class='muted'>" + esc(d.reason || "") + "</td></tr>";
+    }).join("") + "</tbody></table>";
+}
+
+async function decide(runId, decision) {
+  try {
+    await api("/runs/" + encodeURIComponent(runId) + "/approval", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ decision: decision })
+    });
+    refreshRun(runId);
+  } catch (error) {
+    el("current").innerHTML += '<div class="err">提交审批失败：' + esc(error.message) + "</div>";
+  }
+}
+
+async function refreshList() {
+  try {
+    const data = await api("/runs?limit=10");
+    const runs = data.runs || data || [];
+    if (!runs.length) { el("run-list").innerHTML = '<span class="empty">暂无运行</span>'; return; }
+    el("run-list").innerHTML = "<table><tbody>" + runs.map(function (r) {
+      return '<tr><td><a href="#" onclick="state.runId=\'' + esc(r.run_id) + "';watchRun('" + esc(r.run_id) + "');return false;\">" +
+             esc(r.run_id) + "</a></td><td>" + badge(r.status) + "</td><td class='muted time'>" + esc(fmtTime(r.created_at)) + "</td></tr>";
+    }).join("") + "</tbody></table>";
+  } catch (error) {
+    el("run-list").innerHTML = '<span class="err">读取失败：' + esc(error.message) + "</span>";
+  }
+}
+
+el("btn-run").addEventListener("click", submitRun);
+el("btn-refresh").addEventListener("click", refreshList);
+loadOptions();
+refreshList();
+</script>
+</body>
+</html>

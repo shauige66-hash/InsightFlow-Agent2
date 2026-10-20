@@ -451,6 +451,10 @@ PUBLIC_STATE_FIELDS = (
     "failed_tasks",
     "artifacts",
     "report_path",
+    # 运行期可观测性：决策历史与预算用量对"这个 Run 花了多少、为什么这么走"
+    # 是必需信息，而两者都不包含数据行或模型提示词，可以安全外露。
+    "decision_history",
+    "execution_budget",
 )
 
 
