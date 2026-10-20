@@ -80,14 +80,19 @@ def build_run_card(
     tool_calls: int | None = None,
     active_seconds: float | None = None,
     error: str | None = None,
+    console_url: str | None = None,
 ) -> dict[str, Any]:
-    """一次运行结束（或进入待审批）时的卡片。"""
+    """一次运行结束（或进入待审批）时的卡片。
+
+    注意：飞书的 `lark_md` 只支持 `**加粗**` 与 `[文字](链接)`，**不支持**用反引号
+    标注行内代码——写了会原样显示反引号，所以这里不用反引号包 run_id。
+    """
     title = STATUS_TEXT.get(status, status)
     if status == "partial":
         title = "分析完成（部分任务未完成）"
 
     lines = [
-        f"**Run**：`{run_id}`",
+        f"**Run**：{run_id}",
         f"**分析结果**：{_safe(analysis_status, title)}",
     ]
     if analysis_focus:
@@ -103,7 +108,11 @@ def build_run_card(
         lines.append(f"**失败原因**：{error}")
 
     elements: list[dict[str, Any]] = [_div("\n".join(lines))]
-    if status in ("completed", "partial"):
+    if console_url:
+        # 127.0.0.1 的地址只在运行服务的这台机器上打得开；飞书桌面端会调本机浏览器，
+        # 所以自用场景下这个链接可用，分享给别人的群则无意义。
+        elements.append(_div(f"[打开控制台]({console_url})"))
+    elif status in ("completed", "partial"):
         elements.append(
             {
                 "tag": "note",
@@ -131,6 +140,7 @@ def build_approval_card(
     *,
     kind: str | None = None,
     summary: Any = None,
+    console_url: str | None = None,
 ) -> dict[str, Any]:
     """待审批卡片：说明需要确认什么，并提示去哪里处理。
 
@@ -138,7 +148,7 @@ def build_approval_card(
     更糟，用户会以为系统坏了。
     """
     label = "报告发布" if kind == "report_publish" else "计划执行"
-    lines = [f"**Run**：`{run_id}`", f"**待确认**：{label}"]
+    lines = [f"**Run**：{run_id}", f"**待确认**：{label}"]
 
     tasks = []
     if isinstance(summary, dict):
@@ -160,7 +170,9 @@ def build_approval_card(
         },
         "elements": [
             _div("\n".join(lines)),
-            {
+            _div(f"[打开控制台处理]({console_url})")
+            if console_url
+            else {
                 "tag": "note",
                 "elements": [
                     {

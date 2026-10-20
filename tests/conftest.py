@@ -40,6 +40,22 @@ def block_real_network() -> None:
     install_network_guard()
 
 
+@pytest.fixture(autouse=True)
+def _no_external_notifications(monkeypatch) -> None:
+    """测试默认不配通知通道。
+
+    开发机上的 `.env` 里可能填了真实的飞书 webhook；若不隔离，跑一次测试就会
+    往真实群里发卡片，还会让"推送"变成测试的隐性依赖。需要验证推送的用例
+    自己 `monkeypatch.setenv`。
+    """
+    for name in (
+        "FEISHU_WEBHOOK_URL",
+        "FEISHU_SIGN_SECRET",
+        "FEISHU_CONSOLE_URL",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+
 @pytest.fixture(scope="session", autouse=True)
 def _assert_import_has_no_side_effects(tmp_path_factory) -> None:
     """导入 `api_runs` 不得在进程当前目录里建出目录。

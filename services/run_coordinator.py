@@ -34,15 +34,24 @@ _LOGGER = logging.getLogger(__name__)
 
 
 def _safe_notify(callback: Callable[..., Any], *args: Any, **kwargs: Any) -> None:
-    """调用通知函数，吞掉一切异常。
+    """在后台线程里发通知，吞掉一切异常。
 
-    通知器本身已经保证不抛，但这里是最后一道闸：将来换实现、换通道时，
-    一次推送失败仍然不能让一个已经跑完的 Run 变成 failed。
+    两条理由：
+
+    1. 通知是旁路——一次推送失败不能让已经跑完的 Run 变成 failed；
+    2. 通知要访问外部服务，**不能拖住 Run 的收尾**。同步发的话，一个慢的 webhook
+       会让 Run 迟迟不释放执行权，紧接着的审批/恢复请求会被判成"并发执行"而拒绝。
     """
-    try:
-        callback(*args, **kwargs)
-    except Exception as error:  # noqa: BLE001
-        _LOGGER.warning("运行通知失败（已忽略）：%s: %s", type(error).__name__, error)
+
+    def dispatch() -> None:
+        try:
+            callback(*args, **kwargs)
+        except Exception as error:  # noqa: BLE001
+            _LOGGER.warning(
+                "运行通知失败（已忽略）：%s: %s", type(error).__name__, error
+            )
+
+    threading.Thread(target=dispatch, name="run-notify", daemon=True).start()
 
 
 class RunExecutor:

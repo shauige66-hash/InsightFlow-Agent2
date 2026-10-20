@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from typing import Any
 
 from integrations.feishu import FeishuWebhook, build_approval_card, build_run_card
@@ -30,6 +31,16 @@ def _usage(result: dict[str, Any] | None) -> dict[str, Any]:
         return {}
     budget = result.get("execution_budget") or {}
     return budget.get("usage") or {}
+
+
+def _console_url() -> str | None:
+    """可选：卡片里附一个控制台链接。
+
+    `127.0.0.1` 的地址只在跑服务这台机器上有效，分享给别人的群没有意义，
+    所以默认不带；本机自用时在 `.env` 里配上即可直接点开。
+    """
+    url = os.getenv("FEISHU_CONSOLE_URL", "").strip()
+    return url or None
 
 
 def notify_run_finished(
@@ -57,6 +68,7 @@ def notify_run_finished(
             tool_calls=usage.get("tool_calls"),
             active_seconds=usage.get("active_seconds"),
             error=error,
+            console_url=_console_url(),
         )
         return notifier.send_card(card)
     except Exception as failure:  # noqa: BLE001
@@ -79,6 +91,7 @@ def notify_approval_needed(
             run_id,
             kind=pending.get("kind"),
             summary=pending.get("summary"),
+            console_url=_console_url(),
         )
         return notifier.send_card(card)
     except Exception as failure:  # noqa: BLE001

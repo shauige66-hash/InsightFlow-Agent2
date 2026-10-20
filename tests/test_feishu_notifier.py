@@ -94,6 +94,25 @@ def test_a_failed_run_carries_the_reason(webhook) -> None:
     assert "DEEPSEEK_API_KEY is missing" in card["elements"][0]["text"]["content"]
 
 
+def test_cards_avoid_inline_code_markup(webhook) -> None:
+    """`lark_md` 不支持反引号行内代码，写了会原样显示反引号。"""
+    notify_run_finished("run_md", "completed", result={"analysis_status": "completed"})
+    notify_approval_needed("run_md", {"kind": "plan_review", "summary": {"tasks": []}})
+
+    for payload in webhook.received:
+        body = payload["card"]["elements"][0]["text"]["content"]
+        assert "`" not in body
+
+
+def test_a_console_link_is_attached_when_configured(webhook, monkeypatch) -> None:
+    monkeypatch.setenv("FEISHU_CONSOLE_URL", "http://127.0.0.1:8123/ui/")
+    notify_run_finished("run_link", "completed", result={"analysis_status": "completed"})
+
+    elements = webhook.received[0]["card"]["elements"]
+    link = elements[1]["text"]["content"]
+    assert "[打开控制台](http://127.0.0.1:8123/ui/)" == link
+
+
 def test_an_approval_notice_lists_the_tasks(webhook) -> None:
     notify_approval_needed(
         "run_3",
