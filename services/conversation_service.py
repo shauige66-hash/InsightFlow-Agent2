@@ -42,7 +42,15 @@ class ConversationService:
     def __init__(self, coordinator: Any, *, output_root: Any = None) -> None:
         self._coordinator = coordinator
         self._output_root = output_root
-        self._owner = storage.current_config().owner
+
+    @property
+    def _owner(self) -> str:
+        """每次调用现取，而不是在构造时缓存。
+
+        服务实例可能被多个请求复用；把 owner 缓存在构造时，会让并发的第二个
+        用户看到第一个用户的会话。
+        """
+        return storage.current_owner()
 
     # -- 会话 -------------------------------------------------------------
 
@@ -175,6 +183,9 @@ class ConversationService:
             turn_payload = _turn_dict(turn)
             knowledge_refs = list(record.knowledge_refs or [])
 
+        # 先记候选记忆（作用域在写入前判定），再启动 Run：写失败也不影响对话
+        self._record_candidates(content, session_id=session_id, dataset_refs=dataset_refs)
+
         # 启动可能失败（线程池关闭、后端模式非法、登记写入失败）。轮次与用户
         # 消息已经落库，如果不收敛状态，这条消息会永远停在 pending——界面上
         # 既看不到结果，也看不到失败原因。
@@ -282,6 +293,28 @@ class ConversationService:
             scopes=service.scopes_for(dataset_refs),
             limit=3,
         )
+
+    def _record_candidates(
+        self, content: str, *, session_id: str, dataset_refs: list[str]
+    ) -> None:
+        """把用户消息里的偏好记成候选记忆（不确认、不进上下文）。
+
+        作用域由 `classify_scope` 在写入前判定：说"这次报告用红色"只落到本会话，
+        说"金额统一用人民币"才落到 global。写失败不影响消息本身——候选记忆是旁路。
+        """
+        from services.memory_service import MemoryService
+
+        try:
+            service = MemoryService()
+            for candidate in service.propose_candidates(
+                content,
+                provenance={"session_id": session_id},
+                dataset_refs=dataset_refs,
+                session_id=session_id,
+            ):
+                service.add(**candidate)
+        except Exception:  # noqa: BLE001 - 记忆是旁路，不能拖垮对话
+            logger.warning("记录候选记忆失败（已忽略）", exc_info=True)
 
     # -- 同步 -------------------------------------------------------------
 

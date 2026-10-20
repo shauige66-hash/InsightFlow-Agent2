@@ -59,6 +59,12 @@ app = FastAPI(
     version="0.1.0"
 )
 
+# 鉴权：只有设置了 INSIGHTFLOW_API_KEYS 才启用；不设则保持单用户演示模式。
+# 归属者由 token 推导，不接受请求体自报。
+from core.auth import install as install_auth
+
+_API_KEYS = install_auth(app)
+
 # 持久化 Run 生命周期接口（创建 / 查询 / 恢复 / 审批）
 register_run_routes(app)
 register_conversation_routes(app)

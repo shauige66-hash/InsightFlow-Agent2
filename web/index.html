@@ -81,6 +81,12 @@
 <header>
   <h1>InsightFlow</h1>
   <span>结构化数据分析 Agent · 本地演示</span>
+  <span style="margin-left:auto;display:flex;gap:6px;align-items:center">
+    <input type="password" id="api-key" placeholder="API Key（开启鉴权时填写）"
+           style="width:220px;padding:5px 8px;font-size:12px">
+    <button id="btn-save-key" type="button" style="padding:5px 10px;font-size:12px">保存</button>
+    <span id="key-status" class="muted" style="font-size:12px"></span>
+  </span>
 </header>
 
 <main>
@@ -179,11 +185,26 @@ function fmtTime(value) {
   return String(value);
 }
 
+// 服务端开启鉴权时（INSIGHTFLOW_API_KEYS），所有请求都要带 Bearer token。
+// token 存在 localStorage，刷新不丢；没配 key 的服务端会忽略这个头。
+function savedKey() {
+  try { return localStorage.getItem("insightflow_api_key") || ""; } catch (e) { return ""; }
+}
+
 async function api(path, init) {
-  const res = await fetch(path, init);
+  const options = Object.assign({}, init || {});
+  const headers = Object.assign({}, options.headers || {});
+  const key = savedKey();
+  if (key) { headers["Authorization"] = "Bearer " + key; }
+  options.headers = headers;
+
+  const res = await fetch(path, options);
   const text = await res.text();
   let data = null;
   try { data = text ? JSON.parse(text) : null; } catch (e) { data = text; }
+  if (res.status === 401) {
+    throw new Error("401 未授权：请在右上角填入 API Key");
+  }
   if (!res.ok) {
     const detail = data && data.detail ? data.detail : text;
     throw new Error(res.status + " " + (typeof detail === "string" ? detail : JSON.stringify(detail)));
@@ -448,6 +469,25 @@ async function refreshList() {
 
 el("btn-run").addEventListener("click", submitRun);
 el("btn-refresh").addEventListener("click", refreshList);
+
+// API Key：读出来回填，保存后立刻生效（无需刷新页面）
+(function initApiKey() {
+  const input = el("api-key");
+  const status = el("key-status");
+  const key = savedKey();
+  if (key) { input.value = key; status.textContent = "已保存"; }
+  el("btn-save-key").addEventListener("click", function () {
+    try {
+      if (input.value.trim()) { localStorage.setItem("insightflow_api_key", input.value.trim()); }
+      else { localStorage.removeItem("insightflow_api_key"); }
+      status.textContent = input.value.trim() ? "已保存" : "已清除";
+      loadOptions();
+      refreshList();
+    } catch (e) {
+      status.textContent = "保存失败";
+    }
+  });
+})();
 el("upload-data").addEventListener("change", function () {
   uploadFiles("upload-data", "data-files", "upload-data-status");
 });

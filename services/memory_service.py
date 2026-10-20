@@ -36,6 +36,36 @@ _SENSITIVE = (
 #: 显式偏好措辞：只有用户明确表达"今后要这样"才提候选
 _PREFERENCE_MARKERS = ("今后", "以后", "之后统一", "统一用", "一律用", "优先用", "默认用")
 
+#: 作用域。写入前必须先分类，而不是一律 global——否则"这次的报告用红色"会被
+#: 当成永久偏好，污染以后所有会话。
+SCOPE_GLOBAL = "global"
+SCOPE_DATASET_PREFIX = "dataset:"
+SCOPE_SESSION_PREFIX = "session:"
+
+#: 指向"当前这次"的措辞：结论只对本次分析成立
+_SESSION_MARKERS = (
+    "这次",
+    "本次",
+    "这一轮",
+    "这一版",
+    "这个报告",
+    "这份报告",
+    "此报告",
+    "当前会话",
+)
+
+#: 指向"某份数据"的措辞：结论对该数据集成立，但对别的数据不一定
+_DATASET_MARKERS = (
+    "这张表",
+    "这个表",
+    "该表",
+    "这个数据集",
+    "该数据集",
+    "这份数据",
+    "这批数据",
+    "这个库",
+)
+
 
 class MemoryValidationError(ValueError):
     """记忆内容不可接受。"""
@@ -43,7 +73,12 @@ class MemoryValidationError(ValueError):
 
 class MemoryService:
     def __init__(self, *, owner: str | None = None) -> None:
-        self._owner = owner or storage.current_config().owner
+        self._explicit_owner = owner
+
+    @property
+    def _owner(self) -> str:
+        """显式传入的优先；否则现取当前请求的归属者（不在构造时缓存）。"""
+        return self._explicit_owner or storage.current_owner()
 
     def _repository(self, session) -> MemoryRepository:
         return MemoryRepository(session, owner=self._owner)
@@ -133,12 +168,59 @@ class MemoryService:
 
     def scopes_for(self, dataset_refs: list[str]) -> list[str]:
         """当前会话适用的作用域：全局 + 该数据集的专属记忆。"""
-        scopes = ["global"]
+        scopes = [SCOPE_GLOBAL]
         for ref in dataset_refs:
             from pathlib import Path
 
-            scopes.append(f"dataset:{Path(ref).stem}")
+            scopes.append(f"{SCOPE_DATASET_PREFIX}{Path(ref).stem}")
         return scopes
+
+    # -- 写入前的作用域分类 -----------------------------------------------
+
+    @staticmethod
+    def classify_scope(
+        text: str,
+        *,
+        dataset_refs: list[str] | None = None,
+        session_id: str | None = None,
+    ) -> tuple[str, str]:
+        """判断一条记忆该落在哪个作用域，返回 `(scope, reason)`。
+
+        规则是确定性的、可解释的，且**保守**：拿不准就 global，因为 global 的
+        记忆会被所有会话读到，错放一条的代价比漏放一条大得多。
+
+        优先级：
+        1. 文中点名了本次的某个数据集 → `dataset:<stem>`（跨会话，但只对该数据）
+        2. 出现"这次/本次/这份报告"这类措辞 → `session:<id>`（会话内有效）
+        3. 出现"这张表/这个数据集"但没有点名 → 只有一个数据集时归它，否则 global
+        4. 其余视为稳定偏好 → `global`
+        """
+        content = (text or "").strip()
+        refs = [ref for ref in (dataset_refs or []) if ref]
+        stems = []
+        for ref in refs:
+            from pathlib import Path
+
+            stems.append(Path(ref).stem)
+
+        lowered = content.lower()
+        for stem in stems:
+            if stem and stem.lower() in lowered:
+                return f"{SCOPE_DATASET_PREFIX}{stem}", f"点名了数据集 {stem}"
+
+        if any(marker in content for marker in _SESSION_MARKERS):
+            if session_id:
+                return f"{SCOPE_SESSION_PREFIX}{session_id}", "措辞指向本次分析"
+            if len(stems) == 1:
+                return f"{SCOPE_DATASET_PREFIX}{stems[0]}", "措辞指向本次分析，且只有一个数据集"
+            return SCOPE_GLOBAL, "措辞指向本次分析，但缺少会话与数据集上下文"
+
+        if any(marker in content for marker in _DATASET_MARKERS):
+            if len(stems) == 1:
+                return f"{SCOPE_DATASET_PREFIX}{stems[0]}", "措辞指向数据集，且只有一个数据集"
+            return SCOPE_GLOBAL, "措辞指向数据集，但本次有多个数据集"
+
+        return SCOPE_GLOBAL, "稳定偏好"
 
     # -- 候选 -------------------------------------------------------------
 
@@ -147,22 +229,34 @@ class MemoryService:
         text: str,
         *,
         provenance: dict[str, Any] | None = None,
+        dataset_refs: list[str] | None = None,
+        session_id: str | None = None,
     ) -> list[dict[str, Any]]:
-        """从用户消息里提出候选记忆。只记录，不确认。"""
+        """从用户消息里提出候选记忆。只记录，不确认。
+
+        作用域在**写入前**分类：默认 global 会让"这次报告用红色"变成永久偏好。
+        """
         content = (text or "").strip()
         if not content or len(content) > MAX_VALUE_LENGTH:
             return []
         if not any(marker in content for marker in _PREFERENCE_MARKERS):
             return []
 
+        scope, reason = self.classify_scope(
+            content, dataset_refs=dataset_refs, session_id=session_id
+        )
         candidates = [
             {
                 "kind": "preference",
                 "key": "explicit_preference",
                 "value": content,
-                "scope": "global",
+                "scope": scope,
                 "status": CANDIDATE,
-                "provenance": {**(provenance or {}), "source": "user_message_heuristic"},
+                "provenance": {
+                    **(provenance or {}),
+                    "source": "user_message_heuristic",
+                    "scope_reason": reason,
+                },
             }
         ]
         return candidates
