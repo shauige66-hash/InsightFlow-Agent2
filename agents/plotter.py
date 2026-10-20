@@ -69,6 +69,10 @@ PLOT_PROMPT = """
 - output_path：
   图片保存路径
 
+- **不要写任何 import 语句。** 执行沙箱不提供 `__import__`，写了会直接报
+  `ImportError: __import__ not found`。matplotlib 用 `plt`、pandas 用 `pd`、
+  numpy 用 `np`，都已经在命名空间里。
+
 要求：
 
 1. 优先使用 source_task_id 对应的分析执行结果绘图。

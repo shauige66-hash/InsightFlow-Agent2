@@ -14,18 +14,33 @@ from __future__ import annotations
 from typing import Any
 
 import pandas as pd
+import numpy as np
 
 # 可用的内置函数白名单。
 #
-# 刻意不包含 `__import__`、`open`、`eval`、`exec`、`compile`：
-# 模型代码不能自行导入模块或直接读写文件，只能通过注入的 `pd` / `plt`
-# 与数据集交互。容器本身另有只读根、无网络与资源限制，这里是纵深的一层，
-# 不是唯一防线。
+# 刻意不包含 `open`、`eval`、`exec`、`compile`：模型代码不能直接读写文件或动态
+# 执行代码，只能通过注入的 `pd` / `plt` 与数据集交互。容器本身另有只读根、
+# 无网络与资源限制，这里是纵深的一层，不是唯一防线。
 #
+# `__import__` 单列在下面：把它整个拿掉时，任何 `import` 语句都只会得到
+# CPython 的默认报错 `ImportError: __import__ not found`——模型看不出该怎么改，
+# 于是修复循环原地打转。换成会解释原因的版本，限制完全一样，但错误信息可执行。
+
+
+def _blocked_import(name, globals=None, locals=None, fromlist=(), level=0):  # noqa: ANN001
+    """禁止 import，但把原因和替代写法说清楚。"""
+    raise ImportError(
+        f"沙箱不允许 import（{name}）：matplotlib 用 plt、pandas 用 pd、numpy 用 np，"
+        "它们已经在命名空间里。请删除 import 语句后重试。"
+    )
+
 # 包含异常类：生成代码里 `try/except` 是常见写法（例如"缺列就换个算法"），
 # 拿掉异常类会让这类正常代码直接 NameError。异常类不提供任何访问能力，
 # 放行它们不会放宽上面的边界。
 SAFE_BUILTINS: dict[str, Any] = {
+    # 保留 __import__ 这个名字，但换成会解释原因的拒绝实现：
+    # 直接删掉时，import 语句只会抛出 CPython 的默认错误，模型无从修复。
+    "__import__": _blocked_import,
     "abs": abs,
     "all": all,
     "any": any,
@@ -47,6 +62,27 @@ SAFE_BUILTINS: dict[str, Any] = {
     "sum": sum,
     "tuple": tuple,
     "zip": zip,
+    # 类型判断与迭代：绘图/分析代码里极其常见，且不提供任何访问能力。
+    # 真实模型第一次跑就在这里挂了（NameError: isinstance），mock 从没触发过。
+    "isinstance": isinstance,
+    "issubclass": issubclass,
+    "type": type,
+    "getattr": getattr,
+    "iter": iter,
+    "next": next,
+    "reversed": reversed,
+    "slice": slice,
+    "frozenset": frozenset,
+    "callable": callable,
+    "hash": hash,
+    "repr": repr,
+    "format": format,
+    "divmod": divmod,
+    "pow": pow,
+    "ord": ord,
+    "chr": chr,
+    "map": map,
+    "filter": filter,
     # 异常类型
     "Exception": Exception,
     "BaseException": BaseException,
@@ -140,6 +176,8 @@ def build_plot_scope(
     """
     scope: dict[str, Any] = {
         "dfs": dfs,
+        "pd": pd,
+        "np": np,
         "plt": plt,
         "analysis_result": analysis_result,
         "result_df": build_result_dataframe(analysis_result),
