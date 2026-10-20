@@ -39,6 +39,7 @@ CASES = {
         "data_sources": ["data/customers.csv", "data/orders.csv"],
         "analysis_focus": "分析各地区高价值客户的销售贡献，并给出结论。",
         "dynamic": False,
+        "knowledge_sources": ["knowledge/business_rules.md"],
     },
     "retail-gmv": {
         "data_sources": [
@@ -47,6 +48,12 @@ CASES = {
         ],
         "analysis_focus": "最近两个完整月的 GMV 环比如何？退货金额最高的商品有哪些？",
         "dynamic": True,
+        # 口径必须一起给：这份数据 12 月不完整、M/POST 不是商品。不给口径，
+        # 模型会得出 -74% 和"M 是退货冠军"——两次真实运行都这么答过。
+        "knowledge_sources": [
+            "knowledge/business_rules.md",
+            "knowledge/retail_data_notes.md",
+        ],
     },
 }
 
@@ -107,7 +114,9 @@ def run_case(name: str, spec: dict, output_root: Path) -> dict:
         result = run_analysis(
             data_sources=list(spec["data_sources"]),
             analysis_focus=spec["analysis_focus"],
-            knowledge_sources=["knowledge/business_rules.md"],
+            knowledge_sources=list(
+                spec.get("knowledge_sources") or ["knowledge/business_rules.md"]
+            ),
             run_id=run_id,
             model_factory=build_model_factory(run_id),
             output_root=output_root,

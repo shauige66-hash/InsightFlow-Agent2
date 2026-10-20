@@ -1,47 +1,49 @@
-"""沙箱与绘图代码之间的"隐含契约"。
+"""沙箱与生成代码之间的"隐含契约"。
 
-真实模型第一次跑绘图时踩到的两个坑：写 `import pandas as pd`、用 `isinstance`。
-mock 模型从不写这些，所以只有真实调用才暴露出来。
+真实模型踩到的坑：写 `import pandas as pd`、用 `isinstance`、算时间要 `import time`、
+画图例要 `matplotlib.patches`。mock 模型从不写这些，所以只有真实调用才暴露出来。
 """
 
 from __future__ import annotations
 
 import pytest
 
-from sandbox.bootstrap import SAFE_BUILTINS, build_plot_scope, build_python_scope
-from tools.plot_tool import strip_provided_imports
+from sandbox.bootstrap import (
+    ALLOWED_IMPORTS,
+    SAFE_BUILTINS,
+    build_plot_scope,
+    build_python_scope,
+)
 
 
-class TestImportStripping:
-    def test_canonical_imports_are_removed(self) -> None:
-        code = (
-            "import pandas as pd\n"
-            "import numpy as np\n"
-            "import matplotlib.pyplot as plt\n"
-            "fig = plt.figure()\n"
-        )
+class TestImportAllowlist:
+    @pytest.mark.parametrize(
+        "name",
+        ["time", "datetime", "math", "statistics", "json", "re", "pandas", "numpy"],
+    )
+    def test_pure_computation_modules_are_importable(self, name: str) -> None:
+        """真实模型确实需要这些：算时间、算统计量、序列化中间结果。"""
+        assert SAFE_BUILTINS["__import__"](name) is not None
+        assert name in ALLOWED_IMPORTS
 
-        stripped = strip_provided_imports(code)
+    @pytest.mark.parametrize(
+        "name", ["matplotlib.pyplot", "matplotlib.ticker", "matplotlib.patches"]
+    )
+    def test_matplotlib_submodules_are_importable(self, name: str) -> None:
+        assert SAFE_BUILTINS["__import__"](name) is not None
 
-        assert "import" not in stripped
-        assert "fig = plt.figure()" in stripped
+    @pytest.mark.parametrize("name", ["os", "subprocess", "socket", "pathlib", "shutil", "pickle"])
+    def test_unsafe_modules_are_refused_with_guidance(self, name: str) -> None:
+        with pytest.raises(ImportError) as error:
+            SAFE_BUILTINS["__import__"](name)
 
-    def test_unrelated_imports_are_left_alone(self) -> None:
-        """只剥"已注入模块"的等价写法；真正的动态导入仍然会被沙箱拒绝。"""
-        code = "import json\nfrom matplotlib.ticker import FuncFormatter\nx = 1\n"
+        message = str(error.value)
+        assert "不允许 import" in message
+        assert "可用的模块" in message
 
-        stripped = strip_provided_imports(code)
-
-        assert "import json" in stripped
-        assert "from matplotlib.ticker import FuncFormatter" in stripped
-
-    def test_indented_imports_are_removed_too(self) -> None:
-        code = "def draw():\n    import matplotlib.pyplot as plt\n    return plt.figure()\n"
-
-        stripped = strip_provided_imports(code)
-
-        assert "import matplotlib" not in stripped
-        assert "return plt.figure()" in stripped
+    def test_relative_imports_are_refused(self) -> None:
+        with pytest.raises(ImportError):
+            SAFE_BUILTINS["__import__"]("something", level=1)
 
 
 class TestSandboxBuiltins:
@@ -55,16 +57,6 @@ class TestSandboxBuiltins:
     def test_dangerous_builtins_are_absent(self, name: str) -> None:
         assert name not in SAFE_BUILTINS
 
-    def test_import_fails_with_an_actionable_message(self) -> None:
-        blocked = SAFE_BUILTINS["__import__"]
-
-        with pytest.raises(ImportError) as error:
-            blocked("matplotlib")
-
-        message = str(error.value)
-        assert "不允许 import" in message
-        assert "plt" in message  # 告诉模型该用什么
-
     def test_setattr_is_not_exposed(self) -> None:
         """setattr 能改注入对象的状态，不在白名单里。"""
         assert "setattr" not in SAFE_BUILTINS
@@ -72,11 +64,12 @@ class TestSandboxBuiltins:
 
 
 class TestScopes:
-    def test_the_plot_scope_provides_pandas_and_numpy(self) -> None:
+    def test_the_plot_scope_provides_pandas_numpy_and_ticker(self) -> None:
         scope = build_plot_scope({}, plt=object(), analysis_result={}, output_path="x.png")
 
         assert "pd" in scope
         assert "np" in scope
+        assert "mtick" in scope
         assert scope["output_path"] == "x.png"
 
     def test_the_python_scope_provides_pandas(self) -> None:
@@ -86,12 +79,10 @@ class TestScopes:
         assert "dfs" in scope
 
 
-class TestPrintAndBuiltins:
-    """真实模型的调试习惯：写 print、用 isinstance。mock 从不写这些。"""
+class TestPrint:
+    """真实模型的调试习惯：写 print。mock 从不写。"""
 
-    def test_print_is_available_and_writes_to_stderr(self, capsys) -> None:
-        from sandbox.bootstrap import SAFE_BUILTINS
-
+    def test_print_writes_to_stderr(self, capsys) -> None:
         SAFE_BUILTINS["print"]("调试信息")
 
         captured = capsys.readouterr()
@@ -100,8 +91,6 @@ class TestPrintAndBuiltins:
 
     def test_print_ignores_an_explicit_file(self, capsys) -> None:
         """模型可能写 print(..., file=sys.stderr)；不能因此报错。"""
-        from sandbox.bootstrap import SAFE_BUILTINS
-
         SAFE_BUILTINS["print"]("again", file=None)
 
         assert "again" in capsys.readouterr().err

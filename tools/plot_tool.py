@@ -18,24 +18,11 @@ from utils.result_artifacts import to_jsonable
 
 CHART_ID_PATTERN = re.compile(r"[A-Za-z0-9\_-]+")
 
-# 沙箱已经注入了这些模块（pd / np / mtick / plt），但模型几乎总会先写几行
-# `import pandas as pd`——沙箱禁用 __import__，于是这类"完全等价的 import"
-# 会让绘图在第一步就失败。执行前把它们剥掉：限制没有放松（真正的动态导入仍被
-# 拒绝），只是不让一行多余的 import 毁掉整张图。
-_PROVIDED_IMPORTS = re.compile(
-    r"^[ \t]*(?:"
-    r"import[ \t]+(?:pandas|numpy|matplotlib\.ticker|matplotlib\.pyplot|matplotlib)"
-    r"(?:[ \t]+as[ \t]+\w+)?"
-    r"|from[ \t]+(?:pandas|numpy|matplotlib\.ticker|matplotlib\.pyplot)(?:\.\w+)?"
-    r"[ \t]+import[ \t]+[\w, \t\*\(\)]+"
-    r")[ \t]*\r?\n?",
-    re.MULTILINE,
-)
 
-
-def strip_provided_imports(code: str) -> str:
-    """去掉等价于"已注入模块"的 import 行。"""
-    return _PROVIDED_IMPORTS.sub("", code or "")
+# 这里曾经有一个"执行前剥掉 pandas/matplotlib import"的步骤，用来绕开沙箱的
+# import 禁令。沙箱改成白名单导入后它不再需要，而且有害：
+# `import matplotlib.patches as mpatches` 被剥掉之后，代码里的 mpatches 就未定义，
+# 报的还是 NameError——一个自己造出来的错误。
 
 
 def create_plot_tool(
@@ -108,7 +95,7 @@ def create_plot_tool(
         job = SandboxJob(
             mode="plot",
             table_names=list(sandbox_tables),
-            code=strip_provided_imports(code),
+            code=code,
             analysis_result=analysis_result,
             output_filename=output_filename,
             op_label=f"plot:{chart_id}",

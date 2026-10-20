@@ -11,6 +11,7 @@
 
 from __future__ import annotations
 
+import builtins
 import sys
 from typing import Any
 
@@ -18,22 +19,48 @@ import pandas as pd
 import numpy as np
 import matplotlib.ticker as mtick
 
-# 可用的内置函数白名单。
+# 允许导入的模块。
 #
-# 刻意不包含 `open`、`eval`、`exec`、`compile`：模型代码不能直接读写文件或动态
-# 执行代码，只能通过注入的 `pd` / `plt` 与数据集交互。容器本身另有只读根、
-# 无网络与资源限制，这里是纵深的一层，不是唯一防线。
+# 一开始的做法是"禁止一切 import"，把 pd / plt 注入命名空间就够了。真实的模型
+# 不这么写：算时间要 `import time`、算周期要 `datetime`、画图例要
+# `matplotlib.patches`，于是每换一个任务就冒出一个新的 ImportError，修复循环也
+# 改不动（它只知道"不允许 import"）。
 #
-# `__import__` 单列在下面：把它整个拿掉时，任何 `import` 语句都只会得到
-# CPython 的默认报错 `ImportError: __import__ not found`——模型看不出该怎么改，
-# 于是修复循环原地打转。换成会解释原因的版本，限制完全一样，但错误信息可执行。
+# 改成白名单：只放行纯计算、无文件与网络能力的模块。容器本身仍有只读根、无网络、
+# 非 root 与资源上限，这里是纵深的一层，不是唯一防线。
+ALLOWED_IMPORTS = frozenset(
+    {
+        # 纯计算与文本处理
+        "math", "statistics", "decimal", "fractions", "random",
+        "re", "json", "string", "textwrap", "unicodedata",
+        "datetime", "calendar", "time",
+        "itertools", "functools", "collections", "operator", "copy", "enum",
+        # 数据处理与绘图
+        "numpy", "pandas", "matplotlib",
+        "matplotlib.pyplot", "matplotlib.ticker", "matplotlib.patches",
+        "matplotlib.colors", "matplotlib.dates", "matplotlib.lines",
+        "matplotlib.transforms", "matplotlib.figure", "matplotlib.axes",
+    }
+)
+
+_ALLOWED_ROOTS = frozenset(name.split(".")[0] for name in ALLOWED_IMPORTS)
+
+_REAL_IMPORT = builtins.__import__
 
 
-def _blocked_import(name, globals=None, locals=None, fromlist=(), level=0):  # noqa: ANN001
-    """禁止 import，但把原因和替代写法说清楚。"""
+def _guarded_import(name, globals=None, locals=None, fromlist=(), level=0):  # noqa: ANN001
+    """只放行白名单模块，其余给出可执行的错误信息。"""
+    if level:
+        raise ImportError("沙箱不支持相对导入，请使用绝对模块名。")
+
+    allowed = name in ALLOWED_IMPORTS or name.split(".")[0] in _ALLOWED_ROOTS
+    if allowed:
+        return _REAL_IMPORT(name, globals, locals, fromlist, level)
+
     raise ImportError(
-        f"沙箱不允许 import（{name}）：matplotlib 用 plt、pandas 用 pd、numpy 用 np，"
-        "它们已经在命名空间里。请删除 import 语句后重试。"
+        f"沙箱不允许 import（{name}）。可用的模块：math/statistics/datetime/time/json/re/"
+        "itertools/collections 等标准库，以及 numpy/pandas/matplotlib 及其子模块；"
+        "数据已通过 pd/dfs 提供，绘图用 plt。"
     )
 
 
@@ -51,9 +78,8 @@ def _print_to_stderr(*args, **kwargs):  # noqa: ANN002, ANN003
 # 拿掉异常类会让这类正常代码直接 NameError。异常类不提供任何访问能力，
 # 放行它们不会放宽上面的边界。
 SAFE_BUILTINS: dict[str, Any] = {
-    # 保留 __import__ 这个名字，但换成会解释原因的拒绝实现：
-    # 直接删掉时，import 语句只会抛出 CPython 的默认错误，模型无从修复。
-    "__import__": _blocked_import,
+    # 白名单式导入：放行纯计算与绘图模块，其余拒绝并说明可用的替代
+    "__import__": _guarded_import,
     # print 重定向到 stderr：stdout 是协议流，但调试输出不该让代码直接失败
     "print": _print_to_stderr,
     "abs": abs,
