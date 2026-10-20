@@ -84,3 +84,24 @@ class TestScopes:
 
         assert "pd" in scope
         assert "dfs" in scope
+
+
+class TestPrintAndBuiltins:
+    """真实模型的调试习惯：写 print、用 isinstance。mock 从不写这些。"""
+
+    def test_print_is_available_and_writes_to_stderr(self, capsys) -> None:
+        from sandbox.bootstrap import SAFE_BUILTINS
+
+        SAFE_BUILTINS["print"]("调试信息")
+
+        captured = capsys.readouterr()
+        assert "调试信息" in captured.err
+        assert captured.out == ""  # stdout 必须留给协议流
+
+    def test_print_ignores_an_explicit_file(self, capsys) -> None:
+        """模型可能写 print(..., file=sys.stderr)；不能因此报错。"""
+        from sandbox.bootstrap import SAFE_BUILTINS
+
+        SAFE_BUILTINS["print"]("again", file=None)
+
+        assert "again" in capsys.readouterr().err

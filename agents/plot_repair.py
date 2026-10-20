@@ -13,6 +13,7 @@ from langchain_core.language_models import BaseChatModel
 from langchain_core.prompts import PromptTemplate
 
 from state import ExecutionResult, VisualizationTask
+from agents.result_shape import describe_result_shape
 from utils.llm_retry import invoke_json_with_retry
 
 PLOT_REPAIR_PROMPT = """
@@ -82,6 +83,10 @@ PLOT_REPAIR_PROMPT = """
    不要重新从原始数据重复计算已经完成的分析。
 
 4. analysis_result 用于访问无法直接表示为单个 DataFrame 的分析结果。
+
+   本次 analysis_result 的实际结构如下（**只能使用这些键**）：
+
+{result_shape}
 
 5. 只有当分析执行结果不足以完成原始可视化任务时，
    才使用 dfs 中的原始 DataFrame 进行必要的补充处理。
@@ -187,7 +192,8 @@ def repair_plot_code(
         default=str
     ),
     "code": code,
-    "error": error
+    "error": error,
+    "result_shape": describe_result_shape(execution_result),
 }
     # 按节点预算压缩上下文。
     # 不可压缩字段见 utils.context_budget.NODE_PRESERVE_FIELDS；

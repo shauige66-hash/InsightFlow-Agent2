@@ -11,6 +11,7 @@
 
 from __future__ import annotations
 
+import sys
 from typing import Any
 
 import pandas as pd
@@ -34,6 +35,17 @@ def _blocked_import(name, globals=None, locals=None, fromlist=(), level=0):  # n
         "它们已经在命名空间里。请删除 import 语句后重试。"
     )
 
+
+def _print_to_stderr(*args, **kwargs):  # noqa: ANN002, ANN003
+    """`print` 写 stderr，不碰 stdout。
+
+    stdout 是宿主解析结果用的协议流（最后一行是 JSON）。模型用 print 调试很常见，
+    直接不给它会得到 NameError；给一个重定向到 stderr 的版本，既保住协议，
+    也让调试输出能被 executor 捕获下来。
+    """
+    kwargs.pop("file", None)
+    print(*args, file=sys.stderr, **kwargs)
+
 # 包含异常类：生成代码里 `try/except` 是常见写法（例如"缺列就换个算法"），
 # 拿掉异常类会让这类正常代码直接 NameError。异常类不提供任何访问能力，
 # 放行它们不会放宽上面的边界。
@@ -41,6 +53,8 @@ SAFE_BUILTINS: dict[str, Any] = {
     # 保留 __import__ 这个名字，但换成会解释原因的拒绝实现：
     # 直接删掉时，import 语句只会抛出 CPython 的默认错误，模型无从修复。
     "__import__": _blocked_import,
+    # print 重定向到 stderr：stdout 是协议流，但调试输出不该让代码直接失败
+    "print": _print_to_stderr,
     "abs": abs,
     "all": all,
     "any": any,

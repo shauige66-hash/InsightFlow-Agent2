@@ -1720,7 +1720,8 @@ def report_node(
     # 被引用的业务规则要能追到来源，因此附录由证据生成，而不是让模型复述
     appendix = _citations_appendix(state)
     charts = _charts_appendix(state, report)
-    suffix = f"{appendix}{charts}"
+    failures = _failed_charts_appendix(state)
+    suffix = f"{appendix}{charts}{failures}"
 
     return {
         "report_content": (
@@ -1729,6 +1730,26 @@ def report_node(
         "completed_operations": _ops,
         **_extra,
     }
+
+
+def _failed_charts_appendix(state: InsightFlowState) -> str:
+    """把没能生成的图表列进报告。
+
+    图表是报告的一部分；少一张图而正文只字不提，读者会以为那就是全部结论。
+    """
+    failed = state.get("failed_charts") or []
+    if not failed:
+        return ""
+
+    lines = ["", "## 未能生成的图表", ""]
+    for item in failed:
+        reason = str(item.get("error") or "未知原因").strip().replace("\n", " ")
+        lines.append(
+            f"- `{item.get('chart_id')}`（来源任务 {item.get('source_task_id')}）：{reason[:200]}"
+        )
+    lines.append("")
+    lines.append("这些图表没有产出，不影响已生成的图表与结论。")
+    return "\n".join(lines)
 
 
 def artifact_node(
@@ -2615,6 +2636,8 @@ def advance_chart_node(
 
     run_id = state.get("run_id")
 
+    failed_charts = None
+
     if (
         run_id is not None
         and latest_result is not None
@@ -2665,14 +2688,28 @@ def advance_chart_node(
                 }
             )
 
+            # 图表失败只写日志的话，报告里看起来"一切正常"，读者并不知道少了一张图。
+            # 记进 state，由报告把它列出来。
+            failed_charts = list(state.get("failed_charts") or [])
+            failed_charts.append(
+                {
+                    "chart_id": chart_id,
+                    "source_task_id": visualization_task["source_task_id"],
+                    "error": latest_result.get("error"),
+                }
+            )
+
     next_index = current_index + 1
 
-    return {
+    updates = {
         "current_chart_index": next_index,
         "current_plot_code": None,
         "plot_error": None,
         "plot_retry_count": 0
     }
+    if failed_charts:
+        updates["failed_charts"] = failed_charts
+    return updates
 
 
 @_with_state

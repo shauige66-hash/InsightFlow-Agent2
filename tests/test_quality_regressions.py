@@ -325,3 +325,33 @@ class TestDefect7ChartsMissingFromReport:
         import nodes
 
         assert nodes._charts_appendix({}, "# 报告") == ""
+
+
+class TestDefect8FailedChartsHidden:
+    """图表失败只写日志时，报告里看起来"一切正常"，读者不知道少了一张图。"""
+
+    def test_failed_charts_are_listed_in_the_report(self) -> None:
+        import nodes
+
+        section = nodes._failed_charts_appendix(
+            {
+                "failed_charts": [
+                    {
+                        "chart_id": "chart_3",
+                        "source_task_id": "task_4",
+                        "error": "KeyError: 'hv_sales_contribution'",
+                    }
+                ]
+            }
+        )
+
+        assert "## 未能生成的图表" in section
+        assert "chart_3" in section
+        assert "task_4" in section
+        assert "KeyError" in section
+
+    def test_no_section_when_every_chart_succeeded(self) -> None:
+        import nodes
+
+        assert nodes._failed_charts_appendix({}) == ""
+        assert nodes._failed_charts_appendix({"failed_charts": []}) == ""

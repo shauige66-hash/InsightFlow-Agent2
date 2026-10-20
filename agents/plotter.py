@@ -13,6 +13,7 @@ from langchain_core.language_models import BaseChatModel
 from langchain_core.prompts import PromptTemplate
 
 from state import ExecutionResult, VisualizationTask
+from agents.result_shape import describe_result_shape
 from langchain_core.exceptions import OutputParserException
 
 PLOT_PROMPT = """
@@ -82,6 +83,12 @@ PLOT_PROMPT = """
    不要重新从原始数据重复计算已经完成的分析。
 
 3. analysis_result 用于访问无法直接表示为单个 DataFrame 的分析结果。
+
+   本次 analysis_result 的实际结构如下：
+
+{result_shape}
+
+   只能使用上面列出的键；取不存在的键会抛 KeyError，修复阶段也救不回来。
 
 4. 只有当分析执行结果不足以完成可视化任务时，
    才使用 dfs 中的原始 DataFrame 进行必要的补充处理。
@@ -178,7 +185,8 @@ def generate_plot_code(
             ensure_ascii=False,
             indent=2,
             default=str
-        )
+        ),
+        "result_shape": describe_result_shape(execution_result),
     }
     # 按节点预算压缩上下文。
     # 不可压缩字段见 utils.context_budget.NODE_PRESERVE_FIELDS；
