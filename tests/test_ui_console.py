@@ -82,3 +82,43 @@ class TestRunArtifactRoute:
         client = TestClient(api.app)
         # 编码后的 ../ 由 Starlette 解码后进入路径参数；即使命中也不得读到目录外文件
         assert client.get("/runs/run_x/..%2F..%2Fapi.py").status_code == 404
+
+
+class TestArtifactRoutePathTraversal:
+    """IF-02：run_id 未校验时，Windows 上可读出输出根之外的任意图片。
+
+    修复前实测：`GET /runs/C:%5CUsers%5C...%5Cprobe/escape.png` 返回 200 与文件内容。
+    """
+
+    def test_an_absolute_run_id_is_refused(self, tmp_path, monkeypatch) -> None:
+        import api as api_module
+        import api_runs
+
+        root = tmp_path / "outputs"
+        (root / "run_ok").mkdir(parents=True)
+        (root / "run_ok" / "chart_1.png").write_bytes(b"\x89PNG\r\n\x1a\n")
+        outside = tmp_path / "escape.png"
+        outside.write_bytes(b"\x89PNG\r\n\x1a\nsecret")
+
+        monkeypatch.setattr(api_runs, "OUTPUT_ROOT", root)
+        client = TestClient(api_module.app)
+
+        for run_id in (str(tmp_path), "..", "C:%5CWindows"):
+            response = client.get(f"/runs/{run_id}/chart_1.png")
+            assert response.status_code == 404, (run_id, response.status_code)
+
+    def test_a_normal_artifact_is_served(self, tmp_path, monkeypatch) -> None:
+        import api as api_module
+        import api_runs
+
+        root = tmp_path / "outputs"
+        (root / "run_ok").mkdir(parents=True)
+        (root / "run_ok" / "chart_1.png").write_bytes(b"\x89PNG\r\n\x1a\nok")
+
+        monkeypatch.setattr(api_runs, "OUTPUT_ROOT", root)
+        client = TestClient(api_module.app)
+
+        response = client.get("/runs/run_ok/chart_1.png")
+
+        assert response.status_code == 200
+        assert response.content.endswith(b"ok")

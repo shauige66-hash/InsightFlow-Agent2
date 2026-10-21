@@ -502,14 +502,27 @@ def download_report(
 def run_artifact(run_id: str, filename: str) -> FileResponse:
     import api_runs
 
+    # run_id 也必须校验：只校验文件名是不够的。Windows 上把 `C:\...` 或
+    # `..\..\..` 编码进 run_id，`Path(output_root) / run_id / name` 会直接指向
+    # 输出根之外（绝对路径还会替换整个左侧），等于"按 run_id 读任意图片"。
+    # 这个漏洞在实现产物路由时真实存在过，由此固定为：形态校验 + 根目录校验。
+    # 对外统一回 404，避免把"这个 run_id 形态非法"与"文件不存在"区分成探测信号。
+    try:
+        api_runs._validate_run_id(run_id)
+    except HTTPException:
+        raise HTTPException(status_code=404, detail="产物不存在") from None
+
     name = filename.strip()
     if not name or "/" in name or "\\" in name or ".." in name or name.startswith("."):
         raise HTTPException(status_code=404, detail="不允许的文件名")
     if Path(name).suffix.lower() not in {".png", ".svg", ".jpg", ".jpeg", ".webp"}:
         raise HTTPException(status_code=404, detail="只提供图片产物")
 
-    candidate = Path(api_runs.OUTPUT_ROOT) / run_id / name
-    if not candidate.is_file():
+    root = Path(api_runs.OUTPUT_ROOT).resolve()
+    candidate = (root / run_id / name).resolve()
+
+    # 形态校验之后再加一层：解析后的路径必须仍在输出根之内。
+    if root not in candidate.parents or not candidate.is_file():
         raise HTTPException(status_code=404, detail=f"产物不存在：{name}")
 
     return FileResponse(path=str(candidate))
