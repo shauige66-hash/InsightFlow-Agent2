@@ -196,6 +196,9 @@ def ui_root() -> RedirectResponse:
 def report_html(run_id: str) -> FileResponse:
     """同一份报告的 HTML 版本：浏览器里直接读，比下载 PDF 更适合演示。"""
     import api_runs
+    from utils.html_safety import REPORT_CSP
+
+    api_runs._validate_run_id(run_id)
 
     report_path = Path(api_runs.OUTPUT_ROOT) / run_id / "analysis_report.html"
     if not report_path.exists():
@@ -203,9 +206,16 @@ def report_html(run_id: str) -> FileResponse:
             status_code=404,
             detail=f"该运行没有 HTML 报告：{run_id}",
         )
+    # 报告正文源自模型与用户文档，按不可信内容对待：
+    # 文档内已嵌 CSP，这里再用响应头声明一次，避免被 "文件已存在" 的旧产物绕过。
     return FileResponse(
         path=str(report_path),
         media_type="text/html; charset=utf-8",
+        headers={
+            "Content-Security-Policy": REPORT_CSP,
+            "Referrer-Policy": "no-referrer",
+            "X-Content-Type-Options": "nosniff",
+        },
     )
 
 

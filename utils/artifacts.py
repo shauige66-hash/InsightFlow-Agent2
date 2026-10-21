@@ -45,12 +45,21 @@ def save_html_report(
         ]
     )
 
+    # 正文来自模型，模型读过用户上传的文档——必须当不可信内容处理：
+    # 不过白名单就直接拼进 HTML，等于交付一个能读到控制台 token 的存储型 XSS。
+    from utils.html_safety import REPORT_CSP, sanitize_report_html
+
+    body = sanitize_report_html(body)
+
     html = f"""
 <!DOCTYPE html>
 <html lang="zh-CN">
 
 <head>
     <meta charset="UTF-8">
+
+    <meta http-equiv="Content-Security-Policy" content="{REPORT_CSP}">
+    <meta name="referrer" content="no-referrer">
 
     <title>InsightFlow Analysis Report</title>
 
@@ -190,11 +199,22 @@ def save_pdf_report(
             playwright
         )
 
-        page = browser.new_page()
+        page = browser.new_page(java_script_enabled=False)
+
+        # 报告里可能引用了远程图片或链接：导出 PDF 时不让它们真的发出去。
+        # 只放行本地文件与内联数据，其余一律 abort——PDF 不该成为外发通道。
+        def _local_only(route) -> None:
+            url = route.request.url
+            if url.startswith("file://") or url.startswith("data:") or url.startswith("about:"):
+                route.continue_()
+            else:
+                route.abort()
+
+        page.route("**/*", _local_only)
 
         page.goto(
             source_path.as_uri(),
-            wait_until="networkidle"
+            wait_until="load"
         )
 
         page.pdf(
