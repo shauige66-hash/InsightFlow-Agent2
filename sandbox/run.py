@@ -253,6 +253,7 @@ def run_plot(job: dict[str, Any], tables: dict[str, Any]) -> dict[str, Any]:
 
 def main() -> int:
     outcome: dict[str, Any]
+    job: dict[str, Any] = {}
 
     try:
         job = load_job()
@@ -297,9 +298,12 @@ def main() -> int:
         outcome["traceback_tail"] = traceback.format_exc()[-1200:]
 
     RESULT_PATH.parent.mkdir(parents=True, exist_ok=True)
-    RESULT_PATH.write_text(
+    outcome["attempt_id"] = job.get("attempt_id")
+    temporary_result = RESULT_PATH.with_suffix(".tmp")
+    temporary_result.write_text(
         json.dumps(outcome, ensure_ascii=False, default=str), encoding="utf-8"
     )
+    temporary_result.replace(RESULT_PATH)
 
     # stdout 预留给协议类用途，诊断信息走 stderr
     print(json.dumps({"ok": outcome["success"]}), file=sys.stderr)

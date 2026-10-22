@@ -1,21 +1,27 @@
 # 项目启动入口，负责通过命令行启动 InsightFlow 分析流程。
 
 from services.analysis_service import run_analysis
+from core.llm import build_model_factory
+from utils.run_logger import create_run_id
+from pathlib import Path
 
 
 def main():
-
+    run_id = create_run_id()
+    root = Path(__file__).resolve().parent
     result = run_analysis(
+        run_id=run_id,
+        model_factory=build_model_factory(run_id),
         data_sources=[
-            "data/customers.csv",
-            "data/orders.csv"
+            str(root / "data/customers.csv"),
+            str(root / "data/orders.csv")
         ],
         analysis_focus=(
             "分析不同地区的高价值客户表现，"
             "并比较各地区高价值客户的销售贡献。"
         ),
         knowledge_sources=[
-            "knowledge/business_rules.md"
+            str(root / "knowledge/business_rules.md")
         ]
     )
 

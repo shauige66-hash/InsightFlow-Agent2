@@ -27,6 +27,7 @@ from typing import Any
 import pandas as pd
 
 from ingestion.models import TableResource
+from ingestion.loader import _reserve_name
 
 # 计算内容指纹时的分块大小，避免一次把大文件读进内存
 _HASH_CHUNK = 1024 * 1024
@@ -134,6 +135,7 @@ def build_snapshots(data_sources: list[str]) -> dict[str, TableSnapshot]:
 
         if source_type == "csv":
             table_name = path.stem
+            _reserve_name(snapshots, table_name)
             snapshots[table_name] = TableSnapshot(
                 name=table_name,
                 source_type="csv",
@@ -146,6 +148,7 @@ def build_snapshots(data_sources: list[str]) -> dict[str, TableSnapshot]:
             sheets = pd.read_excel(path, sheet_name=None)
             for sheet_name in sheets:
                 table_name = f"{path.stem}.{sheet_name}"
+                _reserve_name(snapshots, table_name)
                 snapshots[table_name] = TableSnapshot(
                     name=table_name,
                     source_type="excel",
@@ -158,6 +161,7 @@ def build_snapshots(data_sources: list[str]) -> dict[str, TableSnapshot]:
         else:
             for table_name in _sqlite_table_names(path):
                 key = f"{path.stem}.{table_name}"
+                _reserve_name(snapshots, key)
                 snapshots[key] = TableSnapshot(
                     name=key,
                     source_type="sqlite",

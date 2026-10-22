@@ -2,7 +2,7 @@
 
 三个概念分开，否则缓存会串：
 
-- **namespace**：授权范围。由 owner 与知识源文件名集合决定，内容更新不改变它。
+- **namespace**：请求 owner、知识源规范路径和索引配置的身份，内容更新不改变它。
 - **knowledge_version**：内容版本。文件内容、切分配置或 embedding 模型任一变化
   都会改变它，缓存键因此失效。
 - **query fingerprint**：检索问句的归一化哈希。
@@ -13,16 +13,22 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import re
 from pathlib import Path
 
-from rag.chunker import CHUNK_OVERLAP, CHUNK_SIZE
-from rag.vector_store import EMBEDDING_MODEL
+from rag.chunker import CHUNK_OVERLAP, CHUNK_SIZE, CHUNKER_VERSION, MODEL_MAX_TOKENS
+from rag.vector_store import EMBEDDING_MODEL, EMBEDDING_REVISION
 
-#: embedding 模型版本：同一模型名 + 同一维度才算同一个索引口径。
-EMBEDDING_MODEL_VERSION = f"{EMBEDDING_MODEL}@384"
+#: embedding 模型名、固定revision与维度共同标识索引口径。
+EMBEDDING_MODEL_VERSION = f"{EMBEDDING_MODEL}@{EMBEDDING_REVISION}:384"
 
 _WHITESPACE = re.compile(r"\s+")
+
+
+class KnowledgeSourceChanged(ValueError):
+    """A run cannot combine results produced under different business rules."""
+    error_kind = "knowledge_changed"
 
 
 def file_content_hash(path: str | Path) -> str:
@@ -34,10 +40,17 @@ def file_content_hash(path: str | Path) -> str:
 
 
 def knowledge_namespace(owner: str, knowledge_sources: list[str]) -> str:
-    """授权命名空间：同一批文件名视为同一个知识库。"""
-    names = "|".join(sorted(Path(source).name for source in knowledge_sources))
+    """Namespace is owner + canonical source identities, never display names."""
+    names = "|".join([
+        *sorted(source_identity(source) for source in knowledge_sources),
+        f"index={EMBEDDING_MODEL_VERSION}/{CHUNKER_VERSION}/{CHUNK_SIZE}/{CHUNK_OVERLAP}/{MODEL_MAX_TOKENS}",
+    ])
     digest = hashlib.sha256(names.encode("utf-8")).hexdigest()[:16]
     return f"kb:{owner}:{digest}"
+
+
+def source_identity(source: str | Path) -> str:
+    return os.path.normcase(str(Path(source).expanduser().resolve()))
 
 
 def knowledge_version(knowledge_sources: list[str]) -> str:
@@ -47,11 +60,12 @@ def knowledge_version(knowledge_sources: list[str]) -> str:
         path = Path(source)
         if not path.exists():
             raise FileNotFoundError(f"Knowledge source not found: {path}")
-        entries.append(f"{path.name}:{file_content_hash(path)}")
+        entries.append(f"{source_identity(path)}:{file_content_hash(path)}")
     payload = "|".join(
         [
             *sorted(entries),
             f"chunk={CHUNK_SIZE}/{CHUNK_OVERLAP}",
+            f"chunker={CHUNKER_VERSION}/{MODEL_MAX_TOKENS}",
             f"model={EMBEDDING_MODEL_VERSION}",
         ]
     )
@@ -74,4 +88,5 @@ __all__ = [
     "knowledge_version",
     "normalize_query",
     "query_fingerprint",
+    "source_identity",
 ]

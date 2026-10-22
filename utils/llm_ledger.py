@@ -25,6 +25,7 @@ from typing import Any
 
 PHASE_STARTED = "started"
 PHASE_COMPLETED = "completed"
+PHASE_REQUEST = "request"
 
 
 def ledger_path(run_id: str, root: Path | str = "outputs") -> Path:
@@ -65,6 +66,7 @@ def record_started(
             "node": node,
             "attempt": attempt,
             "at": time.time(),
+            "request_accounting": "per_request",
         },
         root=root,
     )
@@ -109,6 +111,19 @@ def read_entries(run_id: str, root: Path | str = "outputs") -> list[dict[str, An
     return entries
 
 
+def record_request(*, run_id: str, used: int, operation_id: str = "", node: str = "", attempt: int = 1, root: Path | str = "outputs") -> None:
+    """持久化一次将发出的真实请求预算预留。失败写入会阻止发出请求。"""
+    append({"phase": PHASE_REQUEST, "run_id": run_id, "operation_id": operation_id, "node": node, "attempt": attempt, "used": used, "at": time.time()}, root=root)
+
+
+def request_count(run_id: str, root: Path | str = "outputs") -> int:
+    """真实请求预留的持久化下界；旧账本仅能保守计入每次逻辑 started。"""
+    entries = read_entries(run_id, root)
+    requests = [row for row in entries if row.get("phase") == PHASE_REQUEST]
+    legacy = sum(row.get("phase") == PHASE_STARTED and row.get("request_accounting") != "per_request" for row in entries)
+    return max([len(requests) + legacy] + [int(row.get("used") or 0) for row in requests])
+
+
 def summarize(run_id: str, root: Path | str = "outputs") -> dict[str, Any]:
     """汇总一个 Run 的调用情况。
 
@@ -120,20 +135,24 @@ def summarize(run_id: str, root: Path | str = "outputs") -> dict[str, Any]:
     started: dict[str, int] = {}
     completed: dict[str, int] = {}
     per_node: dict[str, dict[str, int]] = {}
+    last_phase: dict[str, str] = {}
 
     for entry in entries:
+        if entry.get("phase") not in (PHASE_STARTED, PHASE_COMPLETED):
+            continue
         op = entry.get("operation_id", "")
+        last_phase[op] = entry["phase"]
         node = entry.get("node", "")
         bucket = per_node.setdefault(node, {"started": 0, "completed": 0})
 
         if entry.get("phase") == PHASE_STARTED:
             started[op] = started.get(op, 0) + 1
             bucket["started"] += 1
-        else:
+        elif entry.get("phase") == PHASE_COMPLETED:
             completed[op] = completed.get(op, 0) + 1
             bucket["completed"] += 1
 
-    unconfirmed = sorted(op for op in started if op not in completed)
+    unconfirmed = sorted(op for op in started if last_phase.get(op) == PHASE_STARTED)
     replayed = sorted(op for op, count in started.items() if count > 1)
 
     return {
@@ -144,4 +163,5 @@ def summarize(run_id: str, root: Path | str = "outputs") -> dict[str, Any]:
         "per_node": per_node,
         "unconfirmed_operations": unconfirmed,
         "replayed_operations": replayed,
+        "total_requests": request_count(run_id, root),
     }

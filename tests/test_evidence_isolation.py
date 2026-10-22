@@ -34,6 +34,8 @@ def test_evidence_path_defaults_to_the_tracked_location(
 
 def test_the_public_evidence_file_is_git_tracked() -> None:
     """前提检查：默认落点确实是已跟踪文件，因此才需要跳过覆盖。"""
+    if not (success.PROJECT_ROOT / ".git").exists():
+        pytest.skip("源码导出/隔离副本无Git元数据；不伪造跟踪状态")
     assert success._is_tracked_by_git(
         success.PROJECT_ROOT / "docs" / "evidence" / "modelgate-success.json"
     ), "公开证据文件未被 Git 跟踪，这条防护的前提变了"
@@ -45,6 +47,9 @@ def test_dump_evidence_does_not_touch_the_public_file(
     """取证走默认落点时必须跳过写入，公开文件内容保持不变。"""
     target = success.PROJECT_ROOT / "docs" / "evidence" / "modelgate-success.json"
     original = target.read_text(encoding="utf-8")
+    # This unit test exercises the tracked-file guard. Its metadata premise is
+    # checked separately above; an exported source tree has no .git to query.
+    monkeypatch.setattr(success, "_is_tracked_by_git", lambda path: path.resolve() == target.resolve())
 
     monkeypatch.delenv("MODELGATE_EVIDENCE_DIR", raising=False)
     monkeypatch.setattr(

@@ -6,10 +6,9 @@
 # 与 dev 的 deploy/compose.yaml 的区别：那份只起本地开发依赖，API 在你本机跑；
 # 这份把 API 也装进容器，用 PostgreSQL 存会话/记忆/知识，Redis 做检索缓存。
 #
-# 已知限制（写在 README 里，不藏着）：
-# 分析代码在 Docker 沙箱里执行，容器内的 API 需要访问宿主 Docker 才能 `docker run`。
-# Linux 下把下面 api.volumes 里的 docker.sock 取消注释即可；Windows/macOS 的
-# Docker Desktop 不支持把 socket 传进容器，建议本机直接跑 API，或用纯 SQL 分析。
+# 默认为容器化 API/存储（SQL 分析可用）。Python/Plot 需受信 Linux runner；
+# 使用 compose.sandbox.yaml 的同路径挂载、Docker socket/GID 合同，详见 deploy/README.md。
+# Windows/macOS Docker Desktop 建议 API 在宿主运行。
 
 name: insightflow
 
@@ -56,6 +55,7 @@ services:
       INSIGHTFLOW_EXECUTION: ${INSIGHTFLOW_EXECUTION:-inline}
       # 留空即单用户演示模式；设置了就强制 Bearer 鉴权
       INSIGHTFLOW_API_KEYS: ${INSIGHTFLOW_API_KEYS:-}
+      INSIGHTFLOW_ARTIFACT_SIGNING_KEY: ${INSIGHTFLOW_ARTIFACT_SIGNING_KEY:-}
       DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
       DEEPSEEK_BASE_URL: ${DEEPSEEK_BASE_URL:-https://api.deepseek.com/v1}
       DEEPSEEK_MODEL: ${DEEPSEEK_MODEL:-deepseek-chat}
@@ -67,13 +67,12 @@ services:
     volumes:
       - outputs:/app/outputs
       - uploads:/app/uploads
-      # 需要容器内执行 Python 分析时在 Linux 上取消注释：
-      # - /var/run/docker.sock:/var/run/docker.sock
+      # Python/Plot 使用 Linux 专用 compose.sandbox.yaml；单挂 socket 不足。
     restart: unless-stopped
 
   # 队列模式的执行者。只在 INSIGHTFLOW_EXECUTION=queue 时启动：
-  #   INSIGHTFLOW_EXECUTION=queue docker compose -f deploy/compose.app.yaml up -d
-  # 它可以横向扩多个副本——抢占用 SKIP LOCKED，不会重复执行同一个 Run。
+  #   INSIGHTFLOW_EXECUTION=queue docker compose -f deploy/compose.app.yaml --profile queue up -d
+  # 抢占使用 SKIP LOCKED，Run 执行另用持续续租与 fencing；不是模型请求恰好一次。
   worker:
     build:
       context: ..

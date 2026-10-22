@@ -71,7 +71,7 @@ def _memory() -> MemoryService:
 
 @router.post("/sessions", status_code=status.HTTP_201_CREATED)
 def create_session(payload: CreateSessionRequest) -> dict[str, Any]:
-    from api_runs import _validate_data_sources
+    from api_runs import _validate_data_sources, _validate_knowledge_sources
 
     dataset_refs = _validate_data_sources(payload.dataset_refs)
     if not dataset_refs:
@@ -82,7 +82,7 @@ def create_session(payload: CreateSessionRequest) -> dict[str, Any]:
     return _service().create_session(
         title=payload.title,
         dataset_refs=dataset_refs,
-        knowledge_refs=payload.knowledge_refs,
+        knowledge_refs=_validate_knowledge_sources(payload.knowledge_refs),
     )
 
 

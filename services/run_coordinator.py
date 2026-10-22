@@ -16,6 +16,13 @@ from __future__ import annotations
 
 import logging
 import threading
+import os
+import uuid
+from contextvars import copy_context
+from collections import OrderedDict
+
+import storage
+from services.run_identity import LeaseLost, RunConflict, execution_lease
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from pathlib import Path
@@ -64,37 +71,40 @@ class RunExecutor:
         )
         self._lock = threading.Lock()
         self._futures: dict[str, Any] = {}
+        self._recent: OrderedDict[str, Any] = OrderedDict()
+        self._capacity = threading.BoundedSemaphore(max_workers+32)
         self._heartbeats: dict[str, threading.Event] = {}
 
-    def submit(self, run_id: str, work: Callable[[], Any]) -> None:
-        stop = threading.Event()
-        heartbeat = threading.Thread(
-            target=self._beat, args=(run_id, stop), daemon=True
-        )
-
+    def submit(self, run_id: str, work: Callable[[], Any]) -> bool:
+        context = copy_context()
         with self._lock:
-            self._futures[run_id] = self._pool.submit(work)
-            self._heartbeats[run_id] = stop
-            heartbeat.start()
-
-    def _beat(self, run_id: str, stop: threading.Event) -> None:
-        """执行期间定期刷新心跳。
-
-        没有心跳就无法区分"正在执行"与"执行者已崩溃"，
-        被杀死的 Run 会永远显示为 running。
-        """
-        interval = max(1.0, STALE_HEARTBEAT_SECONDS / 6)
-        while not stop.wait(interval):
+            existing=self._futures.get(run_id)
+            if existing is not None and not existing.done():
+                return False
+            if not self._capacity.acquire(blocking=False):
+                raise RunConflict("执行队列已满，请稍后重试同一请求")
             try:
-                self._store.touch(run_id)
-            except Exception:  # noqa: BLE001 - 心跳失败不应影响执行
-                return
+                future=self._pool.submit(context.run,work)
+            except Exception:
+                self._capacity.release()
+                raise
+            self._futures[run_id]=future
+        def complete(done):
+            with self._lock:
+                if self._futures.get(run_id) is done:
+                    self._futures.pop(run_id,None)
+                self._recent[run_id]=done
+                self._recent.move_to_end(run_id)
+                while len(self._recent)>128:
+                    self._recent.popitem(last=False)
+            self._capacity.release()
+        # Register outside the lock: an already-finished future calls back inline.
+        future.add_done_callback(complete)
+        return True
 
     def _stop_heartbeat(self, run_id: str) -> None:
-        with self._lock:
-            stop = self._heartbeats.pop(run_id, None)
-        if stop is not None:
-            stop.set()
+        # Execution heartbeat belongs to the claimed lease, including wait=True workers.
+        return None
 
     def is_active(self, run_id: str) -> bool:
         with self._lock:
@@ -103,7 +113,7 @@ class RunExecutor:
 
     def wait(self, run_id: str, timeout: float | None = None) -> Any:
         with self._lock:
-            future = self._futures.get(run_id)
+            future = self._futures.get(run_id) or self._recent.get(run_id)
         if future is None:
             return None
         return future.result(timeout=timeout)
@@ -182,6 +192,8 @@ class RunCoordinator:
         memories: list[dict[str, Any]] | None = None,
         enable_dynamic_loop: bool = False,
         dynamic_limits: dict[str, Any] | None = None,
+        continue_from_checkpoint: bool = False,
+        assert_lease: Callable[[], None] | None = None,
     ) -> dict[str, Any]:
         from core.checkpoints import open_checkpointer
 
@@ -196,6 +208,8 @@ class RunCoordinator:
                 resolver=ResourceResolver(),
                 output_root=self.output_root,
                 resume=resume,
+                continue_from_checkpoint=continue_from_checkpoint,
+                assert_lease=assert_lease,
                 require_plan_approval=require_plan_approval,
                 require_report_approval=require_report_approval,
                 mcp=mcp,
@@ -265,129 +279,139 @@ class RunCoordinator:
         self.store.update_status(run_id, "failed", error=str(error))
         _safe_notify(notify_run_finished, run_id, "failed", error=str(error))
 
-    def start(
-        self,
-        run_id: str,
-        *,
-        data_sources: list[str],
-        analysis_focus: str | None = None,
-        knowledge_sources: list[str] | None = None,
-        require_plan_approval: bool = False,
-        require_report_approval: bool = False,
-        sql_backend: str = "direct",
-        conversation_context: dict[str, Any] | None = None,
-        memories: list[dict[str, Any]] | None = None,
-        enable_dynamic_loop: bool = False,
-        dynamic_limits: dict[str, Any] | None = None,
-        record_exists: bool = False,
-        wait: bool = False,
-    ) -> Any:
-        """登记并启动一次运行。
+    @staticmethod
+    def _mode() -> str:
+        mode = (os.getenv("INSIGHTFLOW_EXECUTION") or "inline").strip().lower()
+        if mode not in ("inline", "queue"):
+            raise ValueError("INSIGHTFLOW_EXECUTION 只能是 inline 或 queue")
+        if mode == "queue" and not storage.current_config().is_postgres:
+            raise ValueError("queue 执行模式需要 PostgreSQL")
+        return mode
 
-        `record_exists`：队列模式下 Run 记录已由 API 建好（状态 queued），worker
-        抢占后不应再 `create` 一次，否则会把已有记录覆盖掉。
-        `wait`：在 worker 进程里直接于当前线程执行，不投递线程池——worker 本身
-        就是那个"后台"，再套一层线程只会让关闭信号更难处理。
-        """
+    def dispatch(self, run_id: str, *, owner: str | None = None, **payload):
+        owner = owner or storage.current_owner()
+        mode = self._mode()
+        defaults = dict(analysis_focus=None,knowledge_sources=[],require_plan_approval=False,
+                        require_report_approval=False,sql_backend="direct",conversation_context=None,
+                        memories=None,enable_dynamic_loop=False,dynamic_limits=None)
+        defaults.update(payload)
+        payload = defaults
+        record = self.store.create(run_id,data_sources=payload["data_sources"],analysis_focus=payload["analysis_focus"],
+            sql_backend=payload["sql_backend"],require_plan_approval=payload["require_plan_approval"],
+            require_report_approval=payload["require_report_approval"],owner=owner,request_payload=payload)
+        if record.status not in ("pending","queued"):
+            return record
+        if mode == "queue":
+            from services import run_queue
+            run_queue.ensure_schema()
+            self.store.update_status(run_id,"queued",owner=owner)
+            run_queue.enqueue(run_id,{**payload,"_owner":owner})
+        else:
+            self.start(run_id,owner=owner,record_exists=True,**payload)
+        return self.store.get(run_id,owner=owner)
+
+    def _leased_work(self, run_id, owner, payload, *, resume=False, resume_value=None):
+        token = uuid.uuid4().hex
+        if not self.store.claim(run_id,token,owner=owner,resume=resume):
+            raise RunConflict("运行正在执行或当前状态不可启动")
+        stop = threading.Event()
+        def check():
+            self.store.assert_lease(run_id,token,owner=owner)
+        def beat():
+            while not stop.wait(max(1.0,STALE_HEARTBEAT_SECONDS/6)):
+                try:
+                    self.store.touch(run_id,token=token,owner=owner)
+                except Exception:
+                    stop.set()
+                    return
+        heartbeat = threading.Thread(target=beat,name="run-lease-heartbeat",daemon=True)
+        owner_handle=storage.set_current_owner(owner)
+        try:
+            with execution_lease(run_id,token):
+                heartbeat.start()
+                try:
+                    check()
+                    command=Command(resume=resume_value) if resume and resume_value is not None else None
+                    result=self._execute(run_id,
+                        data_sources=payload["data_sources"],analysis_focus=payload.get("analysis_focus"),
+                        knowledge_sources=payload.get("knowledge_sources") or [],resume=command,
+                        require_plan_approval=payload.get("require_plan_approval",False),
+                        require_report_approval=payload.get("require_report_approval",False),
+                        mcp=self._settings_for(payload.get("sql_backend","direct")),
+                        conversation_context=payload.get("conversation_context"),memories=payload.get("memories"),
+                        enable_dynamic_loop=payload.get("enable_dynamic_loop",False),dynamic_limits=payload.get("dynamic_limits"),
+                        continue_from_checkpoint=resume and command is None,assert_lease=check)
+                    check()
+                    return self._finalize(run_id,result)
+                except LeaseLost:
+                    raise
+                except Exception as error:
+                    check()
+                    self._fail(run_id,error,output_root=self.output_root)
+                    raise
+                finally:
+                    stop.set()
+        finally:
+            storage.reset_current_owner(owner_handle)
+
+    def start(self, run_id: str, *, data_sources: list[str], analysis_focus=None, knowledge_sources=None,
+              require_plan_approval=False,require_report_approval=False,sql_backend="direct",
+              conversation_context=None,memories=None,enable_dynamic_loop=False,dynamic_limits=None,
+              record_exists=False,wait=False,owner=None):
+        owner=owner or storage.current_owner()
+        payload=dict(data_sources=data_sources,analysis_focus=analysis_focus,knowledge_sources=knowledge_sources or [],
+            require_plan_approval=require_plan_approval,require_report_approval=require_report_approval,
+            sql_backend=sql_backend,conversation_context=conversation_context,memories=memories,
+            enable_dynamic_loop=enable_dynamic_loop,dynamic_limits=dynamic_limits)
         if not record_exists:
-            self.store.create(
-                run_id,
-                data_sources=data_sources,
-                analysis_focus=analysis_focus,
-                sql_backend=sql_backend,
-                require_plan_approval=require_plan_approval,
-                require_report_approval=require_report_approval,
-            )
-        self.store.update_status(run_id, "running")
-
-        mcp = self._settings_for(sql_backend)
-
-        def work() -> dict[str, Any]:
-            try:
-                result = self._execute(
-                    run_id,
-                    data_sources=data_sources,
-                    analysis_focus=analysis_focus,
-                    knowledge_sources=knowledge_sources or [],
-                    resume=None,
-                    require_plan_approval=require_plan_approval,
-                    require_report_approval=require_report_approval,
-                    mcp=mcp,
-                    conversation_context=conversation_context,
-                    memories=memories,
-                    enable_dynamic_loop=enable_dynamic_loop,
-                    dynamic_limits=dynamic_limits,
-                )
-                return self._finalize(run_id, result)
-            except Exception as error:  # noqa: BLE001 - 失败必须落到 Run 状态
-                self._fail(run_id, error, output_root=self.output_root)
-                raise
-            finally:
-                self.executor._stop_heartbeat(run_id)
-
+            record=self.store.create(run_id,data_sources=data_sources,analysis_focus=analysis_focus,sql_backend=sql_backend,
+                require_plan_approval=require_plan_approval,require_report_approval=require_report_approval,
+                owner=owner,request_payload=payload)
+        else:
+            record=self.store.get(run_id,owner=owner)
+            if record is None:
+                raise KeyError("未找到运行")
+        if record.status not in ("pending","queued"):
+            return record
+        # The durable request is authoritative, including worker/retry starts.
+        # A caller with record_exists=True cannot silently switch its backend.
+        payload = dict(record.request_payload or dict(data_sources=record.data_sources,
+            analysis_focus=record.analysis_focus,sql_backend=record.sql_backend,
+            require_plan_approval=record.require_plan_approval,
+            require_report_approval=record.require_report_approval))
+        def work():
+            return self._leased_work(run_id,owner,payload)
         if wait:
             return work()
+        self.executor.submit(run_id,work)
+        return record
 
-        self.executor.submit(run_id, work)
-        return None
-
-    def resume(self, run_id: str, *, resume_value: Any = None) -> None:
-        """从最后提交的 Checkpoint 继续执行。
-
-        审批决定通过 `Command(resume=...)` 交回被中断的节点。
-        """
-        record = self.store.get(run_id)
+    def resume(self, run_id: str, *, resume_value=None, wait=False, from_queue=False,owner=None):
+        owner=owner or storage.current_owner()
+        record=self.store.get(run_id,owner=owner)
         if record is None:
-            raise KeyError(f"未登记的 run：{run_id}")
-
-        # `running` 有两种含义：正在执行，或执行者已经消失（进程被杀）。
-        # 只按状态字面量判断会把"崩溃后恢复"这条路径永远挡在门外——
-        # 而进程内的执行记录在重启后本来就是空的，is_active 一定为 False。
-        stale = self.store.is_stale_running(run_id)
-
-        if (
-            record.status not in ("waiting_approval", "interrupted", "failed")
-            and not stale
-        ):
-            raise ValueError(
-                f"run {run_id} 当前状态为 {record.status}，不可恢复"
-            )
-
+            raise KeyError("未找到运行")
+        if record.status == "queued" and not from_queue:
+            return record
+        if record.status not in ("waiting_approval","interrupted","failed") and not self.store.is_stale_running(run_id) and not (from_queue and record.status=="queued"):
+            raise RunConflict(f"run 当前状态为 {record.status}，不可恢复")
         if self.executor.is_active(run_id):
-            raise ValueError(f"run {run_id} 正在执行中，拒绝并发的恢复请求")
-
-        self.store.update_status(run_id, "running")
-
-        # 后端模式取记录里最初保存的值，**不接受**调用方在恢复时另行指定：
-        # 否则同一 Run 的前后两段会走不同后端，Checkpoint 里的结果语义就乱了。
-        mcp = self._settings_for(record.sql_backend)
-
-        command = Command(resume=resume_value) if resume_value is not None else None
-
-        def work() -> dict[str, Any]:
-            try:
-                result = self._execute(
-                    run_id,
-                    data_sources=record.data_sources,
-                    analysis_focus=record.analysis_focus,
-                    knowledge_sources=[],
-                    resume=command,
-                    # 沿用该 Run 创建时的审批要求。硬写成 True 会让"崩溃点晚于
-                    # 审批门"的 Run 在恢复时又被拦一次，等于凭空多出一道门。
-                    require_plan_approval=record.require_plan_approval,
-                    require_report_approval=record.require_report_approval,
-                    mcp=mcp,
-                )
-                # 恢复同样要落状态：否则等待重试的审批不会反映到生命周期上，
-                # 查询接口会一直显示 running。
-                return self._finalize(run_id, result)
-            except Exception as error:  # noqa: BLE001
-                self._fail(run_id, error, output_root=self.output_root)
-                raise
-            finally:
-                self.executor._stop_heartbeat(run_id)
-
-        self.executor.submit(run_id, work)
+            raise RunConflict("运行正在执行，拒绝并发恢复")
+        if self._mode()=="queue" and not from_queue:
+            from services import run_queue
+            run_queue.ensure_schema()
+            self.store.update_status(run_id,"queued",owner=owner)
+            run_queue.enqueue(run_id,{"_owner":owner,"_resume":True,"resume_value":resume_value},continuation=True)
+            return self.store.get(run_id,owner=owner)
+        payload=record.request_payload or dict(data_sources=record.data_sources,analysis_focus=record.analysis_focus,
+            sql_backend=record.sql_backend,require_plan_approval=record.require_plan_approval,
+            require_report_approval=record.require_report_approval)
+        def work():
+            return self._leased_work(run_id,owner,payload,resume=True,resume_value=resume_value)
+        if wait:
+            return work()
+        self.executor.submit(run_id,work)
+        return record
 
     def shutdown(self) -> None:
         self.executor.shutdown(wait=True)

@@ -24,6 +24,7 @@ import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from core.publication import publish_file
 
 from sandbox.protocol import (
     SandboxErrorKind,
@@ -53,6 +54,11 @@ _TMPFS_OPTIONS = ",nosuid,nodev,noexec"
 _PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
 
 _SHA_PREFIX = 8
+MAX_PROCESS_OUTPUT_BYTES = 1024 * 1024
+
+
+class SandboxLogLimitExceeded(subprocess.SubprocessError):
+    """The host stopped collecting an unbounded container log stream."""
 
 
 class SandboxUnavailable(RuntimeError):
@@ -156,14 +162,50 @@ class DockerSandboxExecutor:
     def _run_docker(
         self, args: list[str], *, timeout: float = 30.0
     ) -> subprocess.CompletedProcess:
-        return subprocess.run(
-            [self._docker, *args],
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=timeout,
+        command = [self._docker, *args]
+        process = subprocess.Popen(
+            command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
         )
+        buffers = [bytearray(), bytearray()]
+        exceeded = threading.Event()
+
+        def drain(stream, target):
+            try:
+                while chunk := stream.read(64 * 1024):
+                    remaining = MAX_PROCESS_OUTPUT_BYTES - len(target)
+                    target.extend(chunk[:max(0, remaining)])
+                    if len(chunk) > remaining:
+                        exceeded.set()
+                        try:
+                            process.kill()
+                        except OSError:
+                            pass
+            finally:
+                stream.close()
+
+        readers = [threading.Thread(target=drain, args=(stream, target), daemon=True)
+                   for stream, target in zip((process.stdout, process.stderr), buffers)]
+        for reader in readers:
+            reader.start()
+        try:
+            returncode = process.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait()
+            raise
+        finally:
+            for reader in readers:
+                reader.join(timeout=2)
+        if exceeded.is_set():
+            raise SandboxLogLimitExceeded("sandbox log output exceeded host limit")
+        return subprocess.CompletedProcess(command, returncode, *(bytes(b).decode("utf-8", errors="replace") for b in buffers))
+
+    def _cleanup_container(self, container_name: str) -> None:
+        try:
+            self._run_docker(["rm", "-f", container_name], timeout=15)
+        except (OSError, subprocess.SubprocessError):
+            pass
 
     def available(self) -> bool:
         """Docker daemon 是否可用。用于 health 与测试门控。"""
@@ -275,7 +317,9 @@ class DockerSandboxExecutor:
         limits = job.limits
         container_limits = container_limits or {}
 
-        job_root = run_dir / "sandbox" / _short_hash(job.op_label or uuid.uuid4().hex)
+        # A retry is a new attempt; its scratch files can never be replayed as
+        # another attempt's successful result.
+        job_root = run_dir / "sandbox" / f"{_short_hash(job.op_label)}-{uuid.uuid4().hex}"
         in_dir = job_root / "in"
         scratch_dir = job_root / "scratch"
         # 容器**唯一**可写的位置。
@@ -290,6 +334,9 @@ class DockerSandboxExecutor:
 
         for directory in (in_dir, scratch_dir, staging_dir):
             directory.mkdir(parents=True, exist_ok=True)
+        if os.name != "nt":
+            for directory in (scratch_dir, staging_dir):
+                directory.chmod(0o777)  # container UID 65534, private attempt dir
 
         self._write_inputs(job, in_dir, tables or {})
 
@@ -310,6 +357,23 @@ class DockerSandboxExecutor:
                 duration_ms=int((time.perf_counter() - started) * 1000),
             )
 
+        stop_monitor = threading.Event()
+        volume_exceeded = threading.Event()
+
+        def monitor_outputs():
+            while not stop_monitor.wait(0.05):
+                try:
+                    if not self._workspace_within_limits((scratch_dir, staging_dir), limits):
+                        volume_exceeded.set()
+                        self._cleanup_container(container_name)
+                        return
+                except OSError:
+                    volume_exceeded.set()
+                    self._cleanup_container(container_name)
+                    return
+
+        monitor = threading.Thread(target=monitor_outputs, daemon=True)
+        monitor.start()
         try:
             completed = self._run_container(
                 container_name=container_name,
@@ -320,7 +384,7 @@ class DockerSandboxExecutor:
                 limits=limits,
             )
         except subprocess.TimeoutExpired:
-            self.cleanup_orphans(run_id)
+            self._cleanup_container(container_name)
             return SandboxOutcome(
                 success=False,
                 result=None,
@@ -328,11 +392,18 @@ class DockerSandboxExecutor:
                 error_kind=SandboxErrorKind.TIMEOUT,
                 duration_ms=int((time.perf_counter() - started) * 1000),
             )
+        except SandboxLogLimitExceeded as error:
+            self._cleanup_container(container_name)
+            return SandboxOutcome(success=False, result=None, error=str(error), error_kind=SandboxErrorKind.OUTPUT_LIMIT)
         finally:
+            stop_monitor.set()
+            monitor.join(timeout=16)
             self._slots.release()
 
         duration_ms = int((time.perf_counter() - started) * 1000)
-        outcome = self._interpret(completed, scratch_dir, image_info)
+        if volume_exceeded.is_set() or not self._workspace_within_limits((scratch_dir, staging_dir), limits):
+            return SandboxOutcome(success=False, result=None, error="sandbox writable output limit exceeded", error_kind=SandboxErrorKind.OUTPUT_LIMIT, duration_ms=duration_ms)
+        outcome = self._interpret(completed, scratch_dir, image_info, limits=limits, expected_attempt=job_root.name)
         outcome.duration_ms = duration_ms
 
         # 产物只在容器返回成功后才发布：宿主先校验 staging 里的文件，
@@ -358,6 +429,20 @@ class DockerSandboxExecutor:
             outcome.diagnostics["published_path"] = str(published)
 
         return outcome
+
+    @staticmethod
+    def _workspace_within_limits(directories, limits) -> bool:
+        total = count = 0
+        for directory in directories:
+            for path in directory.rglob("*"):
+                count += 1
+                if count > limits.max_output_files or path.is_symlink():
+                    return False
+                if path.is_file():
+                    total += path.stat().st_size
+                    if total > limits.max_workspace_bytes:
+                        return False
+        return True
 
     def _publish_output(
         self,
@@ -402,20 +487,14 @@ class DockerSandboxExecutor:
                 f"staged PNG has invalid dimensions: {width}x{height}"
             )
 
-        # 使用 replace 语义：同一 Run 重放时覆盖自己的产物（幂等要求），
-        # 但不可能碰到别的文件——目标名已经在上面限定为单个文件名。
-        #
-        # 目标若已是符号链接必须显式删除：`os.replace` 会顺着链接写到它指向的
-        # 位置（可能在 Run 目录之外）。
         destination = run_dir / filename
-        if destination.is_symlink():
-            destination.unlink()
-
-        os.replace(staged, destination)
+        # replace replaces a destination symlink itself; it does not follow it.
+        # Re-check the execution lease immediately before the atomic publish.
+        publish_file(staged, destination)
         return destination
 
     def _container_name(self, run_id: str, op_label: str) -> str:
-        return f"{CONTAINER_NAME_PREFIX}{_short_hash(run_id)}-{_short_hash(op_label)}"
+        return f"{CONTAINER_NAME_PREFIX}{_short_hash(run_id)}-{_short_hash(op_label)}-{uuid.uuid4().hex[:8]}"
 
     def _write_inputs(
         self, job: SandboxJob, in_dir: Path, tables: dict[str, Any]
@@ -445,7 +524,9 @@ class DockerSandboxExecutor:
             write_json(encode_dataframe(frame), in_dir / filename)
             dfs_paths[name] = filename
 
-        write_json(job.to_dict(dfs_paths), in_dir / "job.json")
+        payload = job.to_dict(dfs_paths)
+        payload["attempt_id"] = in_dir.parent.name
+        write_json(payload, in_dir / "job.json")
 
         # 代码单独落文件：容器从只读挂载读取，不经过 shell，也不内联进 JSON
         (in_dir / "code.py").write_text(job.code, encoding="utf-8")
@@ -616,6 +697,8 @@ class DockerSandboxExecutor:
             str(limits.cpus),
             "--pids-limit",
             str(limits.pids_limit),
+            "--ulimit",
+            f"fsize={limits.max_workspace_bytes}:{limits.max_workspace_bytes}",
             "--tmpfs",
             f"/tmp:rw{_TMPFS_OPTIONS},size={limits.tmpfs_mb}m",
             "--mount",
@@ -650,19 +733,37 @@ class DockerSandboxExecutor:
         completed: subprocess.CompletedProcess,
         scratch_dir: Path,
         image_info: SandboxImageInfo,
+        *,
+        limits: SandboxLimits | None = None,
+        expected_attempt: str | None = None,
     ) -> SandboxOutcome:
         """把容器执行结果归一化。
 
-        OOM 与异常退出在容器没有写结果文件时只能靠退出码判断；
-        容器内捕获的异常会写结果文件，优先采信结果文件。
+        Process failure always wins over result files. A successful process
+        must also return a bounded, valid result for this exact attempt.
         """
         from sandbox.protocol import read_json
 
+        if completed.returncode != 0:
+            return SandboxOutcome(
+                success=False, result=None,
+                error="sandbox: killed (memory limit exceeded)" if completed.returncode == 137 else f"sandbox exited with code {completed.returncode}",
+                error_kind=SandboxErrorKind.OOM if completed.returncode == 137 else SandboxErrorKind.EXECUTION_ERROR,
+            )
+        limits = limits or SandboxLimits()
         result_path = scratch_dir / "result.json"
 
         if result_path.exists():
             try:
+                if result_path.is_symlink() or not result_path.is_file():
+                    raise ValueError("result is not a regular file")
+                if result_path.stat().st_size > limits.max_result_bytes + 16 * 1024:
+                    raise ValueError("sandbox result exceeded host byte limit")
                 payload = read_json(result_path)
+                if not isinstance(payload, dict) or type(payload.get("success")) is not bool:
+                    raise ValueError("invalid result schema")
+                if expected_attempt is not None and payload.get("attempt_id") != expected_attempt:
+                    raise ValueError("result attempt does not match current execution")
             except (OSError, ValueError) as error:
                 return SandboxOutcome(
                     success=False,
@@ -686,14 +787,6 @@ class DockerSandboxExecutor:
                 result=None,
                 error=payload.get("error") or "sandbox reported failure",
                 error_kind=payload.get("error_kind") or SandboxErrorKind.EXECUTION_ERROR,
-            )
-
-        if completed.returncode == 137:
-            return SandboxOutcome(
-                success=False,
-                result=None,
-                error="sandbox: killed (memory limit exceeded)",
-                error_kind=SandboxErrorKind.OOM,
             )
 
         stderr_tail = (completed.stderr or "")[-400:].strip()

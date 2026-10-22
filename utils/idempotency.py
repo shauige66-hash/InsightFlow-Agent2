@@ -29,6 +29,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Any
+from contextvars import ContextVar
 
 from utils import llm_ledger
 
@@ -38,6 +39,11 @@ COMPLETED_KEY = "completed_operations"
 STATUS_COMPLETED = "completed"
 STATUS_IN_PROGRESS = "in_progress"
 STATUS_UNCERTAIN = "uncertain"
+_CURRENT_OPERATION: ContextVar[dict[str, Any]] = ContextVar("llm_operation_context", default={})
+
+
+def current_operation() -> dict[str, Any]:
+    return dict(_CURRENT_OPERATION.get())
 
 
 def operation_id(*parts: object) -> str:
@@ -57,13 +63,10 @@ def task_operation(run_id: str, task_id: str, attempt: int) -> str:
     return operation_id(run_id, "tool_execution", task_id, f"attempt_{attempt}")
 
 
-def chart_operation(run_id: str, chart_id: str) -> str:
-    """一张图的生成。
-
-    刻意不带 attempt：可视化结果按 chart_id 保留最后一条，
-    因此"这张图是否已经产出过"与尝试次数无关，否则重放会因算出不同 ID 而重复执行。
-    """
-    return operation_id(run_id, "plot_execution", chart_id)
+def chart_operation(run_id: str, chart_id: str, attempt: int | None = None) -> str:
+    """逻辑绘图尝试；省略 attempt 保留旧 checkpoint 的成功图标识。"""
+    base = operation_id(run_id, "plot_execution", chart_id)
+    return base if attempt is None else f"{base}:attempt_{attempt}"
 
 
 def artifact_operation(run_id: str) -> str:
@@ -138,7 +141,24 @@ PENDING_LLM_KEY = "pending_llm_calls"
 
 def unconfirmed_llm_calls(state: dict[str, Any]) -> list[str]:
     """尚未确认结果的模型调用操作 ID。"""
-    return list(state.get(PENDING_LLM_KEY) or [])
+    from core.runtime import RuntimeContextMissing, current_runtime
+    pending = list(state.get(PENDING_LLM_KEY) or [])
+    try:
+        pending.extend(current_runtime().unconfirmed_llm_calls)
+    except RuntimeContextMissing:
+        pass
+    return sorted(set(pending))
+
+
+def _clear_pending(state: dict[str, Any]) -> dict[str, Any]:
+    from core.runtime import RuntimeContextMissing, current_runtime
+    try:
+        current_runtime().unconfirmed_llm_calls.clear()
+    except RuntimeContextMissing:
+        pass
+    updates = {PENDING_LLM_KEY: [], "llm_retry_granted": None}
+    state.update(updates)
+    return updates
 
 
 def guard_llm_calls(
@@ -163,7 +183,7 @@ def guard_llm_calls(
         return None, None
 
     if state.get("llm_retry_granted") == "retry":
-        return {PENDING_LLM_KEY: [], "llm_retry_granted": None}, "retry"
+        return _clear_pending(state), "retry"
 
     from langgraph.types import interrupt
 
@@ -193,7 +213,7 @@ def guard_llm_calls(
             "存在未确认的模型调用且未获准重试：" + ", ".join(pending)
         )
 
-    return {PENDING_LLM_KEY: [], "llm_retry_granted": None}, "retry"
+    return _clear_pending(state), "retry"
 
 
 def run_agent_call(
@@ -257,7 +277,20 @@ def run_agent_call(
         run_id=run_id, operation_id=op_id, node=node, attempt=attempt, root=ledger_root
     )
 
-    payload = call()
+    token = _CURRENT_OPERATION.set({"operation_id": op_id, "node": node, "attempt": attempt})
+    try:
+        payload = call()
+    except Exception as error:
+        from utils.agent_loop import BudgetExceeded
+        from utils.llm_retry import StructuredOutputError
+        if isinstance(error, (BudgetExceeded, StructuredOutputError)):
+            # 这是已知的本地结束，不能在下次恢复时伪装成上游结果未确认。
+            llm_ledger.record_completed(
+                run_id=run_id, operation_id=op_id, node=node, attempt=attempt, root=ledger_root
+            )
+        raise
+    finally:
+        _CURRENT_OPERATION.reset(token)
 
     llm_ledger.record_completed(
         run_id=run_id, operation_id=op_id, node=node, attempt=attempt, root=ledger_root

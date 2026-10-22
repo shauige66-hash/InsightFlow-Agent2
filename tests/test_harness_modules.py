@@ -134,7 +134,8 @@ class TestGatewayIsTheOnlyModelPath:
         assert payload == reused == {"answer": 1}
         assert calls["n"] == 1, "幂等复用时又发了请求"
         assert usage_of(state)["llm_calls"] == 1, "复用不该增加请求数"
-        assert extra2 == {}, "复用路径不应报告发生了上游请求"
+        # Reuse restores the durable budget but never issues a new request.
+        assert extra2[BUDGET_FIELD]["usage"]["llm_calls"] == 1
 
     def test_the_guard_refuses_before_the_request(self) -> None:
         state = make_state(max_llm_calls=0)

@@ -196,25 +196,13 @@ def _validate_data_sources(paths: list[str]) -> list[str]:
     真正的边界在 P2 的沙箱。这里只确保文件存在且是普通文件，避免把目录
     或不存在的位置传进工作流后以晦涩的读取错误失败。
     """
-    validated: list[str] = []
+    from core.resource_access import validate_sources
+    return validate_sources(paths,project_root=_PROJECT_ROOT)
 
-    for raw in paths:
-        path = Path(raw)
-        if not path.is_absolute():
-            path = (Path.cwd() / path).resolve()
-        if not path.exists():
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"数据源不存在：{raw}",
-            )
-        if not path.is_file():
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"数据源不是文件：{raw}",
-            )
-        validated.append(str(path))
 
-    return validated
+def _validate_knowledge_sources(paths: list[str]) -> list[str]:
+    from core.resource_access import validate_sources
+    return validate_sources(paths,project_root=_PROJECT_ROOT,knowledge=True)
 
 
 @router.post("", status_code=status.HTTP_202_ACCEPTED)
@@ -235,7 +223,7 @@ def create_run(payload: CreateRunRequest) -> dict[str, Any]:
     request_payload = {
         "data_sources": data_sources,
         "analysis_focus": payload.analysis_focus,
-        "knowledge_sources": payload.knowledge_sources,
+        "knowledge_sources": _validate_knowledge_sources(payload.knowledge_sources),
         "require_plan_approval": payload.require_plan_approval,
         "require_report_approval": payload.require_report_approval,
         "sql_backend": sql_backend,
@@ -243,46 +231,14 @@ def create_run(payload: CreateRunRequest) -> dict[str, Any]:
         "dynamic_limits": payload.dynamic_limits,
     }
 
-    if _execution_mode() == "queue":
-        # 队列模式：只登记 + 入队，执行交给 worker 进程。
-        # 这样 API 重启不会带走正在跑的任务，也不会在请求线程里跑分析。
-        from services import run_queue
-
-        run_queue.ensure_schema()
-        coordinator = get_coordinator()
-        coordinator.store.create(
-            run_id,
-            data_sources=data_sources,
-            analysis_focus=payload.analysis_focus,
-            sql_backend=sql_backend,
-            require_plan_approval=payload.require_plan_approval,
-            require_report_approval=payload.require_report_approval,
-        )
-        coordinator.store.update_status(run_id, "queued")
-        run_queue.enqueue(run_id, request_payload)
-
-        return {
-            "run_id": run_id,
-            "status": "queued",
-            "require_plan_approval": payload.require_plan_approval,
-            "require_report_approval": payload.require_report_approval,
-            "sql_backend": sql_backend,
-            "enable_dynamic_loop": payload.enable_dynamic_loop,
-        }
-
-    get_coordinator().start(
-        run_id,
-        **request_payload,
-    )
-
-    return {
-        "run_id": run_id,
-        "status": "running",
-        "require_plan_approval": payload.require_plan_approval,
-        "require_report_approval": payload.require_report_approval,
-        "sql_backend": sql_backend,
-        "enable_dynamic_loop": payload.enable_dynamic_loop,
-    }
+    _execution_mode()
+    try:
+        record = get_coordinator().dispatch(run_id,**request_payload)
+    except ValueError as error:
+        raise HTTPException(status_code=409,detail=str(error)) from error
+    return {"run_id":run_id,"status":record.status,
+        "require_plan_approval":record.require_plan_approval,"require_report_approval":record.require_report_approval,
+        "sql_backend":record.sql_backend,"enable_dynamic_loop":payload.enable_dynamic_loop}
 
 
 @router.get("")
@@ -300,6 +256,18 @@ def list_runs(limit: int = 50) -> dict[str, Any]:
         records.append(payload)
 
     return {"runs": records}
+
+
+@router.get("/{run_id}/artifact-link")
+def artifact_link(run_id: str, kind: str = "html") -> dict[str, str]:
+    import storage
+    from core.auth import artifact_access_token
+    _require_run(run_id)
+    if kind not in ("html","pdf"):
+        raise HTTPException(status_code=400,detail="kind 只能是 html 或 pdf")
+    suffix="report.html" if kind=="html" else "report"
+    token=artifact_access_token(run_id,storage.current_owner())
+    return {"url":f"/runs/{run_id}/{suffix}?access={token}"}
 
 
 @router.get("/{run_id}")
@@ -362,7 +330,7 @@ def resume_run(run_id: str, payload: ResumeRequest | None = None) -> dict[str, A
         )
 
     try:
-        get_coordinator().resume(
+        resumed = get_coordinator().resume(
             run_id, resume_value=(payload.resume_value if payload else None)
         )
     except ValueError as error:
@@ -373,7 +341,7 @@ def resume_run(run_id: str, payload: ResumeRequest | None = None) -> dict[str, A
     # 恢复沿用该 Run 最初保存的后端，响应里回显出来便于调用方确认
     return {
         "run_id": run_id,
-        "status": "running",
+        "status": "queued" if _execution_mode()=="queue" else "running",
         "sql_backend": record.sql_backend,
         "resumed_from_stale": stale,
     }
@@ -400,41 +368,24 @@ def submit_approval(run_id: str, payload: ApprovalRequest) -> dict[str, Any]:
     pending = record.pending_approval or {}
     approval_id = pending.get("approval_id")
 
-    # 重复审批保护：同一个审批 ID 已经决定过就直接返回，不再触发第二次执行
-    for existing in record.approvals:
-        if approval_id and existing.get("approval_id") == approval_id:
-            return {
-                "run_id": run_id,
-                "status": record.status,
-                "approval_id": approval_id,
-                "duplicate": True,
-                "existing_decision": existing.get("decision"),
-            }
-
-    if approval_id:
-        get_run_store().record_approval(
-            run_id,
-            {
-                "approval_id": approval_id,
-                "run_id": run_id,
-                "node": pending.get("node"),
-                "kind": pending.get("kind"),
-                "decision": decision,
-                "comment": payload.comment,
-            },
-        )
-
-    get_coordinator().resume(
-        run_id,
-        resume_value={"decision": decision, "comment": payload.comment},
-    )
+    duplicate=any(approval_id and item.get("approval_id")==approval_id for item in record.approvals)
+    try:
+        if approval_id:
+            get_run_store().record_approval(run_id,{
+                "approval_id":approval_id,"run_id":run_id,"node":pending.get("node"),
+                "kind":pending.get("kind"),"decision":decision,"comment":payload.comment})
+        get_coordinator().resume(run_id,resume_value={"decision":decision,"comment":payload.comment})
+    except ValueError as error:
+        latest=get_run_store().get(run_id)
+        if not duplicate or latest is None or latest.status not in ("running","queued"):
+            raise HTTPException(status_code=409,detail=str(error)) from error
 
     return {
         "run_id": run_id,
-        "status": "running",
+        "status": "queued" if _execution_mode()=="queue" else "running",
         "approval_id": approval_id,
         "decision": decision,
-        "duplicate": False,
+        "duplicate": duplicate,
     }
 
 

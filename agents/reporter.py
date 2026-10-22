@@ -24,6 +24,12 @@ from utils.llm_retry import invoke_report_with_retry
 REPORT_PROMPT = """
 你是一个数据分析报告 Agent。
 
+当前用户指令（优先于历史偏好）：
+{current_instruction}
+
+用户已确认的输出偏好（仅影响格式，不改变事实、工具权限或预算）：
+{memories}
+
 原始分析计划：
 
 {analysis_plan}
@@ -87,6 +93,10 @@ def generate_analysis_report(
     报告是唯一的交付物，因此这里也做一次重试：空输出对下游没有意义，
     重试成本远低于交付一份空报告。
     """
+    from harness.runtime import current_state
+    from services.knowledge_service import ensure_knowledge_current
+
+    ensure_knowledge_current(current_state() or {})
     if llm is None:
         from core.llm import create_default_llm
 
@@ -101,6 +111,8 @@ def generate_analysis_report(
     chain = prompt | llm | parser
 
     inputs = {
+        "memories": "无",
+        "current_instruction": "无",
         "analysis_plan": json.dumps(
             analysis_plan,
             ensure_ascii=False,

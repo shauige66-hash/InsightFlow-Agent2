@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import json
+import uuid
 from typing import Any
 
 from sqlalchemy import text
@@ -32,7 +33,9 @@ CREATE TABLE IF NOT EXISTS run_jobs (
     claimed_by TEXT,
     claimed_at TIMESTAMPTZ,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    error      TEXT
+    error      TEXT,
+    claim_token TEXT,
+    next_payload JSONB
 );
 CREATE INDEX IF NOT EXISTS run_jobs_status_created
     ON run_jobs (status, created_at);
@@ -54,26 +57,31 @@ def ensure_schema() -> None:
     """建表（幂等）。"""
     _require_postgres()
     with storage.session_scope(storage.database_url()) as session:
+        session.execute(text("SELECT pg_advisory_xact_lock(7300162)"))
         for statement in _SCHEMA.strip().split(";"):
             if statement.strip():
                 session.execute(text(statement))
+        session.execute(text("ALTER TABLE run_jobs ADD COLUMN IF NOT EXISTS claim_token TEXT"))
+        session.execute(text("ALTER TABLE run_jobs ADD COLUMN IF NOT EXISTS next_payload JSONB"))
         session.commit()
 
 
-def enqueue(run_id: str, payload: dict[str, Any]) -> None:
-    """把一个 Run 放进队列。重复入队是幂等的。"""
+def enqueue(run_id: str, payload: dict[str, Any], *, continuation: bool = False) -> None:
+    """Durable, idempotent dispatch; a continuation can follow a still-finishing claim."""
     _require_postgres()
     with storage.session_scope(storage.database_url()) as session:
-        session.execute(
-            text(
-                """
-                INSERT INTO run_jobs (run_id, payload)
-                VALUES (:run_id, CAST(:payload AS JSONB))
-                ON CONFLICT (run_id) DO NOTHING
-                """
-            ),
-            {"run_id": run_id, "payload": json.dumps(payload, ensure_ascii=False)},
-        )
+        if continuation:
+            statement = """
+                INSERT INTO run_jobs(run_id,payload) VALUES(:run_id,CAST(:payload AS JSONB))
+                ON CONFLICT(run_id) DO UPDATE SET
+                    next_payload = CASE WHEN run_jobs.status='claimed' THEN EXCLUDED.payload ELSE NULL END,
+                    payload = CASE WHEN run_jobs.status='claimed' THEN run_jobs.payload ELSE EXCLUDED.payload END,
+                    status = CASE WHEN run_jobs.status='claimed' THEN 'claimed' ELSE 'queued' END,
+                    error = NULL
+            """
+        else:
+            statement = "INSERT INTO run_jobs(run_id,payload) VALUES(:run_id,CAST(:payload AS JSONB)) ON CONFLICT(run_id) DO NOTHING"
+        session.execute(text(statement),{"run_id":run_id,"payload":json.dumps(payload,ensure_ascii=False)})
         session.commit()
 
 
@@ -91,7 +99,8 @@ def claim(worker_id: str) -> tuple[str, dict[str, Any]] | None:
                    SET status = 'claimed',
                        claimed_by = :worker,
                        claimed_at = now(),
-                       attempts = attempts + 1
+                       attempts = attempts + 1,
+                       claim_token = :claim_token
                  WHERE run_id = (
                        SELECT run_id FROM run_jobs
                         WHERE status = 'queued'
@@ -99,10 +108,10 @@ def claim(worker_id: str) -> tuple[str, dict[str, Any]] | None:
                         FOR UPDATE SKIP LOCKED
                         LIMIT 1
                  )
-             RETURNING run_id, payload
+             RETURNING run_id, payload, claim_token, attempts
                 """
             ),
-            {"worker": worker_id},
+            {"worker": worker_id,"claim_token":uuid.uuid4().hex},
         ).first()
         session.commit()
 
@@ -111,27 +120,20 @@ def claim(worker_id: str) -> tuple[str, dict[str, Any]] | None:
     payload = row.payload
     if isinstance(payload, str):
         payload = json.loads(payload)
-    return row.run_id, dict(payload)
+    return row.run_id, {**dict(payload),"_job_claim":row.claim_token,"_queue_attempt":row.attempts}
 
 
-def finish(run_id: str, *, error: str | None = None) -> None:
-    """标记任务结束（成功或失败）。"""
+def finish(run_id: str, *, error: str | None = None, claim_token: str | None = None) -> None:
     _require_postgres()
+    if not claim_token:
+        raise ValueError("完成队列任务必须携带claim token")
     with storage.session_scope(storage.database_url()) as session:
-        session.execute(
-            text(
-                """
-                UPDATE run_jobs
-                   SET status = :status, error = :error
-                 WHERE run_id = :run_id
-                """
-            ),
-            {
-                "run_id": run_id,
-                "status": "failed" if error else "done",
-                "error": error,
-            },
-        )
+        session.execute(text("""
+            UPDATE run_jobs SET
+                status=CASE WHEN next_payload IS NOT NULL THEN 'queued' ELSE :status END,
+                payload=COALESCE(next_payload,payload),next_payload=NULL,error=:error,claim_token=NULL
+            WHERE run_id=:run_id AND claim_token=:claim_token
+        """),{"run_id":run_id,"status":"failed" if error else "done","error":error,"claim_token":claim_token})
         session.commit()
 
 
@@ -143,7 +145,7 @@ def requeue(run_id: str) -> None:
             text(
                 """
                 UPDATE run_jobs
-                   SET status = 'queued', claimed_by = NULL, claimed_at = NULL
+                   SET status = 'queued', claimed_by = NULL, claimed_at = NULL, claim_token = NULL
                  WHERE run_id = :run_id AND status = 'claimed'
                 """
             ),

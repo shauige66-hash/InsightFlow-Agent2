@@ -326,7 +326,15 @@ def main() -> int:
         default=False,
         help="恢复时未确认的模型调用是否获准重发",
     )
+    parser.add_argument("--scripted-tools", action="store_true", help="仅供LLM编排测试：白名单工具替身，不执行模型代码/容器/浏览器")
     args = parser.parse_args()
+
+    if args.scripted_tools:
+        import harness.tool_dispatcher as dispatcher
+        import nodes
+        from tests.support.scripted_runtime_tools import invoke_scripted_tool, no_browser_pdf
+        dispatcher.invoke_tool = invoke_scripted_tool
+        nodes.save_pdf_report = no_browser_pdf
 
     workdir = Path(args.workdir).resolve()
     workdir.mkdir(parents=True, exist_ok=True)

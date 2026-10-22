@@ -1,16 +1,4 @@
-"""PostgreSQL 实现的 Run 登记。
-
-与 SQLite 版 `RunStore` 保持同一组方法与语义，差别只在存储：
-
-- `create` 是 upsert（`ON CONFLICT (run_id) DO UPDATE`），重复登记同一 Run
-  不会失败，也不会把 `created_at` 改掉；
-- `update_status` 与 `touch` 仍然是"最后写入者生效"，不引入额外的锁；
-- `is_stale_running` 的进程判断只在同一台主机上有意义——`owner_pid` 是
-  本机 PID，跨主机部署时应以心跳为准，接口返回的仍是启发式结论。
-
-运行时状态只有一处权威：Run 的执行状态以这里（或 SQLite 版）为准，
-会话库里的 `conversation_turns.status` 只是展示用的同步值。
-"""
+"""PostgreSQL owner-scoped Run registry and fenced execution leases."""
 
 from __future__ import annotations
 
@@ -29,6 +17,8 @@ from sqlalchemy import (
     Table,
     Text,
     select,
+    text,
+    or_,
 )
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
@@ -39,12 +29,19 @@ from services.run_store import (
     _process_alive,
 )
 
+from services.run_identity import RunConflict, LeaseLost, current_owner, fingerprint, lease_token_for
+
 _metadata = MetaData()
 
 runs = Table(
     "runs",
     _metadata,
     Column("run_id", String(128), primary_key=True),
+    Column("owner", Text, nullable=False, server_default="local-demo"),
+    Column("request_hash", Text),
+    Column("request_payload", JSON, nullable=False, server_default="{}"),
+    Column("lease_token", Text),
+    Column("lease_expires_at", Float),
     Column("status", String(32), nullable=False),
     Column("data_sources", JSON, nullable=False, default=list),
     Column("analysis_focus", Text),
@@ -65,206 +62,144 @@ def ensure_schema(url: str) -> None:
     import storage
 
     engine = storage.get_engine(url)
-    _metadata.create_all(engine, checkfirst=True)
+    with engine.begin() as connection:
+        connection.execute(text("SELECT pg_advisory_xact_lock(7300161)"))
+        _metadata.create_all(connection, checkfirst=True)
+        for ddl in ("owner TEXT NOT NULL DEFAULT 'local-demo'", "request_hash TEXT", "request_payload JSON NOT NULL DEFAULT '{}'", "lease_token TEXT", "lease_expires_at DOUBLE PRECISION"):
+            connection.execute(text("ALTER TABLE runs ADD COLUMN IF NOT EXISTS " + ddl))
 
 
 class PostgresRunStore:
-    """与 `services.run_store.RunStore` 接口一致的 PostgreSQL 版本。"""
-
-    def __init__(self, url: str) -> None:
+    """Owner-scoped insert-only Run registry with shared-database leases."""
+    def __init__(self, url):
         import storage
-
         self._url = url
         ensure_schema(url)
         self._engine = storage.get_engine(url)
 
-    # -- 内部 -------------------------------------------------------------
-
     def _session(self):
         import storage
-
         return storage.session_scope(self._url)
 
+    def _lease_now(self):
+        with self._engine.connect() as connection:
+            return float(connection.scalar(text("SELECT EXTRACT(EPOCH FROM clock_timestamp())")))
+
     @staticmethod
-    def _normalize_backend(sql_backend: str) -> str:
+    def _normalize_backend(value):
         from core.runtime import SqlBackend
-
-        try:
-            return SqlBackend(sql_backend).value
-        except ValueError as error:
-            raise ValueError(f"不支持的 SQL 后端模式：{sql_backend}") from error
+        return SqlBackend(value).value
 
     @staticmethod
-    def _row_to_record(row: Any) -> RunRecord:
-        mapping = row._mapping
-        return RunRecord(
-            run_id=mapping["run_id"],
-            status=mapping["status"],
-            data_sources=list(mapping["data_sources"] or []),
-            analysis_focus=mapping["analysis_focus"],
-            created_at=float(mapping["created_at"] or 0.0),
-            updated_at=float(mapping["updated_at"] or 0.0),
-            error=mapping["error"],
-            pending_approval=mapping["pending_approval"],
-            approvals=list(mapping["approvals"] or []),
-            owner_pid=mapping["owner_pid"],
-            heartbeat_at=mapping["heartbeat_at"],
-            sql_backend=mapping["sql_backend"] or "direct",
-            require_plan_approval=bool(mapping["require_plan_approval"]),
-            require_report_approval=bool(mapping["require_report_approval"]),
-        )
+    def _row_to_record(row):
+        values = dict(row._mapping)
+        values["data_sources"] = list(values.get("data_sources") or [])
+        values["approvals"] = list(values.get("approvals") or [])
+        values["request_payload"] = dict(values.get("request_payload") or {})
+        return RunRecord(**values)
 
-    # -- 写 ---------------------------------------------------------------
-
-    def create(
-        self,
-        run_id: str,
-        *,
-        data_sources: list[str],
-        analysis_focus: str | None = None,
-        status: str = "pending",
-        sql_backend: str = "direct",
-        require_plan_approval: bool = False,
-        require_report_approval: bool = False,
-    ) -> RunRecord:
-        now = time.time()
-        backend = self._normalize_backend(sql_backend)
-
+    def create(self, run_id, *, data_sources, analysis_focus=None, status="pending", sql_backend="direct",
+               require_plan_approval=False, require_report_approval=False, owner=None, request_payload=None):
+        owner = current_owner(owner)
+        payload = request_payload if request_payload is not None else {
+            "data_sources": data_sources,"analysis_focus": analysis_focus,"sql_backend": self._normalize_backend(sql_backend),
+            "require_plan_approval": bool(require_plan_approval),"require_report_approval": bool(require_report_approval),
+        }
+        digest = fingerprint(payload)
+        now = self._lease_now()
         with self._session() as session:
-            statement = pg_insert(runs).values(
-                run_id=run_id,
-                status=status,
-                data_sources=list(data_sources),
-                analysis_focus=analysis_focus,
-                created_at=now,
-                updated_at=now,
-                error=None,
-                pending_approval=None,
-                approvals=[],
-                sql_backend=backend,
-                require_plan_approval=require_plan_approval,
-                require_report_approval=require_report_approval,
-            )
-            # 重复登记同一 Run：刷新可改字段，保留 created_at
-            session.execute(
-                statement.on_conflict_do_update(
-                    index_elements=[runs.c.run_id],
-                    set_={
-                        "status": statement.excluded.status,
-                        "data_sources": statement.excluded.data_sources,
-                        "analysis_focus": statement.excluded.analysis_focus,
-                        "updated_at": statement.excluded.updated_at,
-                        "error": None,
-                        "pending_approval": None,
-                        "approvals": [],
-                        "sql_backend": statement.excluded.sql_backend,
-                        "require_plan_approval": (
-                            statement.excluded.require_plan_approval
-                        ),
-                        "require_report_approval": (
-                            statement.excluded.require_report_approval
-                        ),
-                    },
-                )
-            )
-        return self.get(run_id)
+            session.execute(pg_insert(runs).values(run_id=run_id,owner=owner,status=status,data_sources=list(data_sources),
+                analysis_focus=analysis_focus,created_at=now,updated_at=now,approvals=[],sql_backend=self._normalize_backend(sql_backend),
+                require_plan_approval=require_plan_approval,require_report_approval=require_report_approval,
+                request_hash=digest,request_payload=payload).on_conflict_do_nothing(index_elements=[runs.c.run_id]))
+            row = session.execute(select(runs).where(runs.c.run_id == run_id)).first()
+            if row._mapping["owner"] != owner or row._mapping["request_hash"] != digest:
+                raise RunConflict("run_id 已存在且不属于同一请求")
+            return self._row_to_record(row)
 
-    def set_sql_backend(self, run_id: str, sql_backend: str) -> None:
-        backend = self._normalize_backend(sql_backend)
+    def get(self, run_id, *, owner=None):
         with self._session() as session:
-            session.execute(
-                runs.update()
-                .where(runs.c.run_id == run_id)
-                .values(sql_backend=backend, updated_at=time.time())
-            )
+            row = session.execute(select(runs).where(runs.c.run_id==run_id,runs.c.owner==current_owner(owner))).first()
+        return self._row_to_record(row) if row else None
 
-    def update_status(
-        self,
-        run_id: str,
-        status: str,
-        *,
-        error: str | None = None,
-        pending_approval: dict[str, Any] | None = None,
-    ) -> None:
-        if status not in RUN_STATUSES:
-            raise ValueError(f"未知的运行状态：{status}")
-
-        owner = os.getpid() if status == "running" else None
-        heartbeat = time.time() if status == "running" else None
-
+    def list(self, *, limit=50, owner=None):
         with self._session() as session:
-            session.execute(
-                runs.update()
-                .where(runs.c.run_id == run_id)
-                .values(
-                    status=status,
-                    updated_at=time.time(),
-                    error=error,
-                    pending_approval=pending_approval,
-                    owner_pid=owner if owner is not None else runs.c.owner_pid,
-                    heartbeat_at=(
-                        heartbeat if heartbeat is not None else runs.c.heartbeat_at
-                    ),
-                )
-            )
-
-    def touch(self, run_id: str) -> None:
-        now = time.time()
-        with self._session() as session:
-            session.execute(
-                runs.update()
-                .where(runs.c.run_id == run_id)
-                .values(heartbeat_at=now, updated_at=now, owner_pid=os.getpid())
-            )
-
-    def record_approval(self, run_id: str, approval: dict[str, Any]) -> None:
-        record = self.get(run_id)
-        if record is None:
-            raise KeyError(f"未登记的 run：{run_id}")
-
-        approvals = list(record.approvals)
-        approvals.append(approval)
-
-        with self._session() as session:
-            session.execute(
-                runs.update()
-                .where(runs.c.run_id == run_id)
-                .values(
-                    approvals=approvals,
-                    updated_at=time.time(),
-                    pending_approval=None,
-                )
-            )
-
-    # -- 读 ---------------------------------------------------------------
-
-    def get(self, run_id: str) -> RunRecord | None:
-        with self._session() as session:
-            row = session.execute(
-                select(runs).where(runs.c.run_id == run_id)
-            ).first()
-        return self._row_to_record(row) if row is not None else None
-
-    def list(self, *, limit: int = 50) -> list[RunRecord]:
-        with self._session() as session:
-            rows = session.execute(
-                select(runs).order_by(runs.c.updated_at.desc()).limit(limit)
-            ).all()
+            rows = session.execute(select(runs).where(runs.c.owner==current_owner(owner)).order_by(runs.c.updated_at.desc()).limit(limit)).all()
         return [self._row_to_record(row) for row in rows]
 
-    def get_sql_backend(self, run_id: str) -> str:
+    def get_sql_backend(self, run_id):
         record = self.get(run_id)
-        return record.sql_backend if record is not None else "direct"
+        return record.sql_backend if record else "direct"
 
-    def is_stale_running(self, run_id: str) -> bool:
-        record = self.get(run_id)
+    def set_sql_backend(self, run_id, sql_backend):
+        with self._session() as session:
+            session.execute(runs.update().where(runs.c.run_id==run_id,runs.c.owner==current_owner()).values(sql_backend=self._normalize_backend(sql_backend),updated_at=time.time()))
+
+    def claim(self, run_id, token, *, owner=None, resume=False, ttl=STALE_HEARTBEAT_SECONDS):
+        now = self._lease_now()
+        allowed = ("waiting_approval","interrupted","failed","running","queued") if resume else ("pending","queued")
+        with self._session() as session:
+            result = session.execute(runs.update().where(runs.c.run_id==run_id,runs.c.owner==current_owner(owner),runs.c.status.in_(allowed),
+                or_(runs.c.lease_token.is_(None),runs.c.lease_expires_at <= now)).values(status="running",lease_token=token,lease_expires_at=now+ttl,heartbeat_at=now,owner_pid=os.getpid(),updated_at=now))
+            return result.rowcount == 1
+
+    def assert_lease(self, run_id, token, *, owner=None):
+        record = self.get(run_id,owner=owner)
+        if record is None or record.lease_token != token or not record.lease_expires_at or record.lease_expires_at <= self._lease_now():
+            raise LeaseLost("运行执行权已失效，拒绝继续提交")
+
+    def touch(self, run_id, *, token=None, owner=None):
+        token = token or lease_token_for(run_id)
+        now = self._lease_now()
+        conditions = [runs.c.run_id==run_id,runs.c.owner==current_owner(owner)]
+        values = dict(heartbeat_at=now,updated_at=now)
+        if token:
+            conditions += [runs.c.lease_token==token,runs.c.lease_expires_at>now]
+            values["lease_expires_at"] = now+STALE_HEARTBEAT_SECONDS
+        else:
+            conditions += [runs.c.lease_token.is_(None)]
+        with self._session() as session:
+            result = session.execute(runs.update().where(*conditions).values(**values))
+            if token and result.rowcount != 1:
+                raise LeaseLost("运行租约续期失败")
+
+    def update_status(self, run_id, status, *, error=None,pending_approval=None,owner=None,token=None):
+        if status not in RUN_STATUSES:
+            raise ValueError(f"未知的运行状态：{status}")
+        token = token or lease_token_for(run_id)
+        now = self._lease_now()
+        conditions=[runs.c.run_id==run_id,runs.c.owner==current_owner(owner)]
+        conditions += [runs.c.lease_token==token,runs.c.lease_expires_at>now] if token else [or_(runs.c.lease_token.is_(None),runs.c.lease_expires_at<=now)]
+        values=dict(status=status,updated_at=now,error=error,pending_approval=pending_approval)
+        if status != "running":
+            values.update(lease_token=None,lease_expires_at=None)
+        elif not token:
+            values.update(owner_pid=os.getpid(),heartbeat_at=now)
+        with self._session() as session:
+            result = session.execute(runs.update().where(*conditions).values(**values))
+            if token and result.rowcount != 1:
+                raise LeaseLost("旧执行者不得修改运行状态")
+
+    def is_stale_running(self, run_id):
+        record=self.get(run_id)
         if record is None or record.status != "running":
             return False
-        if not _process_alive(record.owner_pid):
-            return True
-        if record.heartbeat_at is None:
-            return True
-        return (time.time() - record.heartbeat_at) > STALE_HEARTBEAT_SECONDS
+        if record.lease_token:
+            return not record.lease_expires_at or record.lease_expires_at <= self._lease_now()
+        return record.heartbeat_at is None or self._lease_now()-record.heartbeat_at > STALE_HEARTBEAT_SECONDS
 
+    def record_approval(self, run_id, approval):
+        with self._session() as session:
+            row=session.execute(select(runs).where(runs.c.run_id==run_id,runs.c.owner==current_owner()).with_for_update()).first()
+            if row is None:
+                raise KeyError("未找到运行")
+            approvals=list(row._mapping["approvals"] or [])
+            existing=next((item for item in approvals if item.get("approval_id")==approval.get("approval_id")),None)
+            if existing and existing.get("decision") != approval.get("decision"):
+                raise RunConflict("同一审批已经提交不同决定")
+            if existing is None:
+                approvals.append(approval)
+            session.execute(runs.update().where(runs.c.run_id==run_id,runs.c.owner==current_owner()).values(approvals=approvals,updated_at=time.time()))
+            return existing or approval
 
-__all__ = ["PostgresRunStore", "ensure_schema"]
+__all__=["PostgresRunStore","ensure_schema"]

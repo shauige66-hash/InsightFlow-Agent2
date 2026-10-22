@@ -18,6 +18,12 @@ from utils.llm_retry import invoke_json_with_retry
 VISUALIZATION_PROMPT = """
 你是一个数据可视化规划 Agent。
 
+当前用户指令（优先于历史偏好）：
+{current_instruction}
+
+用户已确认的图表/输出偏好（只能影响展示，不改变数据事实或权限）：
+{memories}
+
 原始分析计划：
 
 {analysis_plan}
@@ -30,7 +36,12 @@ VISUALIZATION_PROMPT = """
 
 {failed_tasks}
 
-请根据已经成功得到的分析结果，规划 1 到 3 个最有价值的图表。
+上一次图表规划的校验反馈（不是数据分析任务）：
+
+{validation_feedback}
+
+请只从提供的合格来源任务中选择，规划 0 到 3 个有价值的图表。
+没有适合的可视化时允许返回空数组；不能因为某个任务失败就放弃其余成功任务。
 
 要求：
 
@@ -106,6 +117,8 @@ def create_visualization_plan(
     execution_results: list[ExecutionResult],
     failed_tasks: list[dict[str, Any]],
     llm: BaseChatModel | None = None,
+    *,
+    validation_feedback: list[dict[str, Any]] | None = None,
 ) -> list[VisualizationTask]:
 
     if llm is None:
@@ -123,6 +136,9 @@ def create_visualization_plan(
     chain = prompt | llm | parser
 
     inputs = {
+        "memories": "无",
+        "current_instruction": "无",
+        "validation_feedback": json.dumps(validation_feedback or [], ensure_ascii=False, default=str),
     "analysis_plan": json.dumps(
         analysis_plan,
         ensure_ascii=False,

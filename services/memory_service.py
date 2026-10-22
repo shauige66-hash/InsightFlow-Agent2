@@ -12,7 +12,10 @@
 from __future__ import annotations
 
 import logging
+import hashlib
+import os
 import re
+from pathlib import Path
 from typing import Any
 
 import storage
@@ -125,6 +128,8 @@ class MemoryService:
     ) -> dict[str, Any] | None:
         if value is not None:
             self._validate(kind="preference", key="x", value=value)
+        if status is not None and status not in (CANDIDATE, CONFIRMED):
+            raise MemoryValidationError("未知的记忆状态")
         with storage.session_scope(storage.database_url()) as session:
             record = self._repository(session).update(
                 memory_id, value=value, scope=scope, status=status
@@ -166,13 +171,13 @@ class MemoryService:
                 for record, overlap in hits
             ]
 
-    def scopes_for(self, dataset_refs: list[str]) -> list[str]:
+    def scopes_for(self, dataset_refs: list[str], *, session_id: str | None = None) -> list[str]:
         """当前会话适用的作用域：全局 + 该数据集的专属记忆。"""
         scopes = [SCOPE_GLOBAL]
         for ref in dataset_refs:
-            from pathlib import Path
-
-            scopes.append(f"{SCOPE_DATASET_PREFIX}{Path(ref).stem}")
+            scopes.append(dataset_scope(ref))
+        if session_id:
+            scopes.append(f"{SCOPE_SESSION_PREFIX}{session_id}")
         return scopes
 
     # -- 写入前的作用域分类 -----------------------------------------------
@@ -186,13 +191,13 @@ class MemoryService:
     ) -> tuple[str, str]:
         """判断一条记忆该落在哪个作用域，返回 `(scope, reason)`。
 
-        规则是确定性的、可解释的，且**保守**：拿不准就 global，因为 global 的
-        记忆会被所有会话读到，错放一条的代价比漏放一条大得多。
+        规则是确定性的、可解释的。局部措辞有歧义时限于当前会话；
+        没有会话可绑定就 unresolved，禁止提升为所有会话可读的 global。
 
         优先级：
-        1. 文中点名了本次的某个数据集 → `dataset:<stem>`（跨会话，但只对该数据）
+        1. 文中点名了本次唯一数据集 → 含路径身份的 dataset scope
         2. 出现"这次/本次/这份报告"这类措辞 → `session:<id>`（会话内有效）
-        3. 出现"这张表/这个数据集"但没有点名 → 只有一个数据集时归它，否则 global
+        3. 出现"这张表/这个数据集"但没有点名 → 单数据集归它，否则会话/unresolved
         4. 其余视为稳定偏好 → `global`
         """
         content = (text or "").strip()
@@ -206,19 +211,22 @@ class MemoryService:
         lowered = content.lower()
         for stem in stems:
             if stem and stem.lower() in lowered:
-                return f"{SCOPE_DATASET_PREFIX}{stem}", f"点名了数据集 {stem}"
+                matching_refs = [ref for ref in refs if Path(ref).stem.casefold() == stem.casefold()]
+                if len(matching_refs) == 1:
+                    return dataset_scope(matching_refs[0]), f"点名了数据集 {stem}"
+                return f"{SCOPE_SESSION_PREFIX}{session_id}" if session_id else "unresolved", "同名数据集存在歧义"
 
         if any(marker in content for marker in _SESSION_MARKERS):
             if session_id:
                 return f"{SCOPE_SESSION_PREFIX}{session_id}", "措辞指向本次分析"
             if len(stems) == 1:
-                return f"{SCOPE_DATASET_PREFIX}{stems[0]}", "措辞指向本次分析，且只有一个数据集"
-            return SCOPE_GLOBAL, "措辞指向本次分析，但缺少会话与数据集上下文"
+                return dataset_scope(refs[0]), "措辞指向本次分析，且只有一个数据集"
+            return "unresolved", "措辞指向本次分析，但缺少会话与数据集上下文"
 
         if any(marker in content for marker in _DATASET_MARKERS):
             if len(stems) == 1:
-                return f"{SCOPE_DATASET_PREFIX}{stems[0]}", "措辞指向数据集，且只有一个数据集"
-            return SCOPE_GLOBAL, "措辞指向数据集，但本次有多个数据集"
+                return dataset_scope(refs[0]), "措辞指向数据集，且只有一个数据集"
+            return f"{SCOPE_SESSION_PREFIX}{session_id}" if session_id else "unresolved", "措辞指向数据集，但本次有多个数据集"
 
         return SCOPE_GLOBAL, "稳定偏好"
 
@@ -245,10 +253,12 @@ class MemoryService:
         scope, reason = self.classify_scope(
             content, dataset_refs=dataset_refs, session_id=session_id
         )
+        if scope == "unresolved":
+            return []
         candidates = [
             {
                 "kind": "preference",
-                "key": "explicit_preference",
+                "key": "explicit_preference:" + hashlib.sha256(content.encode("utf-8")).hexdigest()[:24],
                 "value": content,
                 "scope": scope,
                 "status": CANDIDATE,
@@ -280,6 +290,17 @@ class MemoryService:
         for pattern in _SENSITIVE:
             if pattern.search(value):
                 raise MemoryValidationError("记忆内容看起来包含凭据，拒绝写入")
+
+
+def dataset_scope(reference: str) -> str:
+    """Display names never identify datasets; keep preferences stable for this source path.
+
+    Legacy ``dataset:<stem>`` scopes are intentionally not auto-recalled: the
+    owner must explicitly rebind them because a stem cannot disambiguate sources.
+    """
+    canonical = os.path.normcase(str(Path(reference).expanduser().resolve()))
+    identity = hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:32]
+    return f"{SCOPE_DATASET_PREFIX}{Path(reference).stem[:50]}:{identity}"
 
 
 def _memory_dict(record) -> dict[str, Any]:

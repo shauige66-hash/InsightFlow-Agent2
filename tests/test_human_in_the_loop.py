@@ -29,6 +29,7 @@ from tools.tool_registry import clear_tool_cache
 from utils.idempotency import plan_approval_id
 
 from tests.conftest import CALL_RECORDS, CUSTOMERS_CSV
+from tests.support.scripted_runtime_tools import invoke_scripted_tool, no_browser_pdf
 
 REPLIES: dict[str, Any] = {
     "planner": {
@@ -86,6 +87,10 @@ def _factory(run_id: str) -> ModelFactory:
 
 @pytest.fixture(autouse=True)
 def _isolate(tmp_path, monkeypatch):
+    import harness.tool_dispatcher as dispatcher
+    import nodes
+    monkeypatch.setattr(dispatcher, "invoke_tool", invoke_scripted_tool)
+    monkeypatch.setattr(nodes, "save_pdf_report", no_browser_pdf)
     monkeypatch.chdir(tmp_path)
     CALL_RECORDS.clear()
     clear_tool_cache()

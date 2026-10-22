@@ -82,18 +82,18 @@ class TestEnqueueAndClaim:
 class TestCompletion:
     def test_finishing_marks_it_done(self, queue) -> None:
         run_queue.enqueue("run_1", _payload("run_1"))
-        run_queue.claim("w1")
+        claimed = run_queue.claim("w1")
 
-        run_queue.finish("run_1")
+        run_queue.finish("run_1", claim_token=claimed[1]["_job_claim"])
 
         assert run_queue.status_of("run_1") == "done"
         assert run_queue.depth().get("done") == 1
 
     def test_a_failure_records_its_reason(self, queue) -> None:
         run_queue.enqueue("run_1", _payload("run_1"))
-        run_queue.claim("w1")
+        claimed = run_queue.claim("w1")
 
-        run_queue.finish("run_1", error="BudgetExceeded: llm_calls")
+        run_queue.finish("run_1", error="BudgetExceeded: llm_calls", claim_token=claimed[1]["_job_claim"])
 
         assert run_queue.status_of("run_1") == "failed"
         assert "BudgetExceeded" in (run_queue.last_error("run_1") or "")

@@ -25,8 +25,11 @@ from typing import Any, Callable
 from harness import policy
 from utils.agent_loop import BUDGET_FIELD, set_request_hooks, set_state_provider
 from utils.context_budget import context_report_of
-from utils.idempotency import run_agent_call
+from utils.idempotency import run_agent_call, current_operation
 from utils.run_logger import log_event
+from core.runtime import RuntimeContextMissing, current_runtime
+from utils import llm_ledger
+from utils.agent_loop import usage_of
 
 
 class StateNotBound(RuntimeError):
@@ -64,7 +67,32 @@ class LLMGateway:
         只判不记。`run_agent_call` 在落账本之前调一次，`utils.llm_retry`
         在每次重发之前再调一次，两次都只读。
         """
-        policy.ensure_model_request_allowed(self._current_state())
+        state = self._current_state()
+        self._lease()
+        self._reconcile_requests(state)
+        policy.ensure_model_request_allowed(state)
+
+    @staticmethod
+    def _lease() -> None:
+        try:
+            lease = getattr(current_runtime(), "assert_lease", None)
+        except RuntimeContextMissing:
+            return
+        if lease is not None:
+            lease()
+
+    @staticmethod
+    def _reconcile_requests(state: dict[str, Any]) -> None:
+        try:
+            root = current_runtime().output_root
+        except RuntimeContextMissing:
+            return
+        spent = llm_ledger.request_count(state.get("run_id") or "unknown", root=root)
+        usage = usage_of(state)
+        if spent > usage["llm_calls"]:
+            payload = dict(state.get(BUDGET_FIELD) or {})
+            payload["usage"] = {**usage, "llm_calls": spent}
+            state[BUDGET_FIELD] = payload
 
     def call_agent(
         self,
@@ -81,14 +109,16 @@ class LLMGateway:
         每次恢复都重复询问同一件事。
         """
         state = self._current_state()
-        payload, operations, extra = run_agent_call(
-            state,
-            node=agent,
-            subject=subject,
-            call=invoke,
-            attempt=attempt,
-            before_request=self.budget_guard,
-        )
+        self._lease()
+        self._reconcile_requests(state)
+        try:
+            payload, operations, extra = run_agent_call(
+                state, node=agent, subject=subject, call=invoke,
+                attempt=attempt, before_request=self.budget_guard,
+            )
+        except BaseException:
+            state.update(policy.settle(state))
+            raise
 
         extra = dict(extra or {})
         invoked = bool(extra.pop("__upstream_invoked__", False))
@@ -102,6 +132,11 @@ class LLMGateway:
             settled = policy.settle(state)
             extra[BUDGET_FIELD] = settled[BUDGET_FIELD]
             self._log_context(agent, subject, operation_id, state)
+
+        self._lease()
+        # 已消费但尚未进入旧 checkpoint 的请求也必须提交，缓存命中亦然。
+        if isinstance(state.get(BUDGET_FIELD), dict):
+            extra[BUDGET_FIELD] = policy.settle(state)[BUDGET_FIELD]
 
         return payload, operations, extra
 
@@ -148,7 +183,19 @@ class LLMGateway:
         state = self._state_reader()
         if state is None:
             return
+        self._lease()
         policy.count_model_request(state)
+        try:
+            root = current_runtime().output_root
+        except RuntimeContextMissing:
+            return
+        # fsync 发生在真实请求之前；中断后从账本恢复此用量，不以节点提交为界。
+        llm_ledger.record_request(
+            run_id=state.get("run_id") or "unknown",
+            used=usage_of(state)["llm_calls"],
+            **current_operation(),
+            root=root,
+        )
 
     def _current_state(self) -> dict[str, Any]:
         """当前 Run 的 state；未绑定就拒绝。

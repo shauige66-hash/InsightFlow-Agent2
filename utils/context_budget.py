@@ -122,6 +122,7 @@ PRESERVE_KEYS: frozenset[str] = frozenset(
         "columns",
         "preview",
         "__kind__",
+        "current_instruction",
     }
 )
 
@@ -481,14 +482,14 @@ NODE_PRESERVE_FIELDS: dict[str, frozenset[str]] = {
     # critic：任务期望与执行结果（含 error/error_kind）是判定依据
     "critic": frozenset({"task", "retrieved_knowledge", "execution_result"}),
     # visualizer：计划与失败任务决定要不要出图
-    "visualizer": frozenset({"analysis_plan", "failed_tasks"}),
+    "visualizer": frozenset({"analysis_plan", "failed_tasks", "current_instruction", "validation_feedback"}),
     # plotter：图表定义与样本 schema 决定画什么
-    "plotter": frozenset({"visualization_task", "data_context"}),
+    "plotter": frozenset({"visualization_task", "data_context", "current_instruction"}),
     # plot_repair：出错信息与出错代码
     "plot_repair": frozenset({"visualization_task", "code", "error"}),
     # reporter：计划、失败任务与可视化结果是报告骨架
     "reporter": frozenset(
-        {"analysis_plan", "failed_tasks", "visualization_results"}
+        {"analysis_plan", "failed_tasks", "visualization_results", "current_instruction"}
     ),
 }
 

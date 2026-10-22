@@ -33,6 +33,14 @@ from services.run_coordinator import RunCoordinator
 from services.run_store import RunStore
 from utils.idempotency import plan_approval_id, report_approval_id
 
+
+@pytest.fixture(autouse=True)
+def _no_browser_for_approval_tests(monkeypatch):
+    import nodes
+    from tests.support.scripted_runtime_tools import scripted_pdf
+    monkeypatch.setattr(nodes, "save_pdf_report", scripted_pdf)
+
+
 TARGET = "customers.customers"
 CODE = "SELECT COUNT(*) AS n FROM customers"
 

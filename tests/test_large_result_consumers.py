@@ -5,11 +5,14 @@
 
 这两条路径的区别是本阶段的核心，因此在这里跑完整工作流验证，
 而不是只测纯函数。
+非sandbox用例在容器边界返回固定已知结果，实际外置/读取/预览/入参检查保留；
+只有显式sandbox类验收容器绘图，测试环境不足时不得把占位PNG称作真实绘图。
 """
 
 from __future__ import annotations
 
 import json
+import base64
 from pathlib import Path
 from typing import Any
 
@@ -34,6 +37,16 @@ from tests.conftest import CALL_RECORDS
 # 更大的结果（如 20,000 行）不适合走沙箱工作流，
 # 由 tests/test_large_result_recovery.py 直接测 store_result 覆盖。
 BIG_ROWS = 8_000
+
+ROW_COUNT_PLOT_CODE = (
+    "rows = -1 if result_df is None else len(result_df)\n"
+    "fig = plt.figure()\n"
+    "plt.bar(['all'], [rows])\n"
+    "plt.title('行数')\n"
+    "plt.savefig(output_path)\n"
+    "plt.close()\n"
+    "result = rows\n"
+)
 
 PLAN = {
     "tasks": [
@@ -125,6 +138,44 @@ class PromptRecordingFactory:
         )
 
 
+@pytest.fixture(autouse=True)
+def _consumer_boundary(request, monkeypatch):
+    """Test real externalization/loading; the container boundary is inert here.
+
+    The explicitly sandbox-marked class below retains its REAL executor. A tiny
+    fixture PNG proves only publication/path handling, never chart rendering.
+    """
+    if request.node.get_closest_marker("sandbox"):
+        return
+    from tools import python_tool, plot_tool
+    from sandbox.protocol import SandboxOutcome
+    from utils.result_artifacts import to_jsonable
+    from core.runtime import current_runtime
+    from tests.support.scripted_runtime_tools import no_browser_pdf
+    import nodes
+
+    def fixed_outcome(*, job, tables, run_id=None, run_dir=None, **kwargs):
+        if job.mode == "python":
+            assert job.code.strip() == "result = df", "unknown code is not executed in a consumer test"
+            frame = tables[job.table_names[0]].dataframe
+            assert len(frame) == BIG_ROWS
+            return SandboxOutcome(True, to_jsonable(frame), None)
+        assert job.mode == "plot" and job.code == ROW_COUNT_PLOT_CODE
+        payload = job.analysis_result
+        records = payload.get("records") if isinstance(payload, dict) else payload
+        assert isinstance(records, list) and len(records) == BIG_ROWS
+        assert records[-1]["customer_id"] == f"C{BIG_ROWS - 1:06d}", "plot consumer received only the preview"
+        runtime = current_runtime()
+        path = Path(run_dir or runtime.output_dir()) / job.output_filename
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(base64.b64decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/l9sAAAAASUVORK5CYII="))
+        return SandboxOutcome(True, BIG_ROWS, None)
+
+    monkeypatch.setattr(python_tool, "execute_in_sandbox", fixed_outcome)
+    monkeypatch.setattr(plot_tool, "execute_in_sandbox", fixed_outcome)
+    monkeypatch.setattr(nodes, "save_pdf_report", no_browser_pdf)
+
+
 @pytest.fixture
 def workspace(tmp_path: Path) -> tuple[Path, Path]:
     """足够大（>32 KiB）但仍在沙箱 1 MiB 结果上限内的 CSV。"""
@@ -212,20 +263,12 @@ class TestReportSeesBoundedPreview:
 
 class TestPlottingUsesRealData:
     def test_plot_receives_real_row_count(self, workspace) -> None:
-        """绘图必须拿到真实数据：让代码把行数写进图里再断言。
+        """绘图消费边界必须拿到真实数据，fixture断言行数与最后一条记录。
 
         如果绘图拿到的是 `{"__kind__": "externalized"}` 摘要，
         result_df 会是 None 或一行，断言就会失败——这正是缺陷的表现。
         """
-        code = (
-            "rows = -1 if result_df is None else len(result_df)\n"
-            "fig = plt.figure()\n"
-            "plt.bar(['all'], [rows])\n"
-            "plt.title('行数')\n"
-            "plt.savefig(output_path)\n"
-            "plt.close()\n"
-            "result = rows\n"
-        )
+        code = ROW_COUNT_PLOT_CODE
 
         result, recorder = run_workflow(
             workspace,
@@ -235,7 +278,7 @@ class TestPlottingUsesRealData:
 
         plotted = result["visualization_results"][-1]
         assert plotted["success"] is True, plotted["error"]
-        # 产物存在，且真正的 PNG 落在 Run 目录
+        # 固定fixture PNG仅验证发布路径；不宣称绘图代码真实执行。
         assert plotted["path"]
         assert Path(plotted["path"]).exists()
 

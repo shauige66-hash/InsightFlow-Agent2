@@ -4,6 +4,11 @@ import sqlite3
 import pandas as pd
 from ingestion.models import TableResource
 
+
+def _reserve_name(existing: dict, name: str) -> None:
+    if name.casefold() in {str(key).casefold() for key in existing}:
+        raise ValueError(f"重复的数据资源名 {name!r}；请为来源文件设置不同名称")
+
 def load_data_sources( data_sources: list[str]) -> dict[str, TableResource]:
 
     tables: dict[str, TableResource] = {}
@@ -19,6 +24,7 @@ def load_data_sources( data_sources: list[str]) -> dict[str, TableResource]:
         suffix = path.suffix.lower()
 
         if suffix == ".csv":
+           _reserve_name(tables, path.stem)
            df = pd.read_csv(path)
 
            tables[path.stem] = TableResource(
@@ -33,6 +39,7 @@ def load_data_sources( data_sources: list[str]) -> dict[str, TableResource]:
 
             for sheet_name, df in sheets.items():
                 table_name = f"{path.stem}.{sheet_name}"
+                _reserve_name(tables, table_name)
                 tables[table_name] = TableResource(
                     name=table_name,
                     source_type="excel",
@@ -56,6 +63,7 @@ def load_data_sources( data_sources: list[str]) -> dict[str, TableResource]:
                 for table_name in table_names:                   
 
                     key = f"{path.stem}.{table_name}"
+                    _reserve_name(tables, key)
 
                     tables[key] = TableResource(
                         name=key,

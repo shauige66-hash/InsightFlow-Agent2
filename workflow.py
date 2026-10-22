@@ -27,6 +27,7 @@ from nodes import (
     plot_execution_node,
     plot_repair_node,
     advance_chart_node,
+    budget_stop_node,
 )
 
 from conditions import (
@@ -45,6 +46,7 @@ from conditions import (
     route_after_failed_task,
     route_after_decide,
     route_after_runtime_replan,
+    route_after_budget_stop,
 )
 
 
@@ -53,6 +55,8 @@ def create_workflow(checkpointer=None):
     graph = StateGraph(
         InsightFlowState
     )
+    graph.add_node("budget_stop", budget_stop_node)
+    graph.add_conditional_edges("budget_stop", route_after_budget_stop, {"report_publish_gate": "report_publish_gate", "artifact": "artifact"})
 
     graph.add_node(
         "loader",
@@ -201,6 +205,7 @@ def create_workflow(checkpointer=None):
             "approval_gate": "approval_gate",
             "router": "router",
             "complete": "visualization_planner",
+            "budget_stop": "budget_stop",
         }
     )
 
@@ -235,6 +240,7 @@ def create_workflow(checkpointer=None):
             "repair": "repair",
             "critic": "critic",
             "failed": "failed_task",
+            "budget_stop": "budget_stop",
         }
     )
 
@@ -251,6 +257,7 @@ def create_workflow(checkpointer=None):
             "advance": "advance_task",
             "refine": "refine",
             "failed": "failed_task",
+            "budget_stop": "budget_stop",
         }
     )
 
@@ -278,6 +285,7 @@ def create_workflow(checkpointer=None):
             "refine": "refine",
             "execution": "execution",
             "replan": "runtime_replan",
+            "budget_stop": "budget_stop",
         }
     )
 
@@ -288,6 +296,7 @@ def create_workflow(checkpointer=None):
             "router": "router",
             "approval_gate": "approval_gate",
             "complete": "visualization_planner",
+            "budget_stop": "budget_stop",
         }
     )
 
@@ -306,6 +315,7 @@ def create_workflow(checkpointer=None):
         {
             "plot_generation": "plot_generation",
             "report": "report",
+            "budget_stop": "budget_stop",
         }
     )
 
@@ -321,6 +331,7 @@ def create_workflow(checkpointer=None):
     {
         "plot_repair": "plot_repair",
         "advance_chart": "advance_chart",
+        "budget_stop": "budget_stop",
     }
     )
 
@@ -345,6 +356,7 @@ def create_workflow(checkpointer=None):
         {
             "report_publish_gate": "report_publish_gate",
             "artifact": "artifact",
+            "budget_stop": "budget_stop",
         }
     )
 

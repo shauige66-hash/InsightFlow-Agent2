@@ -82,6 +82,20 @@ def _factory(run_id: str) -> ModelFactory:
 def client(tmp_path: Path, monkeypatch):
     """把 API 的存储与产物都指向临时目录，避免污染仓库。"""
     monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("INSIGHTFLOW_EXECUTION","inline")
+    import tools.python_tool as python_tool
+    import nodes
+    from sandbox.protocol import SandboxOutcome
+    def scripted_python(*, job, tables, **kwargs):
+        # This module tests HTTP lifecycle, not Docker execution. Evaluate only
+        # the fixed scripted test operation, never arbitrary generated code.
+        assert job.mode == "python"
+        assert job.code.strip() == "result = len(df)"
+        return SandboxOutcome(success=True,result=len(tables[job.table_names[0]].dataframe),error=None)
+    def no_pdf_browser(*args, **kwargs):
+        raise RuntimeError("PDF browser deliberately disabled in API unit tests")
+    monkeypatch.setattr(python_tool,"execute_in_sandbox",scripted_python)
+    monkeypatch.setattr(nodes,"save_pdf_report",no_pdf_browser)
 
     import api_runs
     from services.run_coordinator import RunCoordinator
@@ -169,7 +183,7 @@ class TestRunLifecycle:
         assert response.status_code == 202
         payload = response.json()
         assert payload["run_id"]
-        assert payload["status"] == "running"
+        assert payload["status"] in ("pending","running")
 
     def test_run_reaches_completed(self, client: TestClient, data_source: Path) -> None:
         created = client.post("/runs", json={"data_sources": [str(data_source)]})

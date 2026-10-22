@@ -41,21 +41,26 @@ def process_one(coordinator, worker_id: str) -> bool:
         return False
 
     run_id, payload = claimed
-    print(f"[worker] 领取 {run_id}（{worker_id}）", flush=True)
+    claim_token=payload.pop("_job_claim",None)
+    owner=payload.pop("_owner",None)
+    attempt=payload.pop("_queue_attempt",1)
+    import storage
+    owner_handle=storage.set_current_owner(owner)
+    print(f"[worker] 领取 {run_id}（{worker_id}）",flush=True)
     try:
-        coordinator.start(
-            run_id,
-            record_exists=True,
-            wait=True,
-            **payload,
-        )
-    except Exception as error:  # noqa: BLE001 - 失败必须记进队列，不能静默
-        message = f"{type(error).__name__}: {error}"
-        print(f"[worker] {run_id} 失败：{message}", flush=True)
-        run_queue.finish(run_id, error=message)
+        if payload.pop("_resume",False) or attempt>1:
+            coordinator.resume(run_id,resume_value=payload.get("resume_value"),owner=owner,wait=True,from_queue=True)
+        else:
+            coordinator.start(run_id,record_exists=True,wait=True,owner=owner,**payload)
+    except Exception as error:
+        message=f"{type(error).__name__}: {error}"
+        print(f"[worker] {run_id} 失败：{message}",flush=True)
+        run_queue.finish(run_id,error=message,claim_token=claim_token)
     else:
-        run_queue.finish(run_id)
-        print(f"[worker] {run_id} 完成", flush=True)
+        run_queue.finish(run_id,claim_token=claim_token)
+        print(f"[worker] {run_id} 完成",flush=True)
+    finally:
+        storage.reset_current_owner(owner_handle)
     return True
 
 

@@ -33,6 +33,10 @@ from tests.test_report_approval import REPLIES
 
 @pytest.fixture(autouse=True)
 def _restore_replies():
+    from sandbox.executor import DockerSandboxExecutor
+    executor = DockerSandboxExecutor()
+    if not executor.available() or not executor.image_present():
+        pytest.skip("本组治理验收明确要求真实Docker及已构建sandbox镜像")
     original = copy.deepcopy(REPLIES)
     yield
     REPLIES.clear()

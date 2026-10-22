@@ -212,6 +212,15 @@ async function api(path, init) {
   return data;
 }
 
+async function openArtifact(runId, kind) {
+  const tab=window.open("about:blank","_blank");
+  if(tab){tab.opener=null;}
+  try {
+    const data=await api("/runs/"+encodeURIComponent(runId)+"/artifact-link?kind="+kind);
+    if(tab){tab.location.href=data.url;} else {window.location.href=data.url;}
+  } catch(error) {if(tab){tab.close();} alert(error.message);}
+}
+
 async function loadOptions() {
   try {
     const data = await api("/ui-options");
@@ -395,9 +404,9 @@ async function refreshRun(runId) {
 
   if (st === "completed" || st === "partial") {
     html += '<div class="row" style="margin-top:12px">' +
-            '<a href="/runs/' + encodeURIComponent(runId) + '/report.html" target="_blank" rel="noopener">' +
+            '<a href="#" onclick="openArtifact(\'' + esc(runId) + '\',\'html\');return false">' +
             '<button class="primary">打开报告</button></a>' +
-            '<a href="/runs/' + encodeURIComponent(runId) + '/report" target="_blank" rel="noopener">' +
+            '<a href="#" onclick="openArtifact(\'' + esc(runId) + '\',\'pdf\');return false">' +
             "<button>下载 PDF</button></a>" +
             "</div>";
   }

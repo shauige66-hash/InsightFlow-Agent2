@@ -58,6 +58,7 @@ def run_phase(
         str(data_source),
         "--crash-at",
         crash_at,
+        "--scripted-tools",
     ]
     if crash_on:
         command += ["--crash-on", crash_on]

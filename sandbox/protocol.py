@@ -38,6 +38,7 @@ class SandboxErrorKind:
     EXECUTION_ERROR = "execution_error"
     INVALID_RESULT = "invalid_result"
     INTERNAL = "internal"
+    OUTPUT_LIMIT = "output_limit"
 
 
 # 环境/资源类失败：重发同样的代码不会好转，不应进入 LLM 修复循环。
@@ -49,6 +50,7 @@ ENVIRONMENT_ERROR_KINDS = frozenset(
         SandboxErrorKind.UNAVAILABLE,
         SandboxErrorKind.TIMEOUT,
         SandboxErrorKind.OOM,
+        SandboxErrorKind.OUTPUT_LIMIT,
     }
 )
 
@@ -65,6 +67,8 @@ class SandboxLimits:
     max_result_bytes: int = 1024 * 1024
     max_result_rows: int = 100_000
     max_output_file_bytes: int = 16 * 1024 * 1024
+    max_workspace_bytes: int = 64 * 1024 * 1024
+    max_output_files: int = 512
     # 并发获取容器配额的最长等待；超过即 fail-closed，不无限排队
     concurrency_wait_seconds: float = 120.0
 

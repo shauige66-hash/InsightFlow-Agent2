@@ -1,12 +1,13 @@
 """端到端 Mock 工作流与 V1 基线。
 
-用假模型跑完整条 LangGraph 流程，验证：
+用假模型与白名单工具响应跑完整条 LangGraph 流程，验证：
 - 一次运行能走到产出报告；
 - 各 Agent 的调用身份被正确传递（ModelGate 追踪的前提）；
 - 循环边界真的会终止；
 - 基线可度量项（调用次数、工具次数、耗时、产物）被记录下来。
 
 不伪造 token 与成本：假模型不返回 usage，因此这些指标记为不可用而不是 0。
+这里不验收Docker代码执行/真实绘图；SQLite只读查询仍用真实工具。
 """
 
 from __future__ import annotations
@@ -119,6 +120,21 @@ def agent_call_count(run_id: str, agent_name: str) -> int:
 def _isolate_outputs(tmp_path, monkeypatch):
     """产物与日志写入临时目录，避免污染仓库。"""
     monkeypatch.chdir(tmp_path)
+    from harness import tool_dispatcher
+    from tests.support.scripted_runtime_tools import invoke_scripted_tool, no_browser_pdf
+    import nodes
+
+    real_invoke = tool_dispatcher.invoke_tool
+    def known_tool(tool_name, tables, arguments, *, snapshots=None):
+        # Workflow/identity assertions do not exercise Python isolation. Only
+        # these fixed replies are modeled; no model-provided code is executed.
+        if tool_name == "sql":
+            return real_invoke(tool_name, tables, arguments, snapshots=snapshots)
+        if arguments.get("code", "").strip() == "result = undefined_name":
+            return {"success": False, "result": None, "error": "NameError: undefined_name", "error_kind": "execution_error"}
+        return invoke_scripted_tool(tool_name, tables, arguments, snapshots=snapshots)
+    monkeypatch.setattr(tool_dispatcher, "invoke_tool", known_tool)
+    monkeypatch.setattr(nodes, "save_pdf_report", no_browser_pdf)
     clear_tool_cache()
     yield tmp_path
     CALL_RECORDS.clear()

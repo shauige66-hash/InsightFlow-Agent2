@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.types import Command
@@ -16,7 +16,7 @@ from core.runtime import (
     build_thread_config,
     use_runtime,
 )
-from ingestion.resources import ResourceResolver
+from ingestion.resources import ResourceResolver, verify_recorded_sources
 from utils.agent_loop import AgentBudget, new_usage
 
 
@@ -53,26 +53,6 @@ def _budget_snapshot(result: dict[str, Any]) -> dict[str, Any]:
     return snapshot(result) if isinstance(result.get("execution_budget"), dict) else {}
 
 
-def _resume_inputs(
-    run_id: str, runtime: RunRuntime, *, grant_retry: bool = False
-) -> dict[str, Any]:
-    """从 Checkpoint 续跑时提供的增量输入。
-
-    只有 `pending_llm_calls` 需要在这里给出：它是**本次运行**才发现的证据
-    （来自账本），不能依赖上一次进程把它写进 Checkpoint。
-    其余字段由 LangGraph 从 Checkpoint 恢复。
-
-    `grant_retry` 表示调用方已经决定重发未确认的调用。它必须作为 state 的一部分
-    传入：恢复是从上一张 Checkpoint 继续，若只靠 `Command` 传参，
-    中断恢复后这个决定就丢了，会被反复询问。
-    """
-    return {
-        "pending_llm_calls": list(runtime.unconfirmed_llm_calls),
-        "llm_retry_granted": "retry" if grant_retry else None,
-        "require_plan_approval": None,
-    }
-
-
 def _unconfirmed_llm_calls(run_id: str, output_root: Path) -> list[str]:
     """从账本找出"已发出但没有完成记录"的模型调用。
 
@@ -107,6 +87,7 @@ def run_analysis(
     memories: list[dict[str, Any]] | None = None,
     enable_dynamic_loop: bool = False,
     dynamic_limits: dict[str, Any] | None = None,
+    assert_lease: Callable[[], None] | None = None,
 ) -> dict[str, Any]:
     """执行（或恢复）一次完整分析。
 
@@ -130,6 +111,14 @@ def run_analysis(
     if run_id is None:
         run_id = create_run_id()
 
+    if resume_value is not None:
+        resume = Command(resume=resume_value)
+    elif isinstance(resume, Command):
+        resume_value = resume.resume
+    recovering = resume is not None or continue_from_checkpoint
+    if recovering and checkpointer is None:
+        raise ValueError("恢复运行需要持久化 checkpointer")
+
     runtime = RunRuntime(
         run_id=run_id,
         model_factory=_require_factory(model_factory, run_id),
@@ -139,12 +128,22 @@ def run_analysis(
         # MCP 后端属于可信运行期配置：默认 direct，只有调用方显式指定才走 MCP。
         # 它不进 state，因此恢复时会重新构造，不会把上次的进程状态带过来。
         mcp=mcp or McpSettings(),
+        assert_lease=assert_lease,
     )
 
     workflow = create_workflow(checkpointer=checkpointer)
     config = build_thread_config(
         run_id, recursion_limit=DEFAULT_RECURSION_LIMIT
     )
+
+    if recovering:
+        persisted_snapshot = workflow.get_state(config)
+        if not persisted_snapshot.values:
+            raise ValueError(f"找不到可恢复的 checkpoint：{run_id}")
+        # 先确认历史输入仍可复现，再进入未确认请求审批或终态收尾。
+        # 否则 replay guard 会先询问是否付费重发，甚至把已损坏的数据
+        # Run 写成 abandoned，而没有暴露真正无法恢复的数据来源。
+        verify_recorded_sources(persisted_snapshot.values.get("table_snapshot") or {})
 
     inputs: dict[str, Any] | None = None
     if resume is None and not continue_from_checkpoint:
@@ -204,27 +203,8 @@ def run_analysis(
             "dynamic_finished": False,
             "termination_reason": None,
         }
-    elif continue_from_checkpoint:
-        # 续跑时也必须把账本里的未确认调用注入：Checkpoint 不会记得上次进程
-        # 在"请求已发出、节点未提交"之间的状态，只有账本有这条证据。
-        inputs = _resume_inputs(run_id, runtime)
-    else:
-        inputs = _resume_inputs(run_id, runtime)
-
-    # 恢复时可以把人工决定交回被中断的节点（Command(resume=...)）
-    # 恢复时可以把人工决定交回被中断的节点（Command(resume=...)）。
-    # 若该决定是针对未确认模型调用的重发许可，还要写进 state：
-    # 仅靠 Command 传参的话，这次 resume 内部再次中断后就丢失了。
-    grant_retry = (
-        isinstance(resume_value, dict)
-        and str(resume_value.get("llm_decision", "")).lower() == "retry"
-    )
-
-    if continue_from_checkpoint or resume is not None:
-        inputs = _resume_inputs(run_id, runtime, grant_retry=grant_retry)
-
-    if resume_value is not None:
-        resume = Command(resume=resume_value)
+    # 恢复传 None/Command，不能把增量 dict 当作一次新的 START 输入。
+    # 新账本证据由 RunRuntime 交给模型守卫，不覆盖 checkpoint 的任何配置。
 
     # 人工对"未确认的模型调用"选择了不重发。这是受控终止：必须落成终态，
     # 否则图仍停在待执行节点上，Run 会一直显示 running 并反复询问同一个决定。
@@ -247,7 +227,9 @@ def run_analysis(
                     if checkpointer
                     else None
                 )
-                if persisted and persisted.get("run_status") in (
+                if not persisted:
+                    raise ValueError(f"找不到可恢复的 checkpoint：{run_id}")
+                if persisted and not persisted.get("next_nodes") and persisted.get("run_status") in (
                     "completed",
                     "failed",
                 ):
@@ -260,6 +242,9 @@ def run_analysis(
                     )
                     return _read_full_state(run_id, checkpointer)
 
+            if assert_lease is not None:
+                assert_lease()
+
             log_event(
                 run_id=run_id,
                 node="workflow",
@@ -270,6 +255,8 @@ def run_analysis(
             result = workflow.invoke(
                 resume if resume is not None else inputs, config
             )
+            if assert_lease is not None:
+                assert_lease()
 
             log_event(
                 run_id=run_id,
@@ -298,6 +285,8 @@ def run_analysis(
         # 表达终止；因此显式把终态写进 Checkpoint。这是一次纯状态写入，
         # 不推进任何节点，也就不会产生副作用。
         with use_runtime(runtime):
+            if runtime.assert_lease is not None:
+                runtime.assert_lease()
             log_event(
                 run_id=run_id,
                 node="workflow",
@@ -308,6 +297,8 @@ def run_analysis(
 
             if checkpointer is not None:
                 workflow = create_workflow(checkpointer=checkpointer)
+                if runtime.assert_lease is not None:
+                    runtime.assert_lease()
                 workflow.update_state(
                     config,
                     {
@@ -315,6 +306,7 @@ def run_analysis(
                         "analysis_status": "failed",
                         "status_reason": str(abandoned),
                     },
+                    as_node="artifact",
                 )
                 return _read_full_state(run_id, checkpointer)
 
@@ -388,6 +380,8 @@ def _mark_abandoned(
     reason = "存在未确认的模型调用，且未获准重发"
 
     with use_runtime(runtime):
+        if runtime.assert_lease is not None:
+            runtime.assert_lease()
         log_event(
             run_id=run_id,
             node="workflow",
@@ -397,6 +391,8 @@ def _mark_abandoned(
         )
 
         workflow = create_workflow(checkpointer=checkpointer)
+        if runtime.assert_lease is not None:
+            runtime.assert_lease()
         workflow.update_state(
             config,
             {
@@ -404,6 +400,7 @@ def _mark_abandoned(
                 "analysis_status": "failed",
                 "status_reason": reason,
             },
+            as_node="artifact",
         )
 
     return _read_full_state(run_id, checkpointer)
@@ -458,6 +455,7 @@ PUBLIC_STATE_FIELDS = (
     # 没能生成的图表：报告会列出来，接口也应当能看到——否则"少了一张图"
     # 只能翻服务器日志。
     "failed_charts",
+    "visualization_planning",
 )
 
 
@@ -493,6 +491,9 @@ def read_run_state(
 
     if pending_approval is not None:
         state["run_status"] = "waiting_approval"
+    elif next_nodes and state.get("run_status") == "completed":
+        # 兼容旧版在 approve 后过早写 completed 的 checkpoint。
+        state["run_status"] = "running"
     elif not next_nodes and state.get("run_status") not in ("completed", "failed"):
         state["run_status"] = "interrupted"
 

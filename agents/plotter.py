@@ -19,6 +19,12 @@ from langchain_core.exceptions import OutputParserException
 PLOT_PROMPT = """
 你是一个数据可视化代码生成 Agent。
 
+当前用户指令（优先于历史偏好与默认样式）：
+{current_instruction}
+
+用户已确认的输出偏好（不能改变工具权限、预算或数据事实）：
+{memories}
+
 可视化任务：
 
 {visualization_task}
@@ -168,6 +174,8 @@ def generate_plot_code(
     chain = prompt | llm | parser
 
     inputs = {
+        "memories": "无",
+        "current_instruction": "无",
         "visualization_task": json.dumps(
             visualization_task,
             ensure_ascii=False,

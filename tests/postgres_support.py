@@ -3,20 +3,21 @@
 测试连真实容器（`deploy/compose.yaml`），不用 SQLite 或假客户端替代：
 "向量索引在真实 PostgreSQL 里可复用"这件事，只有真跑才能验证。
 
-默认连接串指向 compose 暴露的 5433 / 6380；可用环境变量覆盖。服务不可达时
-测试会被 skip，并在 skip 原因里说明——不伪装成通过。
+必须显式指定专用测试数据库和清理许可才会连接。缺少许可或服务不可达时
+测试会被 skip；默认不会连接或重置应用数据库。
 """
 
 from __future__ import annotations
 
 import os
+from urllib.parse import urlsplit
 
 import pytest
 
 DEFAULT_DATABASE = (
-    "postgresql+psycopg://insightflow:insightflow@127.0.0.1:5433/insightflow"
+    "postgresql+psycopg://insightflow:insightflow@127.0.0.1:5433/insightflow_test"
 )
-DEFAULT_REDIS = "redis://127.0.0.1:6380/0"
+DEFAULT_REDIS = "redis://127.0.0.1:6380/15"
 
 TABLES = (
     "knowledge_chunks",
@@ -42,8 +43,27 @@ def libpq_url(url: str | None = None) -> str:
     return (url or database_url()).replace("postgresql+psycopg://", "postgresql://", 1)
 
 
+def require_isolated_postgres() -> None:
+    """Destructive fixtures require explicit opt-in and a dedicated test DB."""
+    name = urlsplit(libpq_url()).path.strip('/')
+    if (os.getenv('INSIGHTFLOW_ALLOW_TEST_DB_RESET') != '1'
+            or not os.getenv('INSIGHTFLOW_TEST_DATABASE_URL')
+            or not (name.endswith('_test') or name.startswith('test_'))):
+        raise RuntimeError('PostgreSQL fixture reset requires an explicit dedicated *_test database and INSIGHTFLOW_ALLOW_TEST_DB_RESET=1')
+
+
+def require_isolated_redis() -> None:
+    parsed = urlsplit(redis_url())
+    if (os.getenv('INSIGHTFLOW_ALLOW_TEST_REDIS_RESET') != '1'
+            or not os.getenv('INSIGHTFLOW_TEST_REDIS_URL')
+            or not parsed.path.strip('/').isdigit()
+            or int(parsed.path.strip('/')) == 0):
+        raise RuntimeError('Redis fixture reset requires an explicit nonzero test DB and INSIGHTFLOW_ALLOW_TEST_REDIS_RESET=1')
+
+
 def postgres_available() -> bool:
     try:
+        require_isolated_postgres()
         import psycopg
 
         with psycopg.connect(libpq_url(), connect_timeout=2) as connection:
@@ -55,6 +75,7 @@ def postgres_available() -> bool:
 
 def redis_available() -> bool:
     try:
+        require_isolated_redis()
         import redis
 
         client = redis.Redis.from_url(redis_url(), socket_connect_timeout=2)
@@ -80,6 +101,7 @@ def drop_tables() -> None:
     只删这些表，不碰 LangGraph Checkpoint 表：不同用例的 thread_id 不同，
     不需要清理。
     """
+    require_isolated_postgres()
     import psycopg
 
     with psycopg.connect(libpq_url()) as connection:
@@ -89,6 +111,7 @@ def drop_tables() -> None:
 
 
 def clear_redis() -> None:
+    require_isolated_redis()
     import redis
 
     redis.Redis.from_url(redis_url()).flushdb()

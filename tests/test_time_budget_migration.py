@@ -179,6 +179,14 @@ class TestRealInterruptResume:
     以及老格式的预算在恢复时会不会被补记等待时间。
     """
 
+    @pytest.fixture(autouse=True)
+    def _scripted_tool_boundary(self, monkeypatch):
+        import harness.tool_dispatcher as dispatcher
+        import nodes
+        from tests.support.scripted_runtime_tools import invoke_scripted_tool, no_browser_pdf
+        monkeypatch.setattr(dispatcher, "invoke_tool", invoke_scripted_tool)
+        monkeypatch.setattr(nodes, "save_pdf_report", no_browser_pdf)
+
     def test_the_approval_payload_lives_in_the_task_not_in_state(
         self, tmp_path: Path
     ) -> None:

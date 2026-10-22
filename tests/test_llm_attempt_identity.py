@@ -29,6 +29,15 @@ from services.analysis_service import run_analysis
 from utils.idempotency import attempt_subject, llm_operation
 
 from tests.conftest import CALL_RECORDS
+from tests.support.scripted_runtime_tools import invoke_scripted_tool, no_browser_pdf
+
+
+@pytest.fixture(autouse=True)
+def _scripted_tools_for_identity_tests(monkeypatch):
+    import harness.tool_dispatcher as dispatcher
+    import nodes
+    monkeypatch.setattr(dispatcher, "invoke_tool", invoke_scripted_tool)
+    monkeypatch.setattr(nodes, "save_pdf_report", no_browser_pdf)
 
 PLANNER_PLAN = {
     "tasks": [
@@ -469,7 +478,7 @@ class TestRepairCrashRecoveryKeepsLedgerSemantics:
 
         driver = Path(__file__).resolve().parent.parent / "scripts" / "recovery_driver.py"
         completed = subprocess.run(
-            [_sys.executable, str(driver), *args],
+            [_sys.executable, str(driver), *args, "--scripted-tools"],
             capture_output=True,
             text=True,
             encoding="utf-8",

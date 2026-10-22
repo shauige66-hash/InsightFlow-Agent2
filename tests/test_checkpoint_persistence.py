@@ -88,6 +88,10 @@ def _factory(run_id: str) -> ModelFactory:
 def _isolate(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     clear_tool_cache()
+    # This suite validates actual SQLite checkpoints, independently of Docker.
+    import harness.tool_dispatcher as dispatcher
+    monkeypatch.setattr(dispatcher, "invoke_tool", lambda *_args, **_kwargs:
+        {"success": True, "result": 5, "error": None, "error_kind": None})
     yield tmp_path
     CALL_RECORDS.clear()
     clear_tool_cache()

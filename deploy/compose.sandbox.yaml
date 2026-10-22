@@ -1,0 +1,26 @@
+# Linux only: combine with compose.app.yaml, never use this file alone.
+# INSIGHTFLOW_WORKSPACE is the absolute host checkout path; mount it at exactly
+# the same path inside API/worker so Docker daemon bind sources are valid.
+services:
+  api:
+    working_dir: ${INSIGHTFLOW_WORKSPACE:?Set an absolute Linux checkout path}
+    group_add:
+      - ${DOCKER_GID:?Set the Docker socket group id}
+    volumes:
+      - type: bind
+        source: ${INSIGHTFLOW_WORKSPACE}
+        target: ${INSIGHTFLOW_WORKSPACE}
+      - type: bind
+        source: ${INSIGHTFLOW_DOCKER_SOCKET:-/var/run/docker.sock}
+        target: /var/run/docker.sock
+  worker:
+    working_dir: ${INSIGHTFLOW_WORKSPACE:?Set an absolute Linux checkout path}
+    group_add:
+      - ${DOCKER_GID:?Set the Docker socket group id}
+    volumes:
+      - type: bind
+        source: ${INSIGHTFLOW_WORKSPACE}
+        target: ${INSIGHTFLOW_WORKSPACE}
+      - type: bind
+        source: ${INSIGHTFLOW_DOCKER_SOCKET:-/var/run/docker.sock}
+        target: /var/run/docker.sock

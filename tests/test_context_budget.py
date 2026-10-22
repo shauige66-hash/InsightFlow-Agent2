@@ -575,7 +575,7 @@ class TestContextBudgetDoesNotBreakNormalAnalysis:
         assert context["truncated"] is False
 
     def test_large_result_enters_context_only_as_preview(
-        self, tmp_path: Path
+        self, tmp_path: Path, monkeypatch
     ) -> None:
         """8000 行结果不允许整份进 Prompt，只以有界预览出现。"""
         big = tmp_path / "big.csv"
@@ -583,6 +583,11 @@ class TestContextBudgetDoesNotBreakNormalAnalysis:
         for index in range(8000):
             lines.append(f"C{index:06d},East,{index * 1.5}")
         big.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        # Exercise real externalization/context budgeting with a deterministic
+        # tool response; container execution is covered by sandbox tests.
+        import harness.tool_dispatcher as dispatcher
+        monkeypatch.setattr(dispatcher, "invoke_tool", lambda *_args, **_kwargs:
+            {"success": True, "result": [{"customer_id": f"C{i:06d}", "region": "East", "amount": i * 1.5} for i in range(8000)], "error": None, "error_kind": None})
 
         REPLIES["planner"]["tasks"][0]["target_tables"] = ["big"]
         REPLIES["executor"] = {"code": "result = df.copy()"}

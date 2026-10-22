@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import logging
 import time
+from threading import RLock
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Sequence
@@ -31,6 +32,8 @@ from rag.versioning import (
     knowledge_namespace,
     knowledge_version,
     query_fingerprint,
+    source_identity,
+    KnowledgeSourceChanged,
 )
 from rag.vector_store import get_embedding_model
 
@@ -149,10 +152,13 @@ class KnowledgeRetriever:
                 version=version,
                 sources=sources,
                 query=query,
+                embedding=embedding,
                 top_k=top_k,
                 min_score=min_score,
             )
 
+        if knowledge_version(sources) != version:
+            raise KnowledgeSourceChanged("知识源在检索期间已变化，请新建Run并重新取证")
         payload = [item.to_dict() for item in evidence]
         self._cache.set_json(key, payload)
 
@@ -249,6 +255,7 @@ class KnowledgeRetriever:
         version: str,
         sources: list[str],
         query: str,
+        embedding: list[float],
         top_k: int,
         min_score: float,
     ) -> list[RetrievalEvidence]:
@@ -258,17 +265,15 @@ class KnowledgeRetriever:
         )
 
         cache_key = f"{namespace}:{version}"
-        mapping = _LOCAL_CHUNKS.get(cache_key)
         vector_store = get_cached_vector_store(cache_key)
 
-        if vector_store is None or mapping is None:
-            documents, mapping = _load_and_chunk(namespace=namespace, sources=sources)
+        if vector_store is None:
+            documents = _load_and_chunk(namespace=namespace, version=version, sources=sources)
             vector_store = create_and_cache_vector_store(
-                documents=documents, cache_key=cache_key
+                documents=documents, cache_key=cache_key, embeddings=self._embedding()
             )
-            _LOCAL_CHUNKS[cache_key] = mapping
 
-        results = vector_store.similarity_search_with_score(query=query, k=top_k)
+        results = vector_store.similarity_search_with_score_by_vector(embedding=embedding, k=top_k)
         best = max((float(score) for _, score in results), default=0.0)
         cutoff = max(min_score, best * MIN_RELATIVE_SCORE)
 
@@ -276,14 +281,10 @@ class KnowledgeRetriever:
         for document, score in results:
             if float(score) < cutoff:
                 continue
-            identity = _chunk_identity(document)
-            chunk = mapping.get(identity)
-            if chunk is None:
-                continue
             evidence.append(
                 RetrievalEvidence(
-                    chunk_id=chunk["chunk_id"],
-                    document_id=chunk["document_id"],
+                    chunk_id=document.metadata["chunk_id"],
+                    document_id=document.metadata["document_id"],
                     source=str(document.metadata.get("source") or ""),
                     page=document.metadata.get("page"),
                     content=document.page_content.strip(),
@@ -314,8 +315,8 @@ class KnowledgeRetriever:
 
         with factory() as session:
             index = PostgresKnowledgeIndex(session)
+            index.lock_namespace(namespace)
             indexed = self._index_into(index, namespace=namespace, version=version, sources=sources)
-            session.commit()
 
             hits = index.search(
                 namespaces=[namespace],
@@ -323,7 +324,9 @@ class KnowledgeRetriever:
                 top_k=top_k,
                 min_score=min_score,
                 embedding_model_version=EMBEDDING_MODEL_VERSION,
+                knowledge_version=version,
             )
+            session.commit()
 
         best = max((hit.score for hit in hits), default=0.0)
         cutoff = max(min_score, best * MIN_RELATIVE_SCORE)
@@ -354,8 +357,10 @@ class KnowledgeRetriever:
         factory = self._session_factory
         assert factory is not None
         with factory() as session:
+            index = PostgresKnowledgeIndex(session)
+            index.lock_namespace(namespace)
             indexed = self._index_into(
-                PostgresKnowledgeIndex(session),
+                index,
                 namespace=namespace,
                 version=version,
                 sources=sources,
@@ -378,18 +383,21 @@ class KnowledgeRetriever:
             path = Path(source)
             content_hash = file_content_hash(path)
             if index.has_document(
-                namespace=namespace, source=path.name, content_hash=content_hash
+                namespace=namespace, source=source_identity(path), content_hash=content_hash,
+                knowledge_version=version, embedding_model_version=EMBEDDING_MODEL_VERSION,
             ):
                 continue
 
             documents = load_knowledge_document(source)
             chunks = split_documents(documents)
+            if file_content_hash(path) != content_hash:
+                raise KnowledgeSourceChanged("知识源在加载期间已变化，请新建Run并重新取证")
             texts = [chunk.page_content for chunk in chunks]
             vectors = self._embedding().embed_documents(texts) if texts else []
             index.put_document(
                 namespace=namespace,
                 owner=self._owner,
-                source=path.name,
+                source=source_identity(path),
                 content_hash=content_hash,
                 knowledge_version=version,
                 embedding_model_version=EMBEDDING_MODEL_VERSION,
@@ -408,59 +416,49 @@ class KnowledgeRetriever:
         return indexed
 
 
-#: local 模式下 chunk 身份到稳定 id 的映射（按 namespace:version 隔离）
-_LOCAL_CHUNKS: dict[str, dict[tuple, dict[str, str]]] = {}
-
-
-def _chunk_identity(document: Document) -> tuple:
-    return (
-        document.metadata.get("source"),
-        document.metadata.get("page"),
-        document.page_content,
-    )
-
-
 def _load_and_chunk(
-    *, namespace: str, sources: list[str]
-) -> tuple[list[Document], dict[tuple, dict[str, str]]]:
+    *, namespace: str, version: str, sources: list[str]
+) -> list[Document]:
     """加载并切分，同时给每个片段分配与持久化后端一致的稳定 id。"""
     import hashlib
 
     documents: list[Document] = []
-    mapping: dict[tuple, dict[str, str]] = {}
 
     for source in sources:
         path = Path(source)
         content_hash = file_content_hash(path)
         document_id = hashlib.sha256(
-            f"{namespace}|{path.name}|{content_hash}".encode("utf-8")
+            f"{namespace}|{source_identity(path)}|{content_hash}".encode("utf-8")
         ).hexdigest()[:32]
         loaded = split_documents(load_knowledge_document(source))
+        if file_content_hash(path) != content_hash:
+            raise KnowledgeSourceChanged("知识源在加载期间已变化，请新建Run并重新取证")
         for position, chunk in enumerate(loaded):
             chunk_id = hashlib.sha256(
                 f"{document_id}|{position}".encode("utf-8")
             ).hexdigest()[:32]
-            mapping[_chunk_identity(chunk)] = {
-                "chunk_id": chunk_id,
-                "document_id": document_id,
-            }
+            chunk.metadata.update(chunk_id=chunk_id, document_id=document_id)
         documents.extend(loaded)
 
-    return documents, mapping
+    return documents
 
 
 _retriever: KnowledgeRetriever | None = None
+_RETRIEVER_LOCK = RLock()
 
 
 def get_retriever() -> KnowledgeRetriever:
-    """当前存储模式对应的检索器（进程内单例）。"""
+    """复用当前配置/owner实例，不改变其他请求正在使用的实例。"""
     global _retriever
-    if _retriever is not None:
-        return _retriever
-
     import storage
 
     config = storage.current_config()
+    owner = storage.current_owner()
+    # Each returned object captures one trusted owner; swapping the cached
+    # object never mutates an in-flight retriever used by another request.
+    with _RETRIEVER_LOCK:
+        if _retriever is not None and _retriever._owner == owner and getattr(_retriever, "_config", None) == config:
+            return _retriever
     cache = KnowledgeCache(
         config.redis_url if config.redis_enabled else None,
         enabled=config.redis_enabled,
@@ -471,20 +469,25 @@ def get_retriever() -> KnowledgeRetriever:
         session_factory = storage.get_session_factory(
             storage.database_url(), pool_size=config.pool_size
         )
-    _retriever = KnowledgeRetriever(
-        owner=config.owner,
+    retriever = KnowledgeRetriever(
+        owner=owner,
         cache=cache,
         persistent=config.is_postgres,
         session_factory=session_factory,
     )
-    return _retriever
+    retriever._config = config
+    with _RETRIEVER_LOCK:
+        _retriever = retriever
+    return retriever
 
 
 def reset_retriever() -> None:
-    """测试用：丢弃单例与进程内片段映射。"""
+    """测试用：丢弃检索器与包含片段元数据的有界向量缓存。"""
     global _retriever
     _retriever = None
-    _LOCAL_CHUNKS.clear()
+    from rag.vector_store import _VECTOR_STORE_CACHE, _CACHE_LOCK
+    with _CACHE_LOCK:
+        _VECTOR_STORE_CACHE.clear()
 
 
 __all__ = [

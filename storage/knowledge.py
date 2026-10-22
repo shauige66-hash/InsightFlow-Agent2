@@ -6,7 +6,7 @@
 身份与版本：
 
 - 文档身份 = `(namespace, source, content_hash)`，同一份内容重复索引是幂等的；
-- 同名文件内容变化 → 插入新文档、把旧的置为非活跃，旧向量自然退出检索；
+- 同一规范来源内容变化 → 插入新文档、把旧的置为非活跃，旧向量退出检索；
 - `namespace_version` 是所有活跃文档内容指纹的哈希，供缓存键与失效判断使用。
 
 每次查询都按 `namespace` 过滤：不同知识库之间不会互相命中。
@@ -17,8 +17,9 @@ from __future__ import annotations
 import hashlib
 from dataclasses import dataclass
 from typing import Any, Iterable, Sequence
+from pathlib import Path
 
-from sqlalchemy import delete, func, select, update
+from sqlalchemy import delete, func, select, update, text
 from sqlalchemy.orm import Session
 
 from storage.knowledge_models import EMBEDDING_DIM, KnowledgeChunk, KnowledgeDocument
@@ -60,6 +61,12 @@ class PostgresKnowledgeIndex:
     def __init__(self, session: Session) -> None:
         self._session = session
 
+    def lock_namespace(self, namespace: str) -> None:
+        """Keep index publication and its query in one serialized transaction."""
+        if self._session.get_bind().dialect.name == "postgresql":
+            key = int.from_bytes(hashlib.sha256(namespace.encode()).digest()[:8], "big", signed=True)
+            self._session.execute(text("SELECT pg_advisory_xact_lock(:key)"), {"key": key})
+
     # -- 写入 -------------------------------------------------------------
 
     def put_document(
@@ -75,10 +82,15 @@ class PostgresKnowledgeIndex:
         byte_size: int = 0,
     ) -> tuple[str, bool]:
         """写入一份文档；返回 `(document_id, 是否复用已有索引)`。"""
+        self.lock_namespace(namespace)
         doc_id = document_id_for(namespace, source, content_hash)
 
         existing = self._session.get(KnowledgeDocument, doc_id)
-        if existing is not None and existing.is_active:
+        if (existing is not None and existing.is_active
+                and existing.knowledge_version == knowledge_version
+                and self.has_document(namespace=namespace, source=source,
+                    content_hash=content_hash, knowledge_version=knowledge_version,
+                    embedding_model_version=embedding_model_version)):
             return doc_id, True
 
         chunks = list(chunks)
@@ -89,7 +101,7 @@ class PostgresKnowledgeIndex:
                     f"{EMBEDDING_DIM} 不一致；更换模型需要一次 schema 变更"
                 )
 
-        # 同名的旧版本退出检索（不物理删除，保留可追溯性）
+        # 同一规范来源的旧版本退出检索；不同目录同名文件互不影响。
         self._session.execute(
             update(KnowledgeDocument)
             .where(
@@ -132,12 +144,24 @@ class PostgresKnowledgeIndex:
         return doc_id, False
 
     def has_document(
-        self, *, namespace: str, source: str, content_hash: str
+        self, *, namespace: str, source: str, content_hash: str,
+        knowledge_version: str | None = None, embedding_model_version: str | None = None,
     ) -> bool:
         """同样的内容是否已经索引过（跳过加载与 embedding 的依据）。"""
         doc_id = document_id_for(namespace, source, content_hash)
         record = self._session.get(KnowledgeDocument, doc_id)
-        return record is not None and record.is_active and record.chunk_count > 0
+        if record is None or not record.is_active or record.chunk_count <= 0:
+            return False
+        if knowledge_version is not None and record.knowledge_version != knowledge_version:
+            return False
+        if embedding_model_version is not None:
+            count = self._session.scalar(select(func.count()).select_from(KnowledgeChunk).where(
+                KnowledgeChunk.document_id == doc_id,
+                KnowledgeChunk.embedding_model_version == embedding_model_version,
+            ))
+            if count != record.chunk_count:
+                return False
+        return True
 
     def deactivate_source(self, *, namespace: str, source: str) -> int:
         """删除某个来源：文档置为非活跃，片段随之不再被检索。"""
@@ -211,6 +235,7 @@ class PostgresKnowledgeIndex:
         top_k: int,
         min_score: float,
         embedding_model_version: str | None = None,
+        knowledge_version: str | None = None,
     ) -> list[ChunkHit]:
         """按余弦相似度检索，返回相似度（越大越相关）。
 
@@ -241,6 +266,8 @@ class PostgresKnowledgeIndex:
             statement = statement.where(
                 KnowledgeChunk.embedding_model_version == embedding_model_version
             )
+        if knowledge_version is not None:
+            statement = statement.where(KnowledgeDocument.knowledge_version == knowledge_version)
         statement = statement.order_by(distance).limit(max(1, top_k))
 
         hits: list[ChunkHit] = []
@@ -252,7 +279,7 @@ class PostgresKnowledgeIndex:
                 ChunkHit(
                     chunk_id=chunk.id,
                     document_id=chunk.document_id,
-                    source=source,
+                    source=Path(source).name,
                     page=chunk.page,
                     content=chunk.content,
                     score=score,

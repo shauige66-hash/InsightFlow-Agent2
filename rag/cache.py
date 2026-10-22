@@ -123,6 +123,7 @@ class KnowledgeCache:
             return None
         try:
             raw = client.get(key)
+            value = None if raw is None else json.loads(raw)
         except Exception:  # noqa: BLE001 - 缓存故障不该让检索失败
             self.stats.errors += 1
             logger.warning("redis get failed, falling back to index", exc_info=True)
@@ -131,7 +132,7 @@ class KnowledgeCache:
             self.stats.misses += 1
             return None
         self.stats.hits += 1
-        return json.loads(raw)
+        return value
 
     def set_json(self, key: str, value: Any) -> None:
         client = self._connection()
@@ -147,7 +148,11 @@ class KnowledgeCache:
         payload = self.get_json(key)
         if not isinstance(payload, list):
             return None
-        return [float(item) for item in payload]
+        try:
+            return [float(item) for item in payload]
+        except (ValueError, TypeError):
+            self.stats.errors += 1
+            return None
 
     def set_embedding(self, key: str, embedding: list[float]) -> None:
         self.set_json(key, embedding)

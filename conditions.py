@@ -10,6 +10,14 @@ MAX_RETRIES = 3
 MAX_REFINES = 3
 MAX_PLOT_RETRIES = 3
 
+
+def budget_stopped(state: InsightFlowState) -> bool:
+    return str(state.get("termination_reason") or "").startswith(("budget_exceeded:", "knowledge_changed:"))
+
+
+def route_after_budget_stop(state: InsightFlowState) -> str:
+    return "report_publish_gate" if state.get("require_report_approval") else "artifact"
+
 def route_after_planner(
     state: InsightFlowState
 ) -> Literal["router", "complete"]:
@@ -31,6 +39,8 @@ def route_to_approval(
     `require_plan_approval` 让 HITL 成为显式选择，未开启时保持原有
     全自动路径，避免所有调用方都被迫处理中断。
     """
+    if budget_stopped(state):
+        return "budget_stop"
     if not state.get("analysis_plan"):
         return "complete"
 
@@ -67,6 +77,8 @@ def route_to_report_approval(
     放在 report 之后、artifact 之前：此时报告**内容**已在 state 里，
     但文件尚未写出，因此中断与恢复都不会留下半成品产物。
     """
+    if budget_stopped(state):
+        return "budget_stop"
     if state.get("require_report_approval"):
         return "report_publish_gate"
 
@@ -102,7 +114,7 @@ def route_after_execution(
     # 环境类失败（沙箱不可用、超时、OOM）重发同样的代码不会好转：
     # 让模型去"修"一个根本没跑起来的沙箱只会浪费调用并掩盖真实原因。
     # 这类失败直接进入失败记录，不占用有界修复循环的额度。
-    if state.get("execution_error_kind") in ENVIRONMENT_ERROR_KINDS:
+    if state.get("execution_error_kind") in ENVIRONMENT_ERROR_KINDS or state.get("execution_error_kind") == "dependency_failed":
         return "failed"
 
     if retry_count < MAX_RETRIES:
@@ -178,6 +190,8 @@ def route_after_plot_execution(
     state: InsightFlowState
 ) -> Literal["plot_repair", "advance_chart"]:
 
+    if budget_stopped(state):
+        return "budget_stop"
     error = state.get("plot_error")
 
     retry_count = state.get(
@@ -199,6 +213,8 @@ def route_after_visualization_plan(
     state: InsightFlowState
 ) -> Literal["plot_generation", "report"]:
 
+    if budget_stopped(state):
+        return "budget_stop"
     visualization_plan = state.get(
         "visualization_plan",
         []
@@ -224,6 +240,10 @@ def route_after_tool_execution(
     有错就交给决策层（它需要看到错误分类才能判断能不能修）；没错仍要经过
     Critic，决策层观察到的是"执行结果 + 校验结论"两者，而不是只看执行成功。
     """
+    if budget_stopped(state):
+        return "budget_stop"
+    if state.get("execution_error_kind") == "dependency_failed":
+        return "failed"
     if state.get("enable_dynamic_loop"):
         return "critic" if state.get("execution_error") is None else "decide"
     return route_after_execution(state)
@@ -233,6 +253,8 @@ def route_after_critic_node(
     state: InsightFlowState
 ) -> Literal["decide", "advance", "refine", "failed"]:
     """校验完：开启动态循环时先观察再决定。"""
+    if budget_stopped(state):
+        return "budget_stop"
     if state.get("enable_dynamic_loop"):
         return "decide"
     return route_after_critic(state)
@@ -252,6 +274,8 @@ def route_after_decide(
 
     动作名到节点的映射由 `agent_loop.controller` 维护，这里不重复一份表。
     """
+    if budget_stopped(state):
+        return "budget_stop"
     from agent_loop import route_for
 
     return route_for(state.get("current_action"))  # type: ignore[return-value]
@@ -265,10 +289,15 @@ def route_after_runtime_replan(
     修订被校验拒绝时节点已经写入 `dynamic_finished`，这里直接收尾，
     不会带着一份非法计划继续跑。
     """
+    if budget_stopped(state):
+        return "budget_stop"
     if state.get("dynamic_finished"):
         return "complete"
 
     if state.get("replan_needs_approval"):
         return "approval_gate"
+
+    if int(state.get("current_task_index") or 0) >= len(state.get("analysis_plan") or []):
+        return "complete"
 
     return "router"

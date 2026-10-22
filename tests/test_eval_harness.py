@@ -287,6 +287,7 @@ class TestDataMaterialisation:
 @pytest.fixture(scope="module")
 def small_run(tmp_path_factory) -> EvalRun:
     """跑一个小规模真实评测（含 Docker 沙箱与 MCP 子进程）。"""
+    _require_sandbox()
     workdir = tmp_path_factory.mktemp("p5-eval")
     tasks = [
         task_by_id("csv_total_revenue"),
@@ -531,8 +532,16 @@ class TestReports:
 
 @pytest.fixture(scope="module")
 def fault_result(tmp_path_factory) -> dict:
+    _require_sandbox()
     workdir = tmp_path_factory.mktemp("p5-faults")
     return run_faults(workdir=workdir, mode="direct")
+
+
+def _require_sandbox():
+    from sandbox.executor import DockerSandboxExecutor
+    executor = DockerSandboxExecutor()
+    if not executor.available() or not executor.image_present():
+        pytest.skip("真实Python故障/业务评测需要可用Docker及已构建sandbox镜像")
 
 
 class TestFaultInjection:

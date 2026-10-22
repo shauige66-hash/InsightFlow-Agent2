@@ -45,6 +45,7 @@ _TERMINAL_KINDS = frozenset(
         "forbidden",
         "permission_denied",
         "budget_exceeded",
+        "dependency_failed",
     }
 )
 

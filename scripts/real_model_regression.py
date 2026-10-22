@@ -25,6 +25,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from core.llm import build_model_factory  # noqa: E402
 from services.analysis_service import run_analysis  # noqa: E402
 from utils.run_logger import create_run_id  # noqa: E402
+from eval.business_oracles import answer_fields, grade_business_answers  # noqa: E402
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 # 历史默认落在仓库内的 outputs/（已 gitignore）：
@@ -110,12 +111,13 @@ def run_case(name: str, spec: dict, output_root: Path) -> dict:
         "tool_calls": 0,
         "seconds": 0.0,
         "error": None,
+        "business_check": {"passed": False, "reason": "run has not produced answers"},
     }
 
     try:
         result = run_analysis(
             data_sources=list(spec["data_sources"]),
-            analysis_focus=spec["analysis_focus"],
+            analysis_focus=spec["analysis_focus"] + answer_fields(name),
             knowledge_sources=list(
                 spec.get("knowledge_sources") or ["knowledge/business_rules.md"]
             ),
@@ -143,6 +145,9 @@ def run_case(name: str, spec: dict, output_root: Path) -> dict:
             "seconds": round(time.time() - started, 1),
             "report_path": result.get("report_path"),
         }
+    )
+    record["business_check"] = grade_business_answers(
+        name, str(result.get("report_content") or ""), list(spec["data_sources"])
     )
     return record
 
@@ -183,6 +188,9 @@ def main() -> int:
         elif record["charts_planned"] and record["charts_produced"] < record["charts_planned"]:
             failures += 1
             lines.append(f"  ! 有 {record.get('charts_failed', 0)} 张图未生成")
+        if not record.get("business_check", {}).get("passed"):
+            failures += 1
+            lines.append("  ! 业务数字验收失败：" + record.get("business_check", {}).get("reason", "missing check"))
 
         history.append(record)
 

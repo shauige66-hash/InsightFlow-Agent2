@@ -84,6 +84,20 @@ def _with_state(func: Callable) -> Callable:
                 return func(state)
             except BudgetExceeded as exceeded:
                 return _budget_failure(state, func.__name__, exceeded)
+            except ValueError as error:
+                if getattr(error, "error_kind", None) != "knowledge_changed":
+                    raise
+                reason = str(error)
+                return {
+                    "analysis_status": "failed", "status_reason": reason,
+                    "termination_reason": f"knowledge_changed:{reason}",
+                    "current_action": "finish", "dynamic_finished": True,
+                    "current_code": None, "current_plot_code": None,
+                    "execution_error": reason, "execution_error_kind": "knowledge_changed",
+                    "validation_passed": False, "critic_feedback": reason,
+                    "plot_error": reason, "plot_retry_count": MAX_PLOT_RETRIES,
+                    **HARNESS.policy.settle(state),
+                }
 
     return wrapper
 
@@ -143,6 +157,17 @@ def _budget_failure(
         "analysis_status": "failed",
         "status_reason": reason,
         "failed_tasks": existing,
+        "termination_reason": f"budget_exceeded:{reason}",
+        "current_action": "finish",
+        "dynamic_finished": True,
+        "current_code": None,
+        "current_plot_code": None,
+        "execution_error": reason,
+        "execution_error_kind": BUDGET_ERROR_KIND,
+        "validation_passed": False,
+        "critic_feedback": reason,
+        "plot_error": reason,
+        "plot_retry_count": MAX_PLOT_RETRIES,
         # **必须把预算增量一起返回**。
         #
         # 真实请求的计数是就地写进当前节点那份 state 的（图会为每个节点复制
@@ -180,7 +205,6 @@ def _budget_failure(
         return {
             **common,
             "analysis_status": "partial",
-            "termination_reason": f"模型预算耗尽，动态决策停止：{reason}",
             "dynamic_finished": True,
         }
 
@@ -197,10 +221,41 @@ def _budget_failure(
     return common
 
 
+def budget_stop_node(state: InsightFlowState) -> dict:
+    """预算/数据前提停止后的确定性报告，无需模型，仍遵守发布审批。"""
+    import json
+    final = get_final_execution_results(state.get("execution_results") or [])
+    succeeded = [item for item in final if item.get("success")]
+    reason = state.get("status_reason") or state.get("termination_reason") or "执行预算已用尽"
+    lines = ["# 分析提前结束", "", str(reason), "", "以下仅列出已经执行成功的结果；未完成的分析不构成结论。", ""]
+    for item in build_report_execution_previews(succeeded, run_id=state.get("run_id"), output_root=current_runtime().output_root):
+        lines.extend([f"## 任务 {item['task_id']}", "", "```json", json.dumps(item.get("result"), ensure_ascii=False, indent=2), "```", ""])
+    failed = list(state.get("failed_tasks") or [])
+    known = {item.get("task_id") for item in failed}
+    success_ids = {item.get("task_id") for item in succeeded}
+    for task in state.get("analysis_plan") or []:
+        if task["task_id"] not in known and task["task_id"] not in success_ids:
+            failed.append({"task_id": task["task_id"], "stage": "skipped", "reason": str(reason), "error_kind": BUDGET_ERROR_KIND, "retry_count": 0, "refine_count": 0, "code": None})
+    return {"report_content": "\n".join(lines) + _failed_charts_appendix(state), "failed_tasks": failed, "analysis_status": "partial" if succeeded else "failed", "status_reason": str(reason)}
+
+
+def _assert_lease() -> None:
+    lease = getattr(current_runtime(), "assert_lease", None)
+    if lease is not None:
+        lease()
+
+
+def _task_subject(state: InsightFlowState, task_id: str, *counts: int) -> str:
+    revision = int(state.get("plan_revision") or 0)
+    base = task_id if not revision else f"{task_id}@revision_{revision}"
+    return attempt_subject(base, *counts)
+
+
 from utils.run_logger import log_event
 from time import perf_counter
 from rag.evidence import citations as evidence_citations
 from services.knowledge_service import (
+    ensure_knowledge_current,
     knowledge_contents,
     retrieve_global,
     task_knowledge_updates,
@@ -225,6 +280,7 @@ from planning import (
     plan_fingerprint,
     validate_plan,
     verify_approved_plan,
+    dependencies_satisfied,
 )
 from utils.agent_loop import BUDGET_ERROR_KIND, BUDGET_FIELD, BudgetExceeded
 
@@ -573,7 +629,7 @@ def decide_node(
             observation_fingerprint=observation.fingerprint(),
         )
         updates = decision_updates(state, observation, decision)
-        updates["completed_operations"] = {}
+        updates["completed_operations"] = completed_operations(state)
         _decide_log(
             state,
             observation=observation,
@@ -599,6 +655,8 @@ def decide_node(
         )
     except StructuredOutputError as error:
         proposed, _ops, _extra = _unparseable_decision(error)
+        _ops = completed_operations(state)
+        _extra = HARNESS.policy.settle(state)
 
     decision = validate_action(
         observation, proposed, state=state, limits=limits
@@ -653,16 +711,16 @@ def runtime_replan_node(
     )
 
     authorized, source_types = _authorized_sources(state)
+    # 合并后一起校验，既支持依赖已完成前缀，又执行整个 Run 的任务数上限。
     validation = validate_plan(
-        tasks, authorized_tables=authorized, source_types=source_types
+        completed + tasks if isinstance(tasks, list) else tasks,
+        authorized_tables=authorized, source_types=source_types
     )
 
     completed_ids = {str(task.get("task_id")) for task in completed}
     collisions: list[str] = []
-    if validation.ok:
-        collisions = sorted(
-            completed_ids & {str(task.get("task_id")) for task in validation.tasks}
-        )
+    if isinstance(tasks, list):
+        collisions = sorted(completed_ids & {str(task.get("task_id")) for task in tasks if isinstance(task, dict)})
 
     run_id = state.get("run_id")
     if not validation.ok or collisions:
@@ -713,7 +771,7 @@ def runtime_replan_node(
             **_extra,
         }
 
-    merged = completed + validation.tasks
+    merged = validation.tasks
     if run_id is not None:
         log_event(
             run_id=run_id,
@@ -737,8 +795,7 @@ def runtime_replan_node(
         "current_task_index": index,
         "plan_revision": int(state.get("plan_revision") or 0) + 1,
         "runtime_replans": replans_used + 1,
-        # 路由依据在节点里定下来：恢复时 `require_plan_approval` 会被
-        # 增量输入清空（那是为了避免重复中断），不能靠它决定是否要再审一次。
+        # 修订保留创建时的审批要求；每一版使用独立审批身份。
         "replan_needs_approval": bool(state.get("require_plan_approval")),
         # 拒绝修订时退回到"已批准且已完成"的前缀，不执行被拒的新任务
         "replan_base_plan": list(completed),
@@ -752,6 +809,11 @@ def runtime_replan_node(
         "validation_passed": False,
         "critic_feedback": None,
         "retrieval_focus": None,
+        "extra_retrievals": 0,
+        "task_knowledge": {key: value for key, value in (state.get("task_knowledge") or {}).items() if key in completed_ids},
+        "action_counts": {key: value for key, value in (state.get("action_counts") or {}).items() if key in completed_ids},
+        "execution_results": [item for item in state.get("execution_results") or [] if item.get("task_id") in completed_ids],
+        "failed_tasks": [item for item in state.get("failed_tasks") or [] if item.get("task_id") in completed_ids],
         "completed_operations": _ops,
         **_extra,
     }
@@ -772,6 +834,12 @@ def router_node(
     if task is None:
         # 计划为空或索引越界都走这里：明确失败，而不是 IndexError
         raise ValueError("路由阶段没有可执行任务：计划为空或索引越界")
+
+    final = get_final_execution_results(state.get("execution_results") or [])
+    failed_ids = {item.get("task_id") for item in state.get("failed_tasks") or []}
+    succeeded = {item["task_id"] for item in final if item.get("success") and item.get("task_id") not in failed_ids}
+    if not dependencies_satisfied(task, succeeded=succeeded):
+        return {"current_tool": None, "current_code": None, "execution_error": "上游依赖未成功完成，跳过当前任务", "execution_error_kind": "dependency_failed", "validation_passed": False, "critic_feedback": None}
 
     # 路由要按表的来源类型决定工具，因此资源名必须先过校验：
     # 不存在的表在这里被明确拒绝，而不是变成下游的 KeyError。
@@ -812,6 +880,9 @@ def execution_node(
 
     task = state["analysis_plan"][index]
 
+    if state.get("execution_error_kind") == "dependency_failed":
+        return {"current_code": None}
+
     data_context = HARNESS.task_context(state, task["target_tables"]).tables
 
     tool = state["current_tool"]
@@ -838,7 +909,7 @@ def execution_node(
         "executor",
         # 补充检索会让执行重新跑一次，但那不是"重放同一逻辑尝试"：
         # 把 extra_retrievals 编进身份，新证据才会换来新的代码生成。
-        attempt_subject(task["task_id"], int(state.get("extra_retrievals") or 0)),
+        _task_subject(state, task["task_id"], int(state.get("extra_retrievals") or 0)),
         lambda: generate_execution_code(
             task=task,
             data_context=data_context,
@@ -898,7 +969,7 @@ def tool_execution_node(
     # 下面把它转成与"工具返回失败"完全相同的形状，交给既有的
     # `route_after_execution` 走 failed 分支收敛。
     if tool is None or code is None or tool not in available_tools():
-        missing = (
+        missing = state.get("execution_error") if state.get("execution_error_kind") == "dependency_failed" else (
             "Current tool is missing."
             if tool is None
             else (
@@ -953,7 +1024,7 @@ def tool_execution_node(
             "execution_error": missing,
             # 归类为环境类：重发一次同样的"空代码"不会好转，
             # 因此不进入修复循环，直接收敛成失败。
-            "execution_error_kind": BUDGET_ERROR_KIND,
+            "execution_error_kind": state.get("execution_error_kind") or BUDGET_ERROR_KIND,
         }
 
     # 参数校验失败与执行失败都以错误字典返回，交给 route_after_execution
@@ -977,15 +1048,13 @@ def tool_execution_node(
             context={"task_id": task["task_id"]},
         )
     except BudgetExceeded as exceeded:
-        execution = {
-            "success": False,
-            "result": None,
-            "error": str(exceeded),
-            "error_kind": BUDGET_ERROR_KIND,
-        }
+        return _budget_failure(state, "tool_execution_node", exceeded)
     else:
         execution = outcome.execution
         budget_updates = outcome.budget_updates
+        budget_updates = HARNESS.note_round({**state, **budget_updates})
+        # 轮次记账会打开时钟；工具已结束，进入审批等待前必须再次结算。
+        budget_updates = HARNESS.policy.settle({**state, **budget_updates})
 
     run_id = state.get("run_id")
 
@@ -1118,7 +1187,7 @@ def repair_node(
 
     repaired_code, _ops, _extra = HARNESS.model_call(
         "repair",
-        attempt_subject(task["task_id"], repair_attempt),
+        _task_subject(state, task["task_id"], repair_attempt),
         lambda: repair_execution_code(
             task=task,
             data_context=data_context,
@@ -1157,7 +1226,6 @@ def repair_node(
         "retry_count": retry_count,
         "completed_operations": _ops,
         # 进入修复就是一次新的 Reason→Act→Observe→Decide 轮次。
-        **HARNESS.note_round(state),
         **_extra,
     }
 
@@ -1282,7 +1350,9 @@ def advance_task_node(
         "retry_count": 0,
         "refine_count": 0,
         "critic_feedback": None,
-        "validation_passed": False
+        "validation_passed": False,
+        "extra_retrievals": 0 if next_index < len(state["analysis_plan"]) else int(state.get("extra_retrievals") or 0),
+        "retrieval_focus": None,
     }
 
 
@@ -1307,7 +1377,8 @@ def critic_node(
         "critic",
         # 与执行使用同一口径：补充检索后的复核是一次新的逻辑尝试，
         # 否则记录会被当成上一次判定的重放，永远拿到同一个结论。
-        attempt_subject(
+        _task_subject(
+            state,
             task["task_id"],
             review_round,
             int(state.get("extra_retrievals") or 0),
@@ -1403,7 +1474,7 @@ def refine_node(
 
     refined_code, _ops, _extra = HARNESS.model_call(
         "refine",
-        attempt_subject(task["task_id"], refine_attempt),
+        _task_subject(state, task["task_id"], refine_attempt),
         lambda: refine_execution_code(
             task=task,
             data_context=data_context,
@@ -1443,7 +1514,6 @@ def refine_node(
         "refine_count": refine_count,
         "completed_operations": _ops,
         # 进入精修同样是一次新的循环轮次。
-        **HARNESS.note_round(state),
         **_extra,
     }
 
@@ -1572,6 +1642,8 @@ def _charts_appendix(state: InsightFlowState, report: str) -> str:
 def report_node(
     state: InsightFlowState
 ) -> dict:
+
+    ensure_knowledge_current(state)
 
     # 没有任何执行结果时不必调用模型。
     #
@@ -1741,20 +1813,39 @@ def _failed_charts_appendix(state: InsightFlowState) -> str:
     if not failed:
         return ""
 
-    lines = ["", "## 未能生成的图表", ""]
-    for item in failed:
-        reason = str(item.get("error") or "未知原因").strip().replace("\n", " ")
-        lines.append(
-            f"- `{item.get('chart_id')}`（来源任务 {item.get('source_task_id')}）：{reason[:200]}"
-        )
+    planning = [item for item in failed if item.get("stage") == "planning" or item.get("chart_id") == "visualization_plan"]
+    plotting = [item for item in failed if item not in planning]
+    lines = []
+    for title, items in (("图表规划降级说明", planning), ("未能生成的图表", plotting)):
+        if not items:
+            continue
+        lines.extend(["", "## " + title, ""])
+        if title == "图表规划降级说明":
+            history = []
+            for attempt in (state.get("visualization_planning") or {}).get("attempts", [])[:-1]:
+                for rejection in attempt.get("rejected", []):
+                    error = str(rejection.get("error") or "").strip().replace("\n", " ")[:200]
+                    if error and error not in history:
+                        history.append(error)
+            if history:
+                lines.extend(["前序校验记录：" + "；".join(history[:6]), ""])
+        for item in items:
+            reason = str(item.get("error") or "未知原因").strip().replace("\n", " ")
+            candidate = f"候选第 {item['candidate_index']} 项，" if item.get("candidate_index") else ""
+            lines.append(f"- `{item.get('chart_id')}`（{candidate}来源任务 {item.get('source_task_id')}）：{reason[:400]}")
     lines.append("")
-    lines.append("这些图表没有产出，不影响已生成的图表与结论。")
+    lines.append("以上记录区分规划被拒绝与实际绘图失败；仅已成功生成的图表用于本报告。")
     return "\n".join(lines)
 
 
 def artifact_node(
     state: InsightFlowState
 ) -> dict:
+
+    # Recheck after a publish approval wait. A deterministic early-stop report
+    # already explains the source change and only presents old successful data.
+    if not str(state.get("termination_reason") or "").startswith("knowledge_changed:"):
+        ensure_knowledge_current(state)
 
     # 报告内容可能是有意不产出（例如预算耗尽、没有任何执行结果）。
     # 这种情况不该崩在工作流里：直接跳过产物生成，让 Run 以 failed 收尾。
@@ -1767,6 +1858,7 @@ def artifact_node(
             "analysis_status": state.get("analysis_status") or "failed",
             "status_reason": state.get("status_reason")
             or "没有报告内容，未生成产物",
+            "run_status": "completed" if state.get("analysis_status") == "no_tasks" else "failed",
         }
 
     run_id = state.get(
@@ -1803,6 +1895,7 @@ def artifact_node(
         exist_ok=True
     )
 
+    _assert_lease()
     markdown_path = save_markdown_report(
         report_content,
         output_path=str(
@@ -1811,6 +1904,7 @@ def artifact_node(
         )
     )
 
+    _assert_lease()
     html_path = save_html_report(
         report_content,
         output_path=str(
@@ -1824,6 +1918,7 @@ def artifact_node(
     # 可交付的报告，缺一个 PDF 属于"降级",不是"失败"。
     pdf_path = None
     pdf_reason = None
+    _assert_lease()
     try:
         pdf_path = save_pdf_report(
             html_path,
@@ -1862,7 +1957,12 @@ def artifact_node(
     # 有计划但有任务失败则记为 partial。
     plan = state.get("analysis_plan", [])
 
-    if not plan:
+    if state.get("analysis_status") in ("failed", "partial"):
+        # 全部数据任务执行成功，仍可能因知识源变化/预算而提前停止。
+        # 显式停止结论不能仅因 failed_tasks 为空被重算为 completed。
+        analysis_status = state["analysis_status"]
+        status_reason = state.get("status_reason")
+    elif not plan:
         analysis_status = "no_tasks"
         status_reason = state.get("status_reason") or "Planner 未产出任何分析任务"
     elif state.get("failed_tasks"):
@@ -1890,6 +1990,7 @@ def artifact_node(
         + [path for path in (markdown_path, html_path, pdf_path) if path]
     )
 
+    _assert_lease()
     # 生命周期与产物登记一起写入同一个 state 增量，保证"完成"与"已登记"一致
     run_status = "completed" if analysis_status in ("completed", "partial") else "failed"
 
@@ -2061,7 +2162,7 @@ def _apply_decision(
     # 拒绝时的措辞按关口区分：计划被拒与报告被拒是两件事，
     # 用同一句"分析计划未获批准"来描述报告被拒会误导排查。
     if approved:
-        reason = None
+        reason = state.get("status_reason") if field == "report_approval" else None
     elif field == "report_approval":
         reason = "分析报告未获批准发布"
     else:
@@ -2071,8 +2172,8 @@ def _apply_decision(
         field: record_entry,
         "approvals": approvals,
         "pending_approval": None,
-        "run_status": "completed" if approved else "failed",
-        "analysis_status": None if approved else "failed",
+        "run_status": "running" if approved else "failed",
+        "analysis_status": (state.get("analysis_status") if field == "report_approval" else None) if approved else "failed",
         "status_reason": reason,
     }
 
@@ -2177,19 +2278,73 @@ def visualization_planner_node(
         )
     )
 
-    visualization_plan, _ops, _extra = HARNESS.model_call(
-        "visualizer",
-        "plan",
-        lambda: create_visualization_plan(
-            analysis_plan=state["analysis_plan"],
-            execution_results=final_execution_results,
-            failed_tasks=state.get(
-                "failed_tasks",
-                []
-            ),
-            llm=model_for("visualizer"),
-        ),
-    )
+    from planning.visualization import partition_visualization_plan
+    from utils.llm_retry import StructuredOutputError
+    operations = dict(state.get("completed_operations") or {})
+    feedback = []
+    failed_charts = [item for item in (state.get("failed_charts") or [])
+        if item.get("stage") != "planning" and item.get("chart_id") != "visualization_plan"]
+    _extra = {}
+    stop_updates = {}
+    visualization_plan = []
+    failed_ids = {item.get("task_id") for item in state.get("failed_tasks") or []}
+    successful_ids = {item["task_id"] for item in final_execution_results if item.get("success") and item["task_id"] not in failed_ids}
+    eligible_plan = [item for item in state["analysis_plan"] if item["task_id"] in successful_ids]
+    eligible_ids = {item["task_id"] for item in eligible_plan}
+    eligible_results = [item for item in final_execution_results if item["task_id"] in eligible_ids]
+    diagnostics = {"status": "skipped", "reason": "no_successful_sources", "attempt_count": 0,
+        "accepted_count": 0, "eligible_task_ids": [item["task_id"] for item in eligible_plan], "attempts": []}
+    final_rejections = []
+    if eligible_results:
+        for attempt in range(3):
+            try:
+                proposed, _ops, _extra = HARNESS.model_call(
+                    "visualizer", "plan" if attempt == 0 else attempt_subject("plan", attempt),
+                    lambda: create_visualization_plan(
+                        analysis_plan=eligible_plan, execution_results=eligible_results,
+                        failed_tasks=list(state.get("failed_tasks") or []), validation_feedback=feedback,
+                        llm=model_for("visualizer"),
+                    ), attempt=attempt + 1,
+                )
+            except StructuredOutputError as error:
+                final_rejections = [{"chart_id": "visualization_plan", "source_task_id": None, "error": str(error), "stage": "planning"}]
+                diagnostics["attempts"].append({"attempt": attempt + 1, "proposed_count": None, "accepted_count": 0, "rejected": final_rejections})
+                diagnostics.update(status="degraded", reason="structured_output_error")
+                _extra = HARNESS.policy.settle(state)
+                break
+            except BudgetExceeded as error:
+                final_rejections = [{"chart_id": "visualization_plan", "source_task_id": None, "error": str(error), "stage": "planning"}]
+                diagnostics["attempts"].append({"attempt": attempt + 1, "proposed_count": None, "accepted_count": 0, "rejected": final_rejections})
+                diagnostics.update(status="failed", reason="budget_exceeded")
+                stop_updates = _budget_failure(state, "visualization_planner_node", error)
+                break
+            operations.update(_ops)
+            state["completed_operations"] = operations
+            visualization_plan, rejected = partition_visualization_plan(proposed, analysis_plan=state["analysis_plan"], execution_results=final_execution_results, failed_tasks=state.get("failed_tasks") or [])
+            diagnostics["attempts"].append({"attempt": attempt + 1,
+                "proposed_count": len(proposed) if isinstance(proposed, list) else None,
+                "accepted_count": len(visualization_plan), "rejected": rejected})
+            if visualization_plan:
+                final_rejections = rejected
+                diagnostics.update(status="degraded" if rejected else "planned", reason="partial_plan" if rejected else "valid_plan")
+                break
+            if rejected:
+                feedback = rejected
+                if attempt == 2:
+                    final_rejections = rejected
+                    diagnostics.update(status="degraded", reason="invalid_plan")
+                continue
+            if feedback:
+                final_rejections = [{"chart_id": "visualization_plan", "source_task_id": None, "stage": "planning",
+                    "error": "前序图表计划被拒绝后，模型返回空计划；本次未生成图表。前序原因：" + "；".join(item["error"] for item in feedback)}]
+                diagnostics.update(status="degraded", reason="empty_after_rejections")
+            else:
+                diagnostics.update(status="skipped", reason="model_selected_no_charts")
+            break
+    failed_charts.extend(final_rejections)
+    diagnostics["attempt_count"] = len(diagnostics["attempts"])
+    diagnostics["accepted_count"] = len(visualization_plan)
+    _ops = operations
 
     run_id = state.get("run_id")
 
@@ -2198,11 +2353,12 @@ def visualization_planner_node(
             run_id=run_id,
             node="visualization_planner",
             event="visualization_plan_created",
-            status="success",
+            status="success" if diagnostics["status"] == "planned" else diagnostics["status"],
             details={
                 "chart_count": len(
                     visualization_plan
                 ),
+                "planning": diagnostics,
                 "charts": [
                     {
                         "chart_id": item["chart_id"],
@@ -2219,10 +2375,13 @@ def visualization_planner_node(
         )
 
     return {
+        **_extra,
+        **stop_updates,
         "visualization_plan": visualization_plan,
         "current_chart_index": 0,
         "completed_operations": _ops,
-        **_extra,
+        "failed_charts": failed_charts,
+        "visualization_planning": diagnostics,
     }
 
 
@@ -2369,7 +2528,7 @@ def plot_execution_node(
         "visualization_plan"
     ][index]
 
-    code = state["current_plot_code"]
+    code = state.get("current_plot_code")
 
     if code is None:
         # 绘图计划产出为空（例如预算拦下了代码生成）。
@@ -2444,8 +2603,12 @@ def plot_execution_node(
     #   2) 写入时按 chart_id 去重，使重放得到与首次一致的列表。
     # 修复循环里的多次尝试保留最后一条（last-wins），不产生重复的图表记录。
     run_id = state.get("run_id") or "unknown"
-    op_id = chart_operation(run_id, chart_id)
+    op_id = chart_operation(run_id, chart_id, int(state.get("plot_retry_count") or 0))
     done = replay_guard(state, op_id, what=f"图表 {chart_id} 的生成")
+    if done is None:
+        legacy = replay_guard(state, chart_operation(run_id, chart_id), what=f"图表 {chart_id} 的旧登记")
+        if legacy and any(item.get("chart_id") == chart_id and item.get("success") for item in (legacy.detail or {}).get("visualization_results") or []):
+            done = legacy
 
     if done is not None and done.detail:
         return {
@@ -2494,35 +2657,12 @@ def plot_execution_node(
             context={"chart_id": chart_id},
         )
     except BudgetExceeded as exceeded:
-        # 预算耗尽属于环境类失败：重画同一张图不会好转，因此**不允许**
-        # 进入 plot_repair 循环（那会为了重试而再次尝试启动容器）。
-        #
-        # 用既有的 plot_retry_count 表达"不再重试"，而不是新增 state 字段：
-        # 未在 InsightFlowState 里声明的键会被 LangGraph 静默丢掉，
-        # 那样路由读不到标志，还是会把流程送进 plot_repair。
-        previous_results = [
-            result
-            for result in state.get("visualization_results", [])
-            if result.get("chart_id") != chart_id
-        ]
-        return {
-            "visualization_results": previous_results
-            + [
-                {
-                    "chart_id": chart_id,
-                    "code": code,
-                    "success": False,
-                    "path": None,
-                    "error": str(exceeded),
-                }
-            ],
-            "plot_error": str(exceeded),
-            # 置满重试计数 → route_after_plot_execution 直接走 advance_chart
-            "plot_retry_count": MAX_PLOT_RETRIES,
-        }
+        return _budget_failure(state, "plot_execution_node", exceeded)
     else:
         execution = outcome.execution
         budget_updates = outcome.budget_updates
+        budget_updates = HARNESS.note_round({**state, **budget_updates})
+        budget_updates = HARNESS.policy.settle({**state, **budget_updates})
 
     visualization_result = {
         "chart_id": chart_id,
@@ -2596,6 +2736,13 @@ def plot_execution_node(
             "plot_error": execution["error"],
         },
     )
+    if execution["success"]:
+        # 图级成功别名兼容已有读取方；失败仅登记到具体尝试，不阻止下一轮修复。
+        updates["completed_operations"] = record(
+            {**state, "completed_operations": updates["completed_operations"]},
+            chart_operation(run_id, chart_id),
+            detail={"visualization_results": updates["visualization_results"], "plot_error": None},
+        )
 
     # 把治理层产生的预算增量（工具调用计数 + 执行时钟结算）并入返回值，
     # 否则绘图消耗不会落盘，恢复后预算就归零了。
@@ -2817,6 +2964,5 @@ def plot_repair_node(
         "plot_retry_count": plot_retry_count,
         "completed_operations": _ops,
         # 绘图修复是一个独立的有界循环，也计入总轮次。
-        **HARNESS.note_round(state),
         **_extra,
     }

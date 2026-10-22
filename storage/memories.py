@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import re
+import hashlib
 import uuid
 from datetime import datetime, timezone
 from typing import Any, Iterable
@@ -33,7 +34,7 @@ _CJK = re.compile(r"[\u4e00-\u9fff]+")
 
 
 def _tokens(text: str) -> set[str]:
-    """粗粒度词元：英文按词，中文按单字与相邻二元组。
+    """粗粒度词元：英文按词，中文保留原段与相邻二元组。
 
     中文没有空格，整段汉字会被当成一个词元，导致"销售额用什么货币"与
     "今后销售额统一用人民币元表示"零重合。用二元组才能让同一话题的表述
@@ -74,6 +75,14 @@ class MemoryRepository:
         """写入或更新一条记忆（按 owner+scope+kind+key 幂等）。"""
         existing = self._find(scope=scope, kind=kind, key=key)
         payload = dict(provenance or {})
+
+        # A proposal is a pending revision, never an implicit revocation of a
+        # confirmed setting. Repeated identical proposals remain idempotent.
+        if existing is not None and existing.status == CONFIRMED and status == CANDIDATE:
+            digest = hashlib.sha256(value.encode("utf-8")).hexdigest()[:24]
+            payload["replaces_memory_id"] = existing.id
+            key = f"pending:{key[:80]}:{digest}"
+            existing = self._find(scope=scope, kind=kind, key=key)
 
         if existing is not None:
             existing.value = value
@@ -134,6 +143,17 @@ class MemoryRepository:
         record = self.get(memory_id)
         if record is None:
             return None
+        replacement = (record.provenance or {}).get("replaces_memory_id")
+        if replacement:
+            target = self.get(str(replacement))
+            if target is not None and target.scope == record.scope and target.kind == record.kind:
+                target.value = record.value
+                target.provenance = {**(record.provenance or {}), "confirmed_revision_id": record.id}
+                target.status = CONFIRMED
+                target.updated_at = _now()
+                record.deleted_at = _now()
+                record.status = CANDIDATE
+                return target
         record.status = CONFIRMED
         record.updated_at = _now()
         return record
@@ -154,6 +174,8 @@ class MemoryRepository:
         if scope is not None:
             record.scope = scope
         if status is not None:
+            if status not in (CANDIDATE, CONFIRMED):
+                raise ValueError("未知的记忆状态")
             record.status = status
         record.updated_at = _now()
         return record
@@ -189,7 +211,9 @@ class MemoryRepository:
         scored: list[tuple[LongTermMemory, int]] = []
         for record in self._session.scalars(candidates):
             overlap = len(wanted & _tokens(f"{record.key} {record.value}"))
-            if overlap >= min_overlap:
+            # Format preferences apply to their consumer even when the user
+            # simply says "analyse sales" without repeating "report format".
+            if overlap >= min_overlap or record.kind == "report_format":
                 scored.append((record, overlap))
 
         # 先按重合度、再按新旧排序：同等相关时新的偏好覆盖旧偏好

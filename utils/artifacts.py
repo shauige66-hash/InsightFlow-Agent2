@@ -1,6 +1,9 @@
 # 负责把分析过程中生成的报告等产物保存到本地文件。
 
 from pathlib import Path
+from utils.html_safety import REPORT_CSP, sanitize_report_html
+from core.publication import atomic_write, publish_file
+import uuid
 
 
 def save_markdown_report(
@@ -15,10 +18,7 @@ def save_markdown_report(
         exist_ok=True
     )
 
-    path.write_text(
-        content,
-        encoding="utf-8"
-    )
+    atomic_write(path, content.encode("utf-8"))
 
     return str(path)
 
@@ -44,11 +44,6 @@ def save_html_report(
             "fenced_code"
         ]
     )
-
-    # 正文来自模型，模型读过用户上传的文档——必须当不可信内容处理：
-    # 不过白名单就直接拼进 HTML，等于交付一个能读到控制台 token 的存储型 XSS。
-    from utils.html_safety import REPORT_CSP, sanitize_report_html
-
     body = sanitize_report_html(body)
 
     html = f"""
@@ -57,10 +52,9 @@ def save_html_report(
 
 <head>
     <meta charset="UTF-8">
-
     <meta http-equiv="Content-Security-Policy" content="{REPORT_CSP}">
-    <meta name="referrer" content="no-referrer">
 
+    <meta name="referrer" content="no-referrer">
     <title>InsightFlow Analysis Report</title>
 
     <style>
@@ -114,10 +108,7 @@ def save_html_report(
 </html>
 """
 
-    path.write_text(
-        html,
-        encoding="utf-8"
-    )
+    atomic_write(path, html.encode("utf-8"))
 
     return str(path)
 
@@ -192,44 +183,49 @@ def save_pdf_report(
         parents=True,
         exist_ok=True
     )
+    staged_pdf = pdf_path.with_name('.' + pdf_path.name + '.' + uuid.uuid4().hex + '.tmp')
 
-    with sync_playwright() as playwright:
+    try:
+        with sync_playwright() as playwright:
 
-        browser = launch_pdf_browser(
-            playwright
-        )
+            browser = launch_pdf_browser(
+                playwright
+            )
 
-        page = browser.new_page(java_script_enabled=False)
+            # Re-sanitize even pre-existing reports, inline only validated PNGs from
+            # this report's directory, and deny every browser resource request.
+            body = sanitize_report_html(
+                source_path.read_text(encoding="utf-8"), image_root=source_path.parent
+            )
+            page = browser.new_page(java_script_enabled=False, service_workers="block")
+            page.route("**/*", lambda route: route.abort())
+            page.set_content(
+                '<!doctype html><html><meta charset="UTF-8">'
+                '<style>body{font-family:Arial,sans-serif;line-height:1.7}'
+                'table{border-collapse:collapse;width:100%}td,th{border:1px solid #ddd;padding:6px}'
+                'img{max-width:100%}pre{white-space:pre-wrap;overflow-wrap:anywhere}</style>'
+                '<body>' + body + '</body></html>',
+                wait_until="load",
+            )
 
-        # 报告里可能引用了远程图片或链接：导出 PDF 时不让它们真的发出去。
-        # 只放行本地文件与内联数据，其余一律 abort——PDF 不该成为外发通道。
-        def _local_only(route) -> None:
-            url = route.request.url
-            if url.startswith("file://") or url.startswith("data:") or url.startswith("about:"):
-                route.continue_()
-            else:
-                route.abort()
+            page.pdf(
+                path=str(staged_pdf.resolve()),
+                format="A4",
+                print_background=True,
+                margin={
+                    "top": "15mm",
+                    "right": "15mm",
+                    "bottom": "15mm",
+                    "left": "15mm",
+                }
+            )
 
-        page.route("**/*", _local_only)
+            browser.close()
 
-        page.goto(
-            source_path.as_uri(),
-            wait_until="load"
-        )
+        publish_file(staged_pdf, pdf_path)
 
-        page.pdf(
-            path=str(pdf_path.resolve()),
-            format="A4",
-            print_background=True,
-            margin={
-                "top": "15mm",
-                "right": "15mm",
-                "bottom": "15mm",
-                "left": "15mm",
-            }
-        )
-
-        browser.close()
+    finally:
+        staged_pdf.unlink(missing_ok=True)
 
     return str(pdf_path)
 

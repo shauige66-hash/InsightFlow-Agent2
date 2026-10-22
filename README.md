@@ -420,7 +420,7 @@ insightflow-agent2/
 返回的路径可以直接作为 `data_sources`。限制写在端点里：
 
 - 类型白名单：`.csv`、`.xlsx`、`.sqlite`、`.db`、`.sqlite3`；知识文件 `.md`、`.txt`、`.pdf`
-- 单文件 20 MB；超限返回 413，且不会留下半个文件
+- 新旧上传入口统一单文件 20 MB、请求体 40 MB、最多20个文件；超限返回 413，清理本次半成品
 - 文件名只取 basename（`../../api.py` 会被削成 `api.py`），目录由服务端决定
 
 `uploads/` 在 `.gitignore` 里——上传的是用户数据，不进版本库。
@@ -436,17 +436,20 @@ INSIGHTFLOW_API_KEYS=key-for-alice:alice,key-for-bob:bob
 
 开启后：
 
-- 除健康检查、控制台页面、报告与图表读取外，所有接口都要带 `Authorization: Bearer <token>`
+- 除健康检查、文档和控制台静态页面外，接口都需要 `Authorization: Bearer <token>`；报告/图表也校验归属
 - **归属者由 token 推导**，请求体里没有 owner 字段可以自报
-- 会话、记忆、知识都按归属者隔离：A 看不见 B 的会话（返回 404，而不是"无权访问"，
+- Run、Turn、会话、记忆、知识都按归属者隔离：A 看不见 B 的记录（返回 404，而不是"无权访问"，
   避免泄露"这个 id 存在"）
 - 控制台右上角填入 token 即可用，存在浏览器 localStorage 里
 
 格式写错（比如漏了 `:owner`）会**启动失败**，而不是静默放行——"看起来有鉴权、实际谁都能进"
 比不配更危险。
 
-报告与图表路由保持公开：浏览器点链接时不会带 Authorization 头，而 run_id 是随机生成的，
-读不到别人的 id 就取不到内容。
+报告和图表不再以随机 run_id 代替授权。浏览器通过已鉴权的 `GET /runs/{id}/artifact-link?kind=html|pdf` 取得5分钟有效、绑定该Run与owner的签名地址；首次访问设置仅该Run路径可用的 HttpOnly cookie，使正文图片正常加载。签名链接在有效期内可转交阅读，请勿放进公共日志。可设 `INSIGHTFLOW_ARTIFACT_SIGNING_KEY` 独立签名密钥；留空时从 API key 配置派生，改密钥会使旧链接失效。
+
+开启鉴权时，数据/知识路径只能指向当前 owner 的上传目录或随项目提供的 `data/`、`knowledge/` 示例；接口不接受任意宿主文件。未配置key的可信本机模式继续支持本机路径。上传目录按owner散列分区；旧无owner Run迁移为local-demo，不会猜测分配给任意用户。
+
+显式重复提交同一run_id只在同owner、同完整请求时复用记录，不清审批历史；不同请求返回409。后台线程和队列保存owner，执行使用原子租约/续期，失效执行者不得提交受保护结果；已在途模型请求仍可能完成，不能声称模型恰好一次。
 
 ## 部署（Docker Compose）
 
@@ -469,9 +472,8 @@ HTTPS，不要把 8000 直接暴露到公网。
 
 **两个已知限制**（写在编排注释里，不藏着）：
 
-1. 分析代码在 Docker 沙箱里执行，容器内的 API 需要访问宿主 Docker 才能 `docker run`。
-   Linux 下把 `api.volumes` 里那行 `/var/run/docker.sock` 取消注释即可；Docker Desktop
-   （Windows/macOS）无法把 socket 传进容器，建议本机直接跑 API。
+1. 默认全容器编排可执行SQL；Python/Plot需要受信Linux runner的完整CLI、socket权限、同路径bind与沙箱镜像。按 [部署合同](deploy/README.md) 使用专用 `compose.sandbox.yaml` 覆盖文件；默认编排不要求这些变量。Windows/macOS建议宿主API+依赖容器。
+   queue模式必须显式 `--profile queue`；只设 `INSIGHTFLOW_EXECUTION=queue` 不会启动worker。会话、新Run、恢复都使用统一dispatch。
 2. 镜像**不装浏览器**。PDF 导出需要 Chrome/Edge/Chromium，容器里通常没有——
    这时报告仍会产出 Markdown 与 HTML，只是没有 PDF，日志里记为 `degraded`。
    要 PDF 就把 Chromium 装进镜像（`playwright install --with-deps chromium`），
@@ -650,8 +652,7 @@ http://127.0.0.1:8000/docs
   请求**无法**指定 MCP Server 启动命令、私有目录、环境变量或宿主路径；
   mcp 模式不可用时明确失败，不会静默回退 direct。
 - 上传文件和生成的分析产物目前保存在本地文件系统。
-- 当前 API 暂未实现用户认证、权限控制和多用户隔离，
-  因此只能作为**本地演示/开发服务**使用，不得直接公网部署。
+- API支持可选Bearer→owner映射、资源归属和签名产物读取，但没有注册/账号找回、按用户配额或限流。默认无key仅用于可信本机；对外还需HTTPS代理与访问控制。
 - RAG 检索阈值目前基于实验结果设定，还没有经过大规模 Benchmark 验证。
 
 ## 后续计划
@@ -661,12 +662,12 @@ http://127.0.0.1:8000/docs
 - 把 SQL 执行迁入受限容器或独立进程
 - 持久化向量数据库
 - LangSmith 工作流追踪与可观测性
-- API 鉴权、限流与多用户隔离
+- 完整账户生命周期、限流与按用户配额
 - RAG 与 Agent 分析质量 Benchmark
 - 异步分析任务和后台执行
 - 实时工作流进度推送
 - 基于 DuckDB 的跨数据源分析
-- 用户认证与多租户隔离
+- 企业身份接入与租户管理
 - 持久化 Artifact 与企业知识存储
 - 可配置的 RAG 检索策略与 Reranking
 
@@ -772,7 +773,7 @@ chart_*.png
 uvicorn api:app --reload
 ```
 
-> 该服务**没有鉴权**，只能本机使用，不得直接公网部署。
+> 默认未配置API key时不要求凭据，仅用于可信本机。对外使用须配置Bearer owner映射、HTTPS代理和访问控制。
 
 #### 本地演示（推荐，隔离且不需要模型服务）
 
@@ -1452,8 +1453,12 @@ The current version of InsightFlow is designed as a local development and demons
 
 Current limitations include:
 
-- Vector stores and caches are maintained in process memory and are not persisted across service restarts.
-- Analysis requests are executed synchronously, so long-running workflows block the request until completion.
+- Knowledge indexes are persisted through the configured local/PostgreSQL storage;
+  process LRU and optional Redis caches are disposable. Version/configuration changes
+  rebuild the index. Index retention and cleanup still need operational policy.
+- `/runs` and conversation requests dispatch background work and return promptly.
+  Local mode uses a bounded thread executor; PostgreSQL queue mode supports separate
+  workers. Durable automatic outbox delivery and abandoned-job recovery remain incomplete.
 - Python and plotting code now run in one-shot Docker containers (read-only root, no network,
   resource and concurrency limits), but containers share the host kernel, so this is
   **not an absolute security guarantee** and is bounded by the local Docker Desktop.
@@ -1469,8 +1474,9 @@ Current limitations include:
   environment, or host paths, and an unavailable MCP backend fails loudly instead of
   silently falling back to direct.
 - Uploaded files and generated artifacts are stored on the local filesystem.
-- The current API does not include authentication, authorization, or multi-user isolation,
-  so it is intended for **local demo/development use only** and must not be exposed publicly.
+- API keys enable owner-scoped Run, Turn, resource and artifact access. Without keys,
+  trusted local mode retains local file paths. There is no SSO, per-user quota or
+  production concurrency acceptance from this offline repair task.
 - Retrieval thresholds are currently based on empirical testing rather than a large-scale retrieval benchmark.
 - Agent execution is bounded by a per-run budget (rounds, tool calls, model requests
   and execution time) held in workflow state. The budget survives a checkpoint resume
@@ -1483,7 +1489,7 @@ Current limitations include:
   a human approval is not charged, and the accumulated figure is carried across a
   resume. `max_llm_calls` counts **upstream model requests**, so retries caused by
   unparsable structured output consume it too; a request is only counted once the
-  budget check ahead of it has passed and the ledger has recorded its `started` entry.
+  budget check ahead of it has passed and the ledger has durably reserved that request.
 - Context passed to each model call is bounded by a **per-node character budget**.
   Fields that carry failure feedback or task constraints (error text, task definitions,
   schema, approvals) are never truncated, which means a payload consisting only of such
@@ -1499,14 +1505,14 @@ Current limitations include:
 Planned improvements include:
 
 - moving SQL execution into a restricted container or a separate process
-- persistent vector database support
+- index retention and operational migration tooling
 - LangSmith tracing and workflow observability
-- API authentication, rate limiting and multi-user isolation
+- SSO, rate limiting and per-user quotas
 - a real-model evaluation run over the existing harness, once API access and a budget
   are authorised (the harness, scoring and fault injection already exist)
 - expanding the task set beyond its current 42 tasks (no time-series, three-table joins,
   or unstructured-text inputs yet)
-- asynchronous analysis jobs and background execution
+- transactional outbox delivery and controlled abandoned-job recovery
 - real-time workflow progress streaming
 - cross-source analytical querying with DuckDB
 - persistent artifact and knowledge storage

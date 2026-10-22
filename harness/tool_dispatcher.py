@@ -18,6 +18,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from core.inference import resolve_tables
+from core.runtime import RuntimeContextMissing, current_runtime
 from tools.tool_registry import invoke_tool
 from utils.agent_loop import BUDGET_ERROR_KIND, BudgetExceeded
 from utils.middleware import governed_tool_call
@@ -56,6 +57,12 @@ class ToolDispatcher:
         不在派发层决定。
         """
         try:
+            try:
+                lease = getattr(current_runtime(), "assert_lease", None)
+            except RuntimeContextMissing:
+                lease = None
+            if lease is not None:
+                lease()
             with governed_tool_call(state, node=node, tool=tool) as gate:
                 execution = invoke_tool(
                     tool,
@@ -67,6 +74,8 @@ class ToolDispatcher:
                     ),
                 )
                 gate["error_kind"] = execution.get("error_kind")
+                if lease is not None:
+                    lease()
             # 时间结算发生在 governed_tool_call 的 finally 里，
             # 因此必须在 with 退出之后再读，块内取到的是结算前的值。
             budget_updates = gate.get("budget_updates") or {}

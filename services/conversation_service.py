@@ -141,9 +141,11 @@ class ConversationService:
         dynamic_limits: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """提交一条用户消息：创建 Turn + Run 并异步启动。"""
+        deduplicated = False
+        dispatch_payload = None
         with storage.session_scope(storage.database_url()) as session:
             repository = self._sessions(session)
-            record = repository.get_session(session_id)
+            record = repository.lock_session(session_id)
             if record is None:
                 raise KeyError(f"会话不存在：{session_id}")
 
@@ -152,72 +154,98 @@ class ConversationService:
                     session_id, client_message_id
                 )
                 if existing is not None and existing.turn_id:
+                    if existing.content != content:
+                        raise ValueError("同一client_message_id不能用于不同消息内容")
                     turn = repository.get_turn(existing.turn_id)
-                    return {
-                        "turn": _turn_dict(turn) if turn else None,
-                        "run_id": existing.run_id,
-                        "deduplicated": True,
+                    if turn is None:
+                        raise KeyError("轮次不存在")
+                    saved_payload = dict((turn.result or {}).get("_dispatch_payload") or {})
+                    expected = {
+                        "analysis_focus": analysis_focus or content,
+                        "require_plan_approval": require_plan_approval,
+                        "require_report_approval": require_report_approval,
+                        "sql_backend": sql_backend,
+                        "enable_dynamic_loop": enable_dynamic_loop,
+                        "dynamic_limits": dynamic_limits,
                     }
+                    if saved_payload and any(saved_payload.get(key) != value for key, value in expected.items()):
+                        raise ValueError("同一client_message_id不能用于不同分析参数")
+                    if turn.status != "pending":
+                        return {"turn": _turn_dict(turn), "run_id": existing.run_id, "deduplicated": True}
+                    dispatch_payload = saved_payload
+                    turn_payload = _turn_dict(turn)
+                    run_id = existing.run_id
+                    deduplicated = True
 
             dataset_refs = list(record.dataset_refs or [])
             if not dataset_refs:
                 raise ValueError("会话没有绑定数据集，无法开始分析")
 
-            # 先读历史再建本轮，避免把当前这条消息算进"上一轮"
-            history = self._history_snapshot(repository, session_id)
-
-            run_id = f"run_{storage_conversation_id()}"
-            turn = repository.create_turn(
-                session_id=session_id, run_id=run_id, status="pending"
-            )
-            message = repository.add_message(
-                session_id=session_id,
-                role="user",
-                content=content,
-                turn_id=turn.id,
-                run_id=run_id,
-                client_message_id=client_message_id,
-            )
-            turn.user_message_id = message.id
-            repository.link_run(session_id=session_id, turn_id=turn.id, run_id=run_id)
-            turn_payload = _turn_dict(turn)
             knowledge_refs = list(record.knowledge_refs or [])
+            if not deduplicated:
+                history = self._history_snapshot(repository, session_id)
+                run_id = f"run_{storage_conversation_id()}"
+                turn = repository.create_turn(session_id=session_id, run_id=run_id, status="pending")
+                message = repository.add_message(
+                    session_id=session_id, role="user", content=content,
+                    turn_id=turn.id, run_id=run_id, client_message_id=client_message_id,
+                )
+                turn.user_message_id = message.id
+                repository.link_run(session_id=session_id, turn_id=turn.id, run_id=run_id)
+                dispatch_payload = {
+                    "data_sources": dataset_refs,
+                    "analysis_focus": analysis_focus or content,
+                    "knowledge_sources": knowledge_refs,
+                    "require_plan_approval": require_plan_approval,
+                    "require_report_approval": require_report_approval,
+                    "sql_backend": sql_backend,
+                    "conversation_context": self._context_payload(history, dataset_refs=dataset_refs),
+                    "memories": self._memories_for(content, dataset_refs=dataset_refs, session_id=session_id),
+                    "enable_dynamic_loop": enable_dynamic_loop,
+                    "dynamic_limits": dynamic_limits,
+                }
+                # A durable pending submission, replayed with its ORIGINAL
+                # payload if the process dies after commit and before dispatch.
+                turn.result = {"_dispatch_payload": dispatch_payload}
+                turn_payload = _turn_dict(turn)
 
         # 先记候选记忆（作用域在写入前判定），再启动 Run：写失败也不影响对话
-        self._record_candidates(content, session_id=session_id, dataset_refs=dataset_refs)
+        if not deduplicated:
+            self._record_candidates(content, session_id=session_id, dataset_refs=dataset_refs)
 
         # 启动可能失败（线程池关闭、后端模式非法、登记写入失败）。轮次与用户
         # 消息已经落库，如果不收敛状态，这条消息会永远停在 pending——界面上
         # 既看不到结果，也看不到失败原因。
         try:
-            self._coordinator.start(
-                run_id,
-                data_sources=dataset_refs,
-                analysis_focus=analysis_focus or content,
-                knowledge_sources=knowledge_refs,
-                require_plan_approval=require_plan_approval,
-                require_report_approval=require_report_approval,
-                sql_backend=sql_backend,
-                conversation_context=self._context_payload(
-                    history, dataset_refs=dataset_refs
-                ),
-                memories=self._memories_for(content, dataset_refs=dataset_refs),
-                enable_dynamic_loop=enable_dynamic_loop,
-                dynamic_limits=dynamic_limits,
-            )
+            if not dispatch_payload:
+                raise ValueError("旧pending轮次缺少投递快照，请创建新消息")
+            dispatcher = getattr(self._coordinator, "dispatch", None)
+            if dispatcher is None:  # small injected coordinators in offline tests
+                run_record = self._coordinator.start(run_id, **dispatch_payload)
+            else:
+                run_record = dispatcher(run_id, owner=self._owner, **dispatch_payload)
         except Exception as error:
-            self._mark_start_failed(turn_payload["turn_id"], run_id, error)
+            if isinstance(error, ValueError) or not client_message_id:
+                self._mark_start_failed(turn_payload["turn_id"], run_id, error)
+            else:
+                # Keep the original submission retryable; a second identical
+                # client_message_id repairs this window instead of returning a
+                # permanently orphaned Turn as a successful deduplication.
+                with storage.session_scope(storage.database_url()) as session:
+                    self._sessions(session).update_turn(turn_payload["turn_id"],
+                        status="pending", status_reason="投递未完成，使用原client_message_id重试")
             raise
 
         with storage.session_scope(storage.database_url()) as session:
             repository = self._sessions(session)
-            repository.update_turn(turn_payload["turn_id"], status="running")
-            turn_payload["status"] = "running"
+            new_status = getattr(run_record, "status", "running")
+            repository.update_turn(turn_payload["turn_id"], status=_STATUS_MAP.get(new_status, "running"))
+            turn_payload["status"] = _STATUS_MAP.get(new_status, "running")
 
         return {
             "turn": turn_payload,
             "run_id": run_id,
-            "deduplicated": False,
+            "deduplicated": deduplicated,
         }
 
     def _mark_start_failed(self, turn_id: str, run_id: str, error: Exception) -> None:
@@ -248,12 +276,15 @@ class ConversationService:
         self, repository: ConversationRepository, session_id: str
     ) -> dict[str, Any]:
         """当前轮之前的历史：消息与已完成轮次的真实摘要。"""
+        turns = repository.recent_turns(session_id, limit=4)
+        for turn in turns:
+            self._sync_turn(repository, turn)
+        repository._session.flush()
         messages = [
             message
-            for message in repository.list_messages(session_id, limit=20)
+            for message in repository.recent_messages(session_id, limit=6)
             if message.role in ("user", "assistant")
         ]
-        turns = repository.list_turns(session_id, limit=10)
         return {
             "messages": [
                 {"role": message.role, "content": message.content}
@@ -283,15 +314,15 @@ class ConversationService:
         }
 
     @staticmethod
-    def _memories_for(query: str, *, dataset_refs: list[str]) -> list[dict[str, Any]]:
+    def _memories_for(query: str, *, dataset_refs: list[str], session_id: str | None = None) -> list[dict[str, Any]]:
         """新任务开始时召回少量已确认记忆（全局 + 当前数据集）。"""
         from services.memory_service import MemoryService
 
         service = MemoryService()
         return service.retrieve(
             query,
-            scopes=service.scopes_for(dataset_refs),
-            limit=3,
+            scopes=service.scopes_for(dataset_refs, session_id=session_id),
+            limit=5,
         )
 
     def _record_candidates(
@@ -404,11 +435,7 @@ class ConversationService:
         result: dict[str, Any],
     ) -> None:
         """助手消息只在结果真实存在时写一次。"""
-        existing = [
-            message
-            for message in repository.list_messages(turn.session_id)
-            if message.role == "assistant" and message.turn_id == turn.id
-        ]
+        existing = repository.assistant_for_turn(turn.id)
         if existing:
             return
         preview = result.get("preview") or ""
@@ -449,7 +476,7 @@ def _turn_dict(record: ConversationTurn | None) -> dict[str, Any] | None:
         "run_id": record.run_id,
         "status": record.status,
         "status_reason": record.status_reason,
-        "result": record.result or {},
+        "result": {key: value for key, value in (record.result or {}).items() if not key.startswith("_")},
     }
 
 

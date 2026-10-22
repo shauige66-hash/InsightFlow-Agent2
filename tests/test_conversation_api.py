@@ -41,11 +41,15 @@ REPLIES: dict[str, Any] = {
 @pytest.fixture(autouse=True)
 def _fake_tool(monkeypatch: pytest.MonkeyPatch):
     from harness import tool_dispatcher
+    import nodes
 
     def fake_invoke(tool_name, tables, arguments, *, snapshots=None):
         return {"success": True, "result": [{"n": 3}], "error": None, "error_kind": None}
 
     monkeypatch.setattr(tool_dispatcher, "invoke_tool", fake_invoke)
+    def skip_pdf(*args, **kwargs):
+        raise RuntimeError("会话测试不验收浏览器PDF；保留真实Markdown/HTML与降级状态")
+    monkeypatch.setattr(nodes, "save_pdf_report", skip_pdf)
 
 
 @pytest.fixture
@@ -54,6 +58,7 @@ def env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv("INSIGHTFLOW_STORAGE", "local")
     monkeypatch.setenv("INSIGHTFLOW_LOCAL_DB", str(tmp_path / "conversations.sqlite"))
     monkeypatch.setenv("INSIGHTFLOW_OWNER", "api-test")
+    monkeypatch.setenv("INSIGHTFLOW_EXECUTION", "inline")
     monkeypatch.delenv("INSIGHTFLOW_REDIS_ENABLED", raising=False)
 
     database = tmp_path / "customers.sqlite"
@@ -115,7 +120,7 @@ def post_message(env, session_id: str, content: str, **extra) -> dict[str, Any]:
     return response.json()
 
 
-def wait_turn(env, turn_id: str, *, timeout: float = 120) -> dict[str, Any]:
+def wait_turn(env, turn_id: str, *, timeout: float = 20) -> dict[str, Any]:
     run_id = env["client"].get(f"/turns/{turn_id}").json()["run_id"]
     env["coordinator"].executor.wait(run_id, timeout=timeout)
     response = env["client"].get(f"/turns/{turn_id}")
@@ -171,7 +176,8 @@ class TestMessageFlow:
 
         assert accepted["run_id"].startswith("run_")
         assert accepted["turn_id"].startswith("turn_")
-        assert accepted["status"] == "running"
+        # Accepted is asynchronous: the worker may not have claimed it yet.
+        assert accepted["status"] in {"pending", "running"}
 
     def test_the_turn_completes_and_carries_the_result(self, env) -> None:
         session_id = make_session(env)
@@ -286,7 +292,7 @@ class TestFailureAndApproval:
             json={"approval_id": "plan_approval_" + accepted["run_id"], "decision": "approve"},
         )
         assert resumed.status_code == 202, resumed.text
-        env["coordinator"].executor.wait(accepted["run_id"], timeout=120)
+        env["coordinator"].executor.wait(accepted["run_id"], timeout=20)
         turns = env["client"].get(f"/sessions/{session_id}/turns").json()["turns"]
         assert len(turns) == 1
 

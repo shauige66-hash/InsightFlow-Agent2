@@ -17,6 +17,7 @@ from typing import Any
 from rag.evidence import contents
 from rag.retrieval import RetrievalOutcome, get_retriever
 from rag.task_query import build_task_query
+from rag.versioning import KnowledgeSourceChanged
 
 DEFAULT_GLOBAL_QUERY = "与当前数据分析相关的业务规则、指标定义和术语"
 
@@ -87,7 +88,18 @@ def _current_knowledge_version(state: dict[str, Any]) -> str | None:
         return None
     from rag.versioning import knowledge_version
 
-    return knowledge_version(sources)
+    try:
+        return knowledge_version(sources)
+    except OSError as error:
+        raise KnowledgeSourceChanged("知识源已不可用，请新建Run并重新绑定知识源") from error
+
+
+def ensure_knowledge_current(state: dict[str, Any]) -> None:
+    """Final publication must not hide a source change after the last task."""
+    current = _current_knowledge_version(state)
+    stored = state.get("knowledge_version")
+    if current and stored and current != stored:
+        raise KnowledgeSourceChanged("知识源已变化，请新建Run，拒绝混合旧口径结果")
 
 
 def task_knowledge_updates(
@@ -106,7 +118,13 @@ def task_knowledge_updates(
 
     current_version = _current_knowledge_version(state)
     stored_version = state.get("knowledge_version")
+    stored_tasks = dict(state.get("task_knowledge") or {})
     if current_version and stored_version and current_version != stored_version:
+        if state.get("execution_results"):
+            raise KnowledgeSourceChanged("知识源已变化，请新建Run，拒绝混合旧口径结果")
+        existing = []
+        stored_tasks = {}
+    if current_version and any(item.get("knowledge_version") != current_version for item in existing):
         existing = []
 
     if existing and not focus:
@@ -123,7 +141,7 @@ def task_knowledge_updates(
 
     updates: dict[str, Any] = {
         "task_knowledge": {
-            **(state.get("task_knowledge") or {}),
+            **stored_tasks,
             task_id: merged,
         },
     }
@@ -135,11 +153,17 @@ def task_knowledge_updates(
 
 def knowledge_contents(state: dict[str, Any], task_id: str) -> list[str]:
     """给 Prompt 用的证据正文；没有证据时为空列表。"""
-    return contents(evidence_from_state(state, task_id))
+    evidence = evidence_from_state(state, task_id)
+    version = _current_knowledge_version(state)
+    if version and any(item.get("knowledge_version") != version for item in evidence):
+        raise KnowledgeSourceChanged("知识源已变化，请新建Run，拒绝混合旧口径结果")
+    return contents(evidence)
 
 
 __all__ = [
     "DEFAULT_GLOBAL_QUERY",
+    "KnowledgeSourceChanged",
+    "ensure_knowledge_current",
     "evidence_from_state",
     "knowledge_contents",
     "retrieve_global",

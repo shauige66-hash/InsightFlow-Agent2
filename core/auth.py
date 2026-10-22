@@ -12,6 +12,11 @@
 from __future__ import annotations
 
 import hmac
+import hashlib
+import base64
+import json
+import time
+import secrets
 import os
 import re
 from dataclasses import dataclass
@@ -32,18 +37,42 @@ PUBLIC_PREFIXES = (
     "/favicon.ico",
 )
 
-#: 只读产物（报告与图表）。浏览器点链接时不会带 Authorization 头，
-#: 而 run_id 是随机生成的，读不到别人的 id 就取不到内容。
-_PUBLIC_ARTIFACT = re.compile(
-    r"^/runs/[^/]+/(report|report\.html|[^/]+\.(png|svg|jpg|jpeg|webp))$"
-)
+_ARTIFACT = re.compile(r"^/runs/([A-Za-z0-9_-]{4,64})/(report|report\.html|[^/]+\.(png|svg|jpg|jpeg|webp))$")
+_PROCESS_SECRET = secrets.token_bytes(32)
+
+
+def _signing_key():
+    raw = os.getenv("INSIGHTFLOW_ARTIFACT_SIGNING_KEY") or os.getenv("INSIGHTFLOW_API_KEYS", "")
+    return hashlib.sha256(raw.encode("utf-8")).digest() if raw else _PROCESS_SECRET
+
+
+def artifact_access_token(run_id: str, owner: str, *, lifetime: int = 300) -> str:
+    payload = base64.urlsafe_b64encode(json.dumps({"run":run_id,"owner":owner,"exp":int(time.time())+lifetime},separators=(",",":")).encode()).decode().rstrip("=")
+    signature = hmac.new(_signing_key(),payload.encode(),hashlib.sha256).hexdigest()
+    return payload+"."+signature
+
+
+def _artifact_owner(request: Request):
+    match = _ARTIFACT.fullmatch(request.url.path)
+    if request.method not in ("GET","HEAD") or not match:
+        return None
+    value = request.query_params.get("access") or request.cookies.get("insightflow_artifact_access") or ""
+    try:
+        payload,signature=value.rsplit(".",1)
+        expected=hmac.new(_signing_key(),payload.encode(),hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(signature,expected):
+            return None
+        item=json.loads(base64.urlsafe_b64decode(payload+"="*(-len(payload)%4)))
+        if item["run"] != match.group(1) or int(item["exp"]) < time.time():
+            return None
+        return str(item["owner"])
+    except (ValueError,KeyError,TypeError):
+        return None
 
 
 def _is_public(request: Request) -> bool:
-    path = request.url.path
-    if path.startswith(PUBLIC_PREFIXES):
-        return True
-    return request.method in ("GET", "HEAD") and bool(_PUBLIC_ARTIFACT.match(path))
+    path=request.url.path
+    return any(path == prefix or path.startswith(prefix+"/") for prefix in PUBLIC_PREFIXES)
 
 
 @dataclass(frozen=True)
@@ -68,7 +97,7 @@ def load_api_keys(raw: str | None = None) -> list[ApiKey]:
         token, owner = token.strip(), owner.strip()
         if not separator or not token or not owner:
             raise ValueError(
-                f"INSIGHTFLOW_API_KEYS 每项必须是 token:owner，收到 {item!r}"
+                "INSIGHTFLOW_API_KEYS 每项必须是非空 token:owner"
             )
         entries.append(ApiKey(token=token, owner=owner))
     return entries
@@ -100,7 +129,7 @@ class ApiKeyMiddleware(BaseHTTPMiddleware):
         if not self._keys or _is_public(request):
             return await call_next(request)
 
-        owner = resolve_owner(self._keys, request.headers.get("authorization"))
+        owner = resolve_owner(self._keys, request.headers.get("authorization")) or _artifact_owner(request)
         if owner is None:
             return JSONResponse(
                 status_code=401,
@@ -110,7 +139,12 @@ class ApiKeyMiddleware(BaseHTTPMiddleware):
 
         token = storage.set_current_owner(owner)
         try:
-            return await call_next(request)
+            response = await call_next(request)
+            if request.query_params.get("access") and _ARTIFACT.fullmatch(request.url.path):
+                run_id = _ARTIFACT.fullmatch(request.url.path).group(1)
+                response.set_cookie("insightflow_artifact_access",request.query_params["access"],max_age=300,
+                    path=f"/runs/{run_id}/",httponly=True,samesite="strict",secure=request.url.scheme=="https")
+            return response
         finally:
             storage.reset_current_owner(token)
 

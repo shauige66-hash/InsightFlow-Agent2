@@ -138,6 +138,7 @@ class RunRuntime:
     # MCP 后端配置。Client / Session / 子进程句柄不放在这里，
     # 由每次工具调用按需创建并立即回收——会话不能跨越 Checkpoint 存活。
     mcp: McpSettings = field(default_factory=McpSettings)
+    assert_lease: Any = None
 
     def output_dir(self) -> Path:
         return self.output_root / self.run_id

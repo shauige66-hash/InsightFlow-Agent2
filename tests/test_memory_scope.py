@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from services.memory_service import MemoryService
+from services.memory_service import MemoryService, dataset_scope
 
 
 class TestClassifyScope:
@@ -35,23 +35,23 @@ class TestClassifyScope:
         scope, reason = MemoryService.classify_scope(
             "这次按金额算", dataset_refs=["data/orders.csv"], session_id=None
         )
-        assert scope == "dataset:orders"
+        assert scope == dataset_scope("data/orders.csv")
         assert "只有一个数据集" in reason
 
-    def test_session_wording_with_several_datasets_and_no_session_stays_global(self) -> None:
+    def test_session_wording_with_several_datasets_and_no_session_is_unresolved(self) -> None:
         scope, reason = MemoryService.classify_scope(
             "这次按金额算",
             dataset_refs=["data/a.csv", "data/b.csv"],
             session_id=None,
         )
-        assert scope == "global"
+        assert scope == "unresolved"
         assert "缺少会话" in reason
 
     def test_dataset_wording_without_a_name_uses_the_only_dataset(self) -> None:
         scope, reason = MemoryService.classify_scope(
             "这张表的金额单位是分", dataset_refs=["data/orders.csv"], session_id="s"
         )
-        assert scope == "dataset:orders"
+        assert scope == dataset_scope("data/orders.csv")
 
     def test_ambiguous_wording_stays_global(self) -> None:
         scope, _ = MemoryService.classify_scope("今后优先用简洁结论", dataset_refs=[])

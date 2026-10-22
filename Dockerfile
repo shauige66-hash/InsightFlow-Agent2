@@ -16,7 +16,7 @@ WORKDIR /app
 
 # 构建期依赖：psycopg / cryptography 的 wheel 一般够用，这里只补最小的系统库。
 RUN apt-get update \
- && apt-get install -y --no-install-recommends curl tini \
+ && apt-get install -y --no-install-recommends curl tini docker.io \
  && rm -rf /var/lib/apt/lists/*
 
 # 先装 CPU 版 torch，再装其余依赖；分两步是为了让 requirements 变化时能复用这一层

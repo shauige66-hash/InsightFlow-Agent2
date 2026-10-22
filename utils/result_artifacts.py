@@ -25,6 +25,8 @@ import json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+import re
+from core.publication import atomic_write
 
 import numpy as np
 import pandas as pd
@@ -230,11 +232,14 @@ def store_result(
         return jsonable, None
 
     directory = output_root / run_id / "results"
+    safe_id = task_id if re.fullmatch(r"[A-Za-z0-9_-]{1,120}", task_id) else 'task-' + hashlib.sha256(task_id.encode('utf-8')).hexdigest()
     directory.mkdir(parents=True, exist_ok=True)
-    path = directory / f"{task_id}.json"
+    path = directory / f"{safe_id}.json"
 
     payload = json.dumps(jsonable, ensure_ascii=False, default=str).encode("utf-8")
-    path.write_bytes(payload)
+    if len(payload) > LOAD_MAX_BYTES:
+        raise ResultArtifactError("Result exceeds the maximum restorable artifact size")
+    atomic_write(path, payload)
 
     artifact = ResultArtifact(
         path=str(path),
@@ -299,7 +304,7 @@ def _verify_reference(
     if not path.is_file():
         raise ResultArtifactError(f"结果产物不是普通文件：{path}")
 
-    if reference.size and path.stat().st_size > LOAD_MAX_BYTES:
+    if path.stat().st_size > LOAD_MAX_BYTES:
         raise ResultArtifactError(
             f"结果产物超出读取预算：{path.stat().st_size} > {LOAD_MAX_BYTES}"
         )

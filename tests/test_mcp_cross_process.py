@@ -295,15 +295,29 @@ class TestApiMcpExposureBoundary:
     - 非 mcp 模式的 Run 不产生任何 MCP 私有配置。
     """
 
-    def test_coordinator_derives_settings_from_the_stored_record(self) -> None:
-        source = (PROJECT_ROOT / "services" / "run_coordinator.py").read_text(
-            encoding="utf-8"
-        )
-
-        # 必须从记录派生模式，而不是直接用调用方给的对象
-        assert "_settings_for(record.sql_backend)" in source
-        # 只覆盖 mode：Server 模块、超时与私有目录沿用宿主模板
-        assert "replace(self._mcp_template, mode=SqlBackend(" in source
+    def test_coordinator_derives_settings_from_the_stored_record(self, tmp_path, monkeypatch) -> None:
+        from core.runtime import McpSettings
+        from services.run_store import RunStore
+        from services.run_coordinator import RunCoordinator
+        store = RunStore(tmp_path / 'runs.sqlite')
+        store.create('stored_mcp', data_sources=['original.sqlite'], sql_backend='mcp')
+        template = McpSettings(server_module='host.trusted_server', call_timeout=17,
+            private_root=tmp_path / 'private')
+        coordinator = RunCoordinator(store, output_root=tmp_path, mcp_settings=template)
+        captured = {}
+        def execute(run_id, **kwargs):
+            captured.update(kwargs)
+            return {'run_status': 'completed', 'analysis_status': 'completed'}
+        monkeypatch.setattr(coordinator, '_execute', execute)
+        try:
+            coordinator.start('stored_mcp', record_exists=True, wait=True,
+                data_sources=['changed.csv'], sql_backend='direct')
+        finally:
+            coordinator.shutdown()
+        assert captured['data_sources'] == ['original.sqlite']
+        settings = captured['mcp']
+        assert settings.is_mcp and settings.server_module == template.server_module
+        assert settings.call_timeout == 17 and settings.private_root == template.private_root
 
     def test_request_model_cannot_carry_mcp_infrastructure(self) -> None:
         import api_runs

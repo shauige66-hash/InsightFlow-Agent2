@@ -236,6 +236,12 @@ def run_query(
     """
     connection = sqlite3.connect(read_only_uri(database_path), uri=True)
     try:
+        # Bound individual values before SQLite allocates/materializes them.
+        # Row-count and JSON limits below only apply after allocation.
+        connection.setlimit(sqlite3.SQLITE_LIMIT_LENGTH, max(64 * 1024, max_bytes))
+        connection.setlimit(sqlite3.SQLITE_LIMIT_SQL_LENGTH, 256 * 1024)
+        connection.setlimit(sqlite3.SQLITE_LIMIT_COLUMN, 512)
+        connection.setlimit(sqlite3.SQLITE_LIMIT_EXPR_DEPTH, 100)
         authorizer, denials = make_authorizer(allowed_tables)
         connection.set_authorizer(authorizer)
 

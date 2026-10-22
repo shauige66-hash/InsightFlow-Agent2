@@ -126,7 +126,7 @@ tools/ sandbox/ mcp_bridge/                   执行层
 |---|---|---|
 | 本机 | 开发/演示 | `scripts/serve_api.py`，SQLite，零外部依赖 |
 | **混合**（当前使用） | Windows | API 跑宿主 + PostgreSQL/Redis 进容器；因为分析要在宿主 Docker 沙箱执行 |
-| 全容器 | Linux | `deploy/compose.app.yaml`（api + worker + pg + redis）；需挂 docker.sock 才能执行 Python 分析 |
+| 全容器 | Linux | `compose.app.yaml`基础SQL部署；Python另叠加`compose.sandbox.yaml`，按deploy/README的同路径/CLI/GID合同配置 |
 
 ---
 
@@ -285,12 +285,12 @@ tools/ sandbox/ mcp_bridge/                   执行层
 - `INSIGHTFLOW_API_KEYS=token:owner,...`；**不配置即单用户演示模式**（默认关闭鉴权，便于本地使用）。
 - 归属者只从 token 推导，请求体无 owner 字段。
 - 越权读取他人会话返回 **404**（而非 403），避免泄露"该 id 存在"。
-- 报告与图表路由公开：浏览器点链接不带 Authorization，且 run_id 随机不可枚举。
+- 报告与图表需owner授权；浏览器通过已鉴权的artifact-link取得5分钟Run签名地址，正文图片使用Run路径HttpOnly凭据。
 - 已知边界：这是"令牌 → 归属者"映射，**不是完整身份系统**；没有注册、找回报价、配额与账单。
 
 ### 7.4 上传
 
-类型白名单（csv/xlsx/sqlite/db/sqlite3/md/txt/pdf）→ 单文件 20 MB → 只取 basename（`../../api.py` 被削成 `api.py`）→ 目录由服务端决定 → 超限时删除半成品。
+新旧入口统一类型白名单（csv/xlsx/sqlite/db/sqlite3/md/txt/pdf）→ 单文件20MB、请求体40MB、最多20文件 → 只取 basename（`../../api.py` 被削成 `api.py`）→ 目录由服务端决定 → 超限时删除半成品。
 
 ### 7.5 凭据
 
@@ -307,11 +307,13 @@ tools/ sandbox/ mcp_bridge/                   执行层
 
 ## 8. 质量现状（可复核）
 
+2026-10-21 本地工程修复新增 `budget_stop` 后为24个业务节点。当前离线复验按完整测试身份去重为1129通过、88跳过；另有sandbox/slow标记与外部完整端到端模块未执行。原始失败轮、复验XML及剩余边界见本次PDF报告。以下性能、规模与真实模型数字属于既有历史记录，本轮没有重新验证，不能用作本次修改的验收结果。
+
 | 项 | 数值 | 来源 |
 |---|---|---|
-| 全量用例 | 1158 通过 / 2 跳过（约 26 分 40 秒） | 最近一次全量运行日志 |
+| 历史全量用例 | 1158 通过 / 2 跳过（约 26 分 40 秒） | 既有全量运行日志，本轮未重现 |
 | 代码规模 | 生产 28,846 行 / 测试 27,941 行 | `collect_facts.py` 统计 |
-| 节点数 | 23 | `workflow.py` |
+| 当前业务节点数 | 24 | `workflow.py`，含新增budget_stop |
 | 真实模型验证 | 小数据 3/3 图、零售 17,049 行 3/3 图 | 运行日志 + 报告 |
 | 结论正确性 | GMV 环比 +1.98%（标准答案 +2.0%）；退货冠军 `22423` 与标准答案一致 | `case_ground_truth.json` 对照 |
 
@@ -342,8 +344,8 @@ tools/ sandbox/ mcp_bridge/                   执行层
 |---|---|---|---|
 | 1 | 评估基于脚本化模型，真实模型只验过 2 个场景 | 不能据此承诺准确率 | 接入更多真实数据集做基准 |
 | 2 | 无速率限制与按用户配额 | 单用户可耗尽额度 | 加按 token 的日配额 |
-| 3 | 队列无自动重试、无 worker 心跳回收 | 崩溃后任务需人工 `requeue` | 加超时回收 + 重试策略 |
-| 4 | 单机、无线程/进程级隔离扩展 | 无法水平扩展 | 引入外部队列（如 Redis Streams）与多 worker |
+| 3 | Run已有执行租约/心跳，队列claimed任务仍无自动回收 | 崩溃后需核查并人工 `requeue` | 加事务outbox与受控回收策略 |
+| 4 | local模式限单机；PG队列支持多worker但本轮未做生产并发验收 | 不能据离线测试承诺扩展能力 | 在专用PG/Redis/Docker环境验证并发和故障 |
 | 5 | 沙箱依赖宿主 Docker | 部署耦合 | 评估 gVisor / 远程沙箱服务 |
 | 6 | 无 CI、无覆盖率门槛 | 回归靠手工 | 加 GitHub Actions + 覆盖率阈值 |
 | 7 | 依赖未锁定哈希 | 跨机器可能装到不同小版本 | 引入 lock 文件 |

@@ -15,6 +15,8 @@ from pathlib import Path
 from fastapi.responses import RedirectResponse
 from fastapi.staticfiles import StaticFiles
 import shutil
+import storage
+from core.resource_access import owner_upload_dir
 from utils.run_logger import create_run_id
 from fastapi.responses import FileResponse
 from pydantic import WithJsonSchema
@@ -35,7 +37,6 @@ UploadFile = Annotated[
         }
     )
 ]
-UPLOAD_DIR = Path("uploads")
 DATA_EXTENSIONS = {
     ".csv",
     ".xlsx",
@@ -97,53 +98,59 @@ def _safe_upload_name(raw: str) -> str:
     return name
 
 
-@app.post("/api/uploads", status_code=201)
-def upload_dataset(file: UploadFile = File(...)) -> dict[str, Any]:
-    """接收一个数据或知识文件，返回可直接用于 `POST /runs` 的相对路径。"""
-    name = _safe_upload_name(getattr(file, "filename", "") or "")
-    if not name:
-        raise HTTPException(status_code=400, detail="缺少文件名")
+MAX_UPLOAD_FILES = 20
+MAX_UPLOAD_TOTAL_BYTES = 40 * 1024 * 1024
+from core.upload_limit import UploadBodyLimitMiddleware
+app.add_middleware(UploadBodyLimitMiddleware,limit_getter=lambda: MAX_UPLOAD_TOTAL_BYTES)
 
-    suffix = Path(name).suffix.lower()
-    if suffix not in ALLOWED_UPLOAD_SUFFIXES:
-        allowed = "、".join(sorted(ALLOWED_UPLOAD_SUFFIXES))
-        raise HTTPException(status_code=400, detail=f"不支持的文件类型：{suffix or '(无扩展名)'}；允许：{allowed}")
 
-    folder = UPLOAD_DIR / datetime.now().strftime("%Y%m%d")
-    folder.mkdir(parents=True, exist_ok=True)
-    target = folder / f"{uuid4().hex[:8]}-{name}"
-
-    written = 0
+def _write_upload(file, target: Path, *, remaining: int) -> int:
+    written=0
     try:
-        with target.open("wb") as handle:
+        with target.open("xb") as handle:
             while True:
-                chunk = file.file.read(1024 * 1024)
+                chunk=file.file.read(1024*1024)
                 if not chunk:
                     break
                 written += len(chunk)
-                if written > MAX_UPLOAD_BYTES:
-                    handle.close()
-                    target.unlink(missing_ok=True)
-                    raise HTTPException(
-                        status_code=413,
-                        detail=f"文件超过 {MAX_UPLOAD_BYTES // (1024 * 1024)} MB 上限",
-                    )
+                if written > MAX_UPLOAD_BYTES or written > remaining:
+                    raise HTTPException(status_code=413,detail="上传超过文件或请求容量上限")
                 handle.write(chunk)
-    except HTTPException:
+        if written==0:
+            raise HTTPException(status_code=400,detail="文件为空")
+    except Exception:
+        target.unlink(missing_ok=True)
         raise
-    except OSError as error:
-        target.unlink(missing_ok=True)
-        raise HTTPException(status_code=500, detail=f"写入失败：{error}") from error
+    return written
 
-    if written == 0:
-        target.unlink(missing_ok=True)
-        raise HTTPException(status_code=400, detail="文件为空")
 
-    return {
-        "name": name,
-        "path": target.relative_to(_PROJECT_DIR).as_posix(),
-        "size_bytes": written,
-    }
+@app.post("/api/uploads", status_code=201)
+def upload_dataset(file: UploadFile = File(...)) -> dict[str, Any]:
+    name=_safe_upload_name(getattr(file,"filename","") or "")
+    if not name or Path(name).suffix.lower() not in ALLOWED_UPLOAD_SUFFIXES:
+        raise HTTPException(status_code=400,detail="不支持的文件类型或缺少文件名")
+    folder=owner_upload_dir(UPLOAD_DIR)/datetime.now().strftime("%Y%m%d")
+    folder.mkdir(parents=True,exist_ok=True)
+    target=folder/f"{uuid4().hex}-{name}"
+    size=_write_upload(file,target,remaining=MAX_UPLOAD_TOTAL_BYTES)
+    return {"name":name,"path":target.relative_to(_PROJECT_DIR).as_posix(),"size_bytes":size}
+
+
+def _authorized_artifact_path(run_id: str, filename: str) -> Path:
+    import api_runs
+    try:
+        api_runs._validate_run_id(run_id)
+    except HTTPException:
+        raise HTTPException(status_code=404,detail="产物不存在") from None
+    # In authenticated deployments every artifact must belong to the requesting owner.
+    if _API_KEYS or __import__("core.auth",fromlist=["load_api_keys"]).load_api_keys():
+        api_runs._require_run(run_id)
+    root=Path(api_runs.OUTPUT_ROOT).resolve()
+    run_root=(root/run_id).resolve()
+    candidate=(run_root/filename).resolve()
+    if not run_root.is_relative_to(root) or not candidate.is_relative_to(run_root) or not candidate.is_file():
+        raise HTTPException(status_code=404,detail="产物不存在")
+    return candidate
 
 
 def _list_relative(
@@ -196,26 +203,18 @@ def ui_root() -> RedirectResponse:
 def report_html(run_id: str) -> FileResponse:
     """同一份报告的 HTML 版本：浏览器里直接读，比下载 PDF 更适合演示。"""
     import api_runs
-    from utils.html_safety import REPORT_CSP
 
-    api_runs._validate_run_id(run_id)
-
-    report_path = Path(api_runs.OUTPUT_ROOT) / run_id / "analysis_report.html"
+    report_path = _authorized_artifact_path(run_id,"analysis_report.html")
     if not report_path.exists():
         raise HTTPException(
             status_code=404,
             detail=f"该运行没有 HTML 报告：{run_id}",
         )
-    # 报告正文源自模型与用户文档，按不可信内容对待：
-    # 文档内已嵌 CSP，这里再用响应头声明一次，避免被 "文件已存在" 的旧产物绕过。
     return FileResponse(
         path=str(report_path),
         media_type="text/html; charset=utf-8",
-        headers={
-            "Content-Security-Policy": REPORT_CSP,
-            "Referrer-Policy": "no-referrer",
-            "X-Content-Type-Options": "nosniff",
-        },
+        headers={"Content-Security-Policy":"default-src 'none'; img-src 'self'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
+                 "X-Content-Type-Options":"nosniff", "Referrer-Policy":"no-referrer"},
     )
 
 
@@ -291,131 +290,42 @@ def analyze_upload(
     analysis_focus: str | None = Form(None)
 ) -> dict:
 
-    run_id = create_run_id()
-
-    run_upload_dir = (
-        UPLOAD_DIR / run_id
-    )
-
-    data_dir = (
-        run_upload_dir
-        / "data"
-    )
-
-    knowledge_dir = (
-        run_upload_dir
-        / "knowledge"
-    )
-
-    data_dir.mkdir(
-        parents=True,
-        exist_ok=True
-    )
-
-    knowledge_dir.mkdir(
-        parents=True,
-        exist_ok=True
-    )
-
-    data_sources = []
-    knowledge_sources = []
-
-    allowed_data_suffixes = {
-        ".csv",
-        ".xlsx",
-        ".db",
-        ".sqlite",
-        ".sqlite3",
-    }
-
-    allowed_knowledge_suffixes = {
-        ".md",
-        ".txt",
-        ".pdf",
-    }
-
-    for uploaded_file in files:
-
-        filename = Path(
-            uploaded_file.filename or ""
-        ).name
-
-        suffix = Path(
-            filename
-        ).suffix.lower()
-
-        if suffix not in allowed_data_suffixes:
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    f"Unsupported data file type: "
-                    f"{filename}"
-                )
-            )
-
-        file_path = (
-            data_dir
-            / filename
-        )
-
-        with file_path.open(
-            "wb"
-        ) as output_file:
-
-            shutil.copyfileobj(
-                uploaded_file.file,
-                output_file
-            )
-
-        data_sources.append(
-            str(file_path)
-        )
-
-    for uploaded_file in knowledge_files or []:
-
-        filename = Path(
-            uploaded_file.filename or ""
-        ).name
-
-        suffix = Path(
-            filename
-        ).suffix.lower()
-
-        if suffix not in allowed_knowledge_suffixes:
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    f"Unsupported knowledge file type: "
-                    f"{filename}"
-                )
-            )
-
-        file_path = (
-            knowledge_dir
-            / filename
-        )
-
-        with file_path.open(
-            "wb"
-        ) as output_file:
-
-            shutil.copyfileobj(
-                uploaded_file.file,
-                output_file
-            )
-
-        knowledge_sources.append(
-            str(file_path)
-        )
+    run_id=create_run_id()
+    all_files=list(files)+list(knowledge_files or [])
+    if not files or len(all_files)>MAX_UPLOAD_FILES:
+        raise HTTPException(status_code=413 if files else 400,detail="文件数超限或缺少数据源")
+    run_upload_dir=owner_upload_dir(UPLOAD_DIR)/run_id
+    data_sources=[]
+    knowledge_sources=[]
+    total=0
+    written_paths=[]
+    try:
+        for uploaded_file,is_knowledge in [(f,False) for f in files]+[(f,True) for f in (knowledge_files or [])]:
+            name=_safe_upload_name(uploaded_file.filename or "")
+            suffixes=KNOWLEDGE_EXTENSIONS if is_knowledge else DATA_EXTENSIONS
+            if not name or Path(name).suffix.lower() not in suffixes:
+                raise HTTPException(status_code=400,detail="不支持的文件类型")
+            folder=run_upload_dir/("knowledge" if is_knowledge else "data")
+            folder.mkdir(parents=True,exist_ok=True)
+            target=folder/f"{uuid4().hex}-{name}"
+            total += _write_upload(uploaded_file,target,remaining=MAX_UPLOAD_TOTAL_BYTES-total)
+            written_paths.append(target)
+            (knowledge_sources if is_knowledge else data_sources).append(str(target))
+    except Exception:
+        for target in written_paths:
+            target.unlink(missing_ok=True)
+        raise
 
     try:
-        result = run_analysis(
-            data_sources=data_sources,
+        from api_runs import get_coordinator, _execution_mode
+        if _execution_mode()=="queue":
+            record=get_coordinator().dispatch(run_id,data_sources=data_sources,analysis_focus=analysis_focus,knowledge_sources=knowledge_sources)
+            return {"run_id":run_id,"status":record.status}
+        result = get_coordinator().start(
+            run_id, data_sources=data_sources,
             analysis_focus=analysis_focus,
             knowledge_sources=knowledge_sources,
-            run_id=run_id,
-            # 兼容路径同样显式注入模型工厂：run_id 会作为追踪头传给 ModelGate
-            model_factory=build_model_factory(run_id)
+            wait=True, owner=storage.current_owner()
         )
 
     except Exception as error:
@@ -480,7 +390,7 @@ def download_report(
     # 而 Run 本身明明是成功的——端到端测试暴露了这个断链。
     import api_runs
 
-    report_path = Path(api_runs.OUTPUT_ROOT) / run_id / "analysis_report.pdf"
+    report_path = _authorized_artifact_path(run_id,"analysis_report.pdf")
 
     if not report_path.exists():
         raise HTTPException(
@@ -528,8 +438,8 @@ def run_artifact(run_id: str, filename: str) -> FileResponse:
     if Path(name).suffix.lower() not in {".png", ".svg", ".jpg", ".jpeg", ".webp"}:
         raise HTTPException(status_code=404, detail="只提供图片产物")
 
+    candidate = _authorized_artifact_path(run_id,name)
     root = Path(api_runs.OUTPUT_ROOT).resolve()
-    candidate = (root / run_id / name).resolve()
 
     # 形态校验之后再加一层：解析后的路径必须仍在输出根之内。
     if root not in candidate.parents or not candidate.is_file():

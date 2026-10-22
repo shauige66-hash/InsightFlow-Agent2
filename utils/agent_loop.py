@@ -113,11 +113,10 @@ class AgentBudget:
     """
 
     max_rounds: int = 24
-    """Reason→Act→Observe→Decide 的总轮次上限。
+    """真实分析/绘图工具尝试的总轮次上限。
 
-    默认 24：既有的最坏合法路径是 1 次执行 + 3 次 repair + 3 次 refine，
-    再加上图自身的节点步进，远低于这个数；而一旦出现互相触发的组合爆炸，
-    这里会先于 recursion_limit 收敛住。
+    初始尝试和修复后的尝试均计一次；重放缓存结果、模型建议与审批不计。
+    默认24，独立于工具调用总数与图的 recursion_limit。
     """
 
     max_tool_calls: int = 40

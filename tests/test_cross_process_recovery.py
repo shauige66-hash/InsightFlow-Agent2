@@ -45,6 +45,7 @@ def run_phase(
         str(PYTHON),
         str(DRIVER),
         phase,
+        "--scripted-tools",
         "--workdir",
         str(workdir),
         "--run-id",

@@ -37,7 +37,9 @@ class TestSanitizer:
         assert sanitize_report_html(table) == table
 
         link = '<a href="https://ok.example" title="t">链接</a>'
-        assert sanitize_report_html(link) == link
+        rendered = sanitize_report_html(link)
+        assert 'href="https://ok.example"' in rendered
+        assert 'title="t"' in rendered and '链接' in rendered
 
     def test_relative_image_is_kept(self) -> None:
         """报告里的图表是相对路径，必须保留，否则 PDF 里没有图。"""

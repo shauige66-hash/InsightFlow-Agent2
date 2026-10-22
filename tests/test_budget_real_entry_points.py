@@ -215,7 +215,8 @@ class TestLlmBudgetOnTheRealPath:
         assert result["analysis_status"] == "failed"
         # 没有模型调用 → 不可能发生 repair（repair 本身要调模型）
         # 更直接的判据：失败原因里带的是预算口径
-        assert result.get("report_path") is None
+        assert str(result.get("termination_reason", "")).startswith("budget_exceeded:")
+        assert result.get("report_path") and Path(result["report_path"]).is_file()
 
     def test_exhaustion_leaves_no_orphan_ledger_entry(self, tmp_path: Path) -> None:
         """超预算被拦下时不得往 LLM Ledger 写 `started`。

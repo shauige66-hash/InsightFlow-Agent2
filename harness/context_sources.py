@@ -18,7 +18,7 @@ from __future__ import annotations
 from typing import Any
 
 #: 注入长期记忆的 Agent：需要知道输出偏好与指标定义的那些
-MEMORY_AGENTS = frozenset({"planner", "executor", "critic", "refine"})
+MEMORY_AGENTS = frozenset({"planner", "executor", "critic", "refine", "reporter", "visualizer", "plotter"})
 
 #: 注入多轮对话历史的 Agent：只有规划需要理解"刚才的结果"
 CONVERSATION_AGENTS = frozenset({"planner"})
@@ -87,7 +87,12 @@ def inject_context_sources(
     """把记忆与对话写进 Agent 的输入字段；返回写入情况。"""
     memory_count = 0
     if agent in MEMORY_AGENTS and _is_placeholder(fields.get("memories")):
-        text = format_memories(state.get("memories") or [])
+        memories = state.get("memories") or []
+        if agent in {"reporter", "visualizer", "plotter"}:
+            memories = [item for item in memories if item.get("kind") in {"preference", "report_format"}]
+            if _is_placeholder(fields.get("current_instruction")):
+                fields["current_instruction"] = str(state.get("analysis_focus") or "无")
+        text = format_memories(memories)
         if text:
             fields["memories"] = text
             memory_count = text.count("\n- ") + (1 if text.startswith("- ") else 0)
