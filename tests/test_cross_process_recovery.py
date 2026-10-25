@@ -195,21 +195,42 @@ class TestScenarioAServerRestart:
             crash_on=CRASH_AFTER_PLOT_GENERATION,
         )
         # 先暂停（未确认的模型调用），再批准重发以跑完
-        run_phase("resume", workdir=workdir, run_id=run_id, data_source=source)
-        run_phase(
+        paused = run_phase("resume", workdir=workdir, run_id=run_id, data_source=source)
+        assert paused["interrupted"] is True
+        assert paused["pending_approval"]["kind"] == "llm_replay"
+        resumed = run_phase(
             "resume",
             workdir=workdir,
             run_id=run_id,
             data_source=source,
             grant_llm_retry=True,
         )
+        assert resumed["run_status"] == "completed"
+        assert resumed["analysis_status"] == "completed"
 
         files = artifact_files(workdir, run_id)
         assert "analysis_report.md" in files
-        assert "analysis_report.pdf" in files
-        # 报告文件各只有一份
+        assert "analysis_report.html" in files
+        # 不只检查文件数：覆盖写入也不能掩盖 reporter 被重复调用。
         assert files.count("analysis_report.md") == 1
-        assert files.count("analysis_report.pdf") == 1
+        assert files.count("analysis_report.html") == 1
+        assert llm_calls(workdir).count("reporter") == 1
+        assert set(resumed["artifacts"]) == set(files)
+
+        # --scripted-tools 刻意禁用浏览器导出，必须按预期降级，不能把
+        # 任意 PDF 导出失败都当成本用例成功；独立用例覆盖 PDF 成功分支。
+        assert "analysis_report.pdf" not in files
+        events = [
+            json.loads(line)
+            for line in (workdir / "logs" / f"{run_id}.jsonl").read_text(encoding="utf-8").splitlines()
+        ]
+        saved = [event for event in events if event["event"] == "report_artifacts_saved"]
+        assert len(saved) == 1
+        assert saved[0]["status"] == "degraded"
+        assert saved[0]["details"]["pdf_path"] is None
+        assert saved[0]["details"]["pdf_skipped_reason"] == (
+            "RuntimeError: Scripted workflow test does not exercise browser PDF export"
+        )
 
 
 class TestScenarioBApprovalResume:

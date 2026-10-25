@@ -10,6 +10,8 @@ InsightFlow 是一个基于 LangGraph 和 LangChain 构建的 Agentic 数据分�
 
 ## 文档
 
+受控自我改进现已提供命令行入口：真实重复评测 → 提示/经验候选 → 独立验收 → 版本晋升与回退。Critic 可优化，最终评分规则保持独立。使用方法与证据边界见 [自我改进说明](docs/improvement.md)。
+
 | 文档 | 内容 | 适合谁 |
 |---|---|---|
 | [技术说明书](docs/technical-spec.md)（[PDF](docs/technical-spec.pdf)） | 业务需求、功能实现、架构与选型理由、出错补救、工程化与安全、已知限制 | 负责人评审 |

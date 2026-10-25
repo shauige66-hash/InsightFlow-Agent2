@@ -1,0 +1,44 @@
+flowchart TB
+  START["显式启动 baseline / improve CLI<br/>专用评测凭据 + 请求与时间额度"] --> SEED["读取当前版本 Vn<br/>固定评分器、模型、预算与数据指纹"]
+  SEED --> BASE["开发集 + 验证集重复运行基线<br/>每次新 Run、独立输入 / 输出、空会话记忆"]
+  BASE --> EVAL["宿主独立评分<br/>CSV / Decimal 业务答案、完成状态<br/>真实图表、调用数与时间约束"]
+  EVAL --> COMMAND{"命令类型"}
+  COMMAND -->|baseline| SAVE["保存基线报告并结束<br/>不生成候选，不使用保留集"]
+  COMMAND -->|improve| CHOOSE{"搜索后端"}
+  CHOOSE -->|reflective| REFLECT["当前版本参与失败诊断<br/>提出完整提示 / 经验候选"]
+  CHOOSE -->|GEPA| GEPA["官方 gepa.optimize<br/>搜索 Planner / Critic 指引<br/>开发反馈 + 验证评分，按预算搜索"]
+  REFLECT --> CHECK["严格 CandidateProfile 白名单<br/>经验必须引用实际开发试验<br/>不接受评分器、权限、预算或源码字段"]
+  GEPA --> CHECK
+  CHECK --> DEV["候选开发集运行<br/>只向改进器返回开发诊断，不返回标准答案"]
+  DEV --> VAL["候选验证集运行<br/>与基线 / 当前较优候选同条件比较"]
+  VAL --> GAIN{"有独立改进且逐题不退化？"}
+  GAIN -->|原生反思未改善，但还有轮次| REFLECT
+  GAIN -->|有| BEST["记录较优候选与证据<br/>原生反思可用该版本继续下一轮"]
+  BEST -->|继续原生反思搜索| REFLECT
+  BEST -->|搜索结束| LOCK["锁定最终候选<br/>保留集使用标记持久化"]
+  GAIN -->|额度用尽且无较优候选| KEEP["不升级：保持 Vn"]
+  GAIN -->|搜索结束，沿用此前较优候选| LOCK
+  LOCK --> HOLD["基线与锁定候选各跑一次最终保留集批次<br/>不回到本轮搜索；CLI 每轮生成新保留集 seed"]
+  HOLD --> FINAL["registry.finish 固定门禁<br/>逐题通过数、异常数、调用约束<br/>配置指纹、试验覆盖与凭据完整性"]
+  FINAL --> PASS{"全部达标？"}
+  PASS -->|否| KEEP
+  PASS -->|是| STORE["SQLite 事务晋升 Vn+1<br/>保存配置、经验、父版本与评测凭据<br/>并发旧实验不能覆盖新 active"]
+  STORE --> DEPLOY["显式配置版本库路径后<br/>新 Run 读取 active 并保存完整快照"]
+  DEPLOY --> NEXT["后续任务使用新指引与经验<br/>旧 Checkpoint 仍用原版本"]
+  NEXT -. 下一次显式实验 .-> SEED
+  STORE --> ROLLBACK["操作员可回退已验收历史版本<br/>提示与经验一起恢复"]
+  ROLLBACK --> DEPLOY
+
+  CRITIC["内部 Critic 可被优化<br/>它的通过结论不决定外部评测通过"] -. 不进入最终判分依据 .-> EVAL
+  LIMIT["当前范围：一个业务任务的六组数据变体<br/>不训练模型、不开放源码自修改<br/>经验尚无通用语义冲突检测 / 业务作用域"]
+  LIMIT -. 边界说明 .-> CHECK
+  EVIDENCE["经验随候选整体验收<br/>不等于逐条证明因果增益"] -.-> STORE
+
+  classDef normal fill:#EAF3FF,stroke:#4569A1,color:#16345A;
+  classDef trusted fill:#E8F5EC,stroke:#43845B,color:#204C30;
+  classDef candidate fill:#FFF3D6,stroke:#A98127,color:#60470E;
+  classDef note fill:#F4F3F8,stroke:#8C879D,color:#4C465E;
+  class START,BASE,DEV,VAL,NEXT normal;
+  class EVAL,CHECK,LOCK,HOLD,FINAL,STORE,DEPLOY,ROLLBACK trusted;
+  class REFLECT,GEPA,BEST,CRITIC candidate;
+  class LIMIT,EVIDENCE note;

@@ -11,7 +11,7 @@
 
 ## 关于 `--provider real`
 
-真实模型运行**需要明确授权的 API Key 与费用预算**。没有这两样时，
+真实模型运行需要专用评测 API Key、模型名和显式请求数/时间上限。没有这些时，
 本脚本不会去调用付费模型，而是打印需要提供什么。这样做的原因很简单：
 编造成功率、成本或 Token 数据比不测更糟。
 
@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import sys
 from pathlib import Path
@@ -56,6 +57,49 @@ def _select_tasks(args: argparse.Namespace):
     if args.limit is not None:
         tasks = tasks[: args.limit]
     return tasks
+
+
+def _run_real(args: argparse.Namespace) -> int:
+    """A separate real-model suite; mock task scripts never become references."""
+    from eval.real_runner import EvaluationContractChanged, RealEvaluator
+    from improvement.profiles import CandidateProfile
+    from utils.agent_loop import AgentBudget
+    from core.runtime import McpSettings
+    import tempfile
+
+    if not os.getenv("INSIGHTFLOW_EVAL_REAL_API_KEY") or not os.getenv("INSIGHTFLOW_EVAL_REAL_MODEL"):
+        print("真实评测需要 INSIGHTFLOW_EVAL_REAL_API_KEY 和 INSIGHTFLOW_EVAL_REAL_MODEL。", file=sys.stderr)
+        return 2
+    if args.max_llm_calls is None or args.max_seconds is None:
+        print("真实评测必须显式指定 --max-llm-calls 和 --max-seconds（每次任务上限）。", file=sys.stderr)
+        return 2
+    if args.max_llm_calls < 1 or args.max_seconds <= 0 or not math.isfinite(args.max_seconds):
+        print("真实评测的请求数和时间上限必须为有限正数。", file=sys.stderr)
+        return 2
+    if args.family or args.limit is not None or args.faults_only:
+        print("真实评测使用独立业务套件；--family/--limit/--faults-only 仅适用于 mock。", file=sys.stderr)
+        return 2
+    try:
+        profile = CandidateProfile()
+        if args.profile:
+            profile = CandidateProfile.from_dict(json.loads(Path(args.profile).read_text(encoding="utf-8")))
+        workdir = Path(args.workdir).resolve() if args.workdir else Path(tempfile.mkdtemp(prefix="insightflow-real-eval-"))
+        output = Path(args.output).resolve() if args.output else workdir / "reports"
+        evaluator = RealEvaluator(workdir / "runs", repeats=args.repeats,
+                                  budget=AgentBudget(max_llm_calls=args.max_llm_calls, max_seconds=args.max_seconds),
+                                  mcp=McpSettings(mode=args.mode))
+        print(f"真实模型业务评测 | split={args.split} | trials={evaluator.expected_trials(args.split)}")
+        print(f"每次任务最多 {args.max_llm_calls} 个模型请求、{args.max_seconds:g} 秒；Token/费用未知时标为 null。")
+        report = evaluator.evaluate(profile, args.split)
+        output.mkdir(parents=True, exist_ok=True)
+        path = output / "real-eval.json"
+        path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+        print(json.dumps(report["summary"], ensure_ascii=False))
+        print(f"评测报告：{path}")
+        return 0 if report["summary"]["passed"] == report["summary"]["total"] else 1
+    except (ValueError, OSError, EvaluationContractChanged) as error:
+        print(f"真实评测配置或固定合同无效：{type(error).__name__}", file=sys.stderr)
+        return 2
 
 
 def main() -> int:
@@ -98,32 +142,15 @@ def main() -> int:
         default="mock",
         help="模型提供方；real 需要显式授权的 API Key 与预算",
     )
+    parser.add_argument("--repeats", type=int, default=3, help="真实评测每个任务重复次数")
+    parser.add_argument("--split", choices=("development", "validation", "holdout"), default="development")
+    parser.add_argument("--max-llm-calls", type=int, default=None, help="真实评测每次任务的模型请求上限")
+    parser.add_argument("--max-seconds", type=float, default=None, help="真实评测每次任务时间上限")
+    parser.add_argument("--profile", default=None, help="待评测的纯文本候选配置 JSON")
     args = parser.parse_args()
 
     if args.provider == "real":
-        if not os.environ.get("INSIGHTFLOW_EVAL_REAL_API_KEY"):
-            print(
-                "拒绝执行：`--provider real` 需要显式授权。\n"
-                "请设置 INSIGHTFLOW_EVAL_REAL_API_KEY（以及可选的 "
-                "INSIGHTFLOW_EVAL_REAL_BUDGET_USD）后再运行。\n"
-                "\n"
-                "本仓库不会在缺少授权时调用付费模型，也不会用 Mock 结果"
-                "冒充真实模型能力。\n"
-                "\n"
-                "在获得授权之前，下列指标属于**尚未验证**：",
-                file=sys.stderr,
-            )
-            for item in UNVERIFIED_REAL_MODEL_METRICS:
-                print(f"  - {item}", file=sys.stderr)
-            return 2
-
-        print(
-            "注意：真实模型运行尚未在本仓库中实现。需要接入 "
-            "core.llm.build_model_factory 与真实的 key/预算策略，"
-            "并重新校准判分口径（真实模型可能给出非确定性输出）。",
-            file=sys.stderr,
-        )
-        return 3
+        return _run_real(args)
 
     if args.workdir:
         workdir = Path(args.workdir).resolve()

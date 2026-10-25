@@ -1,0 +1,51 @@
+flowchart TB
+  U["用户：问题、数据、业务知识"] --> WEB["浏览器控制台 / HTTP 客户端"]
+  WEB --> API["FastAPI：上传、Runs、会话、审批、产物接口"]
+  API --> AUTH["鉴权、归属隔离、资源与上传校验"]
+  AUTH --> SESSION["会话服务：消息去重、历史与已确认记忆"]
+  AUTH --> RUN["Run 服务 / RunCoordinator"]
+  SESSION --> RUN
+  RUN --> MODE{"执行模式"}
+  MODE -->|inline| LEASE["Run 租约、心跳、状态与并发恢复保护"]
+  MODE -->|queue| QUEUE["PostgreSQL 持久队列 → Worker"]
+  QUEUE --> LEASE
+  CLI["可信本地 CLI / 脚本"] --> ANALYSIS["analysis_service.run_analysis"]
+  LEASE --> ANALYSIS
+  ANALYSIS --> PROFILE["新 Run：固定候选配置快照<br/>恢复 Run：沿用 Checkpoint 原版本"]
+  PROFILE --> GRAPH["LangGraph 分析工作流<br/>规划 → 执行 → 纠错 → 绘图 → 报告"]
+  GRAPH --> RESULT["Markdown / HTML / PDF / 图表<br/>来源引用、运行状态与错误"]
+  RESULT --> VIEW["归属校验 / 签名产物链接 / 下载"]
+  VIEW --> DONE["用户查看 / 下载结果"]
+
+  subgraph SUPPORT["分析工作流的运行支撑"]
+    H["Harness：模型与工具调用治理<br/>上下文、预算、幂等、账本、追踪"]
+    RAG["知识 RAG：加载 → 切分 → 向量化<br/>检索、证据引用、知识版本"]
+    DB["SQLite 或 PostgreSQL<br/>会话、记忆、Run、Checkpoint"]
+    VECTOR["进程内向量索引 / pgvector<br/>Redis 仅作可选缓存"]
+    TOOLS["只读 SQL：direct / MCP<br/>Python、绘图：Docker 沙箱"]
+    LLM["模型访问：按配置经 ModelGate<br/>或直连兼容服务商 API"]
+  end
+  GRAPH -. 调用治理 .-> H
+  GRAPH -. 知识检索 .-> RAG
+  GRAPH -. 状态持久化 .-> DB
+  SESSION -. 会话与记忆 .-> DB
+  RAG -. 索引与缓存 .-> VECTOR
+  H --> TOOLS
+  H --> LLM
+
+  subgraph IMP["独立启动的评测与改进控制器"]
+    IC["评测 / 改进 CLI<br/>显式凭据与调用额度"] --> EV["真实任务重复运行<br/>固定宿主评分器"]
+    EV -->|仅 improve 命令继续| SEARCH["原生反思：提示与经验候选<br/>GEPA：Planner / Critic 指引搜索"]
+    EV -->|baseline / 单独评测| BENCH["保存基线或独立评测报告"]
+    SEARCH --> ACCEPT["验证选择 → 锁定候选<br/>最终保留集验收"]
+    ACCEPT --> REG["SQLite 版本库<br/>达标晋升、未达标保留、可回退"]
+  end
+  EV -. 直接调用，不经过业务队列 .-> ANALYSIS
+  REG -. 显式部署配置，仅供新 Run .-> PROFILE
+
+  classDef entry fill:#EAF3FF,stroke:#4569A1,color:#16345A;
+  classDef trusted fill:#E8F5EC,stroke:#43845B,color:#204C30;
+  classDef candidate fill:#FFF3D6,stroke:#A98127,color:#60470E;
+  class U,WEB,API,CLI,IC entry;
+  class AUTH,LEASE,H,TOOLS,EV,ACCEPT,DB,REG trusted;
+  class SEARCH,PROFILE candidate;

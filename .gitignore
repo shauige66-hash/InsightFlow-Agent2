@@ -237,5 +237,8 @@ tests/.sandbox_classification.json
 # 评测生成的运行报告（scripts/run_eval.py 的默认输出目录）。
 # 里面含宿主绝对路径与机器相关的耗时，属于本地产物，不入库。
 eval/reports/
+
+# Trusted local improvement registry, task receipts and candidate histories.
+*.improvement_private/
 # 由 docs/overview.md 渲染出的中间文件（PDF 才是交付物）
 docs/overview.html

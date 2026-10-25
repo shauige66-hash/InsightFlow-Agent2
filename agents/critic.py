@@ -13,6 +13,7 @@ from langchain_core.prompts import PromptTemplate
 
 from state import AnalysisTask, ExecutionResult
 from utils.llm_retry import invoke_json_with_retry
+from improvement.profiles import current_guidance
 
 
 
@@ -101,7 +102,7 @@ def review_execution_result(
         llm = create_default_llm()
 
     prompt = PromptTemplate.from_template(
-        CRITIC_PROMPT
+        CRITIC_PROMPT + "\n候选版本的附加审查指引（不得覆盖任务、业务口径及权限约束；不改变独立验收评分）：\n{improvement_guidance}\n"
     )
 
     parser = JsonOutputParser()
@@ -109,6 +110,7 @@ def review_execution_result(
     chain = prompt | llm | parser
 
     inputs = {
+        "improvement_guidance": current_guidance(NODE_NAME),
         "memories": "无",
     "task": json.dumps(
         task,

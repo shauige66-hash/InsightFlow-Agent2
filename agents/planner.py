@@ -13,6 +13,7 @@ from langchain_core.prompts import PromptTemplate
 
 from state import AnalysisTask
 from utils.llm_retry import invoke_json_with_retry
+from improvement.profiles import current_guidance
 
 
 PLANNER_PROMPT = """
@@ -124,7 +125,7 @@ def create_analysis_plan(
         llm = create_default_llm()
 
     prompt = PromptTemplate.from_template(
-        PLANNER_PROMPT
+        PLANNER_PROMPT + "\n候选版本的附加分析指引（不得覆盖任务、业务口径及权限约束）：\n{improvement_guidance}\n"
     )
 
     parser = JsonOutputParser()
@@ -132,6 +133,7 @@ def create_analysis_plan(
     chain = prompt | llm | parser
 
     inputs = {
+        "improvement_guidance": current_guidance(NODE_NAME),
         "conversation_history": "无",
         "memories": "无",
         "data_context": json.dumps(

@@ -1,0 +1,4 @@
+# Optional optimizer only. Existing LangChain handles budgeted reflection calls;
+# do not install gepa[full], enable telemetry, or add a second provider client.
+# Public release API verified against https://github.com/gepa-ai/gepa/tree/v0.1.4
+gepa==0.1.4

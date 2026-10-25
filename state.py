@@ -59,6 +59,8 @@ class TaskFailure(TypedDict):
 # 工作流传递信息
 class InsightFlowState(TypedDict, total=False):
     run_id: str  # 每次workflow唯一编号
+    improvement_profile: dict[str, Any]
+    improvement_profile_id: str
 
     analysis_focus: str | None  # 提供分析重点（可选）
 

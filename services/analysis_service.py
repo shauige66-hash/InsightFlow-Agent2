@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import time
 from pathlib import Path
 from typing import Any, Callable
@@ -17,6 +18,7 @@ from core.runtime import (
     use_runtime,
 )
 from ingestion.resources import ResourceResolver, verify_recorded_sources
+from improvement.profiles import CandidateProfile, profile_from_state
 from utils.agent_loop import AgentBudget, new_usage
 
 
@@ -88,6 +90,7 @@ def run_analysis(
     enable_dynamic_loop: bool = False,
     dynamic_limits: dict[str, Any] | None = None,
     assert_lease: Callable[[], None] | None = None,
+    improvement_profile: CandidateProfile | dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """执行（或恢复）一次完整分析。
 
@@ -119,6 +122,15 @@ def run_analysis(
     if recovering and checkpointer is None:
         raise ValueError("恢复运行需要持久化 checkpointer")
 
+    requested_profile = (
+        CandidateProfile.from_dict(improvement_profile)
+        if isinstance(improvement_profile, dict)
+        else improvement_profile
+    )
+    if requested_profile is not None and not isinstance(requested_profile, CandidateProfile):
+        raise TypeError("improvement_profile must be CandidateProfile, dict or None")
+    selected_profile = requested_profile or CandidateProfile()
+
     runtime = RunRuntime(
         run_id=run_id,
         model_factory=_require_factory(model_factory, run_id),
@@ -136,10 +148,26 @@ def run_analysis(
         run_id, recursion_limit=DEFAULT_RECURSION_LIMIT
     )
 
+    persisted_snapshot = workflow.get_state(config) if checkpointer is not None else None
+    if recovering and not persisted_snapshot.values:
+        raise ValueError(f"找不到可恢复的 checkpoint：{run_id}")
+    if persisted_snapshot is not None and persisted_snapshot.values:
+        persisted_profile = profile_from_state(persisted_snapshot.values)
+        if requested_profile is not None and requested_profile.profile_id != persisted_profile.profile_id:
+            raise ValueError("Cannot change improvement profile for an existing checkpoint/run")
+        selected_profile = persisted_profile
+    elif requested_profile is None and not recovering:
+        # Deployment selection is trusted host configuration, never a request/model field.
+        # Resolve it once for a new Run; resumed checkpoints retain their exact snapshot.
+        registry_path = os.getenv("INSIGHTFLOW_IMPROVEMENT_REGISTRY", "").strip()
+        if registry_path:
+            from improvement.registry import load_active_profile
+
+            selected_profile = load_active_profile(registry_path)
+            if not isinstance(selected_profile, CandidateProfile):
+                raise TypeError("Active registry must return a validated CandidateProfile")
+
     if recovering:
-        persisted_snapshot = workflow.get_state(config)
-        if not persisted_snapshot.values:
-            raise ValueError(f"找不到可恢复的 checkpoint：{run_id}")
         # 先确认历史输入仍可复现，再进入未确认请求审批或终态收尾。
         # 否则 replay guard 会先询问是否付费重发，甚至把已损坏的数据
         # Run 写成 abandoned，而没有暴露真正无法恢复的数据来源。
@@ -149,6 +177,8 @@ def run_analysis(
     if resume is None and not continue_from_checkpoint:
         inputs = {
             "run_id": run_id,
+            "improvement_profile": selected_profile.to_dict(),
+            "improvement_profile_id": selected_profile.profile_id,
             "data_sources": data_sources,
             "analysis_focus": analysis_focus,
             "knowledge_sources": knowledge_sources or [],
@@ -438,6 +468,7 @@ def _require_factory(
 # 而且调用方需要的是"这次运行到哪一步"，不是完整数据。
 PUBLIC_STATE_FIELDS = (
     "run_id",
+    "improvement_profile_id",  # Version identity only; candidate instruction text stays private.
     "run_status",
     "analysis_status",
     "status_reason",
