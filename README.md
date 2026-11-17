@@ -1,12 +1,13 @@
 
 ---
-[English](#insightflow--agentic-data-intelligence-platform) | [中文](#insightflow--智能数据分析平台)
+[English](#insightflow-agent2--periodic-business-analysis-agent-for-e-commerce-operations) | [中文](#insightflow-agent2--面向中小电商运营的周期性经营分析-agent)
 
 
-# InsightFlow — 智能数据分析平台
-InsightFlow 是一个基于 LangGraph 和 LangChain 构建的 Agentic 数据分析平台。
+# InsightFlow-Agent2 — 面向中小电商运营的周期性经营分析 Agent
 
-用户可以上传结构化数据集以及可选的业务知识文档。InsightFlow 能够自动理解数据、规划分析任务、选择执行工具、生成并执行代码、修复执行错误、验证分析逻辑、生成可视化结果，并最终输出完整分析报告。
+InsightFlow-Agent2 是一个基于 LangGraph 构建的 Agentic 经营分析系统，面向中小电商运营与代运营团队的**周期性经营复盘**场景（例如每周一份的 GMV、退货、分市场表现分析）。
+
+用户提交订单/交易明细（CSV、Excel、SQLite）和可选的业务口径文档，系统自动完成数据理解、分析规划、代码生成与容器沙箱执行、结果校验、图表绘制和报告生成，输出**带图、带结论、带知识来源引用**的分析报告。Harness 治理、RAG、动态决策等技术能力都服务于这个业务目标。
 
 ## 文档
 
@@ -14,10 +15,13 @@ InsightFlow 是一个基于 LangGraph 和 LangChain 构建的 Agentic 数据分�
 
 | 文档 | 内容 | 适合谁 |
 |---|---|---|
+| [演示手册](docs/demo/README.md) | 一步步跑通真实数据演示：环境准备、控制台操作、演示 Prompt、预期结果、常见问题 | 想动手演示 |
+| [案例研究](docs/case-study.md) | 业务场景全叙述：原流程痛点、五个每周问题与标准答案、两个数据陷阱、有/无口径对照实验 | 判断业务价值 |
+| [项目说明](docs/overview.md)（[PDF](docs/overview.pdf)） | 速览：定位、做法、证据、局限 | 面试 / 初次了解 |
+| [架构说明](docs/architecture.md) | 分层、请求路径、有界循环、存储模式、审批与产物访问 | 改代码前 |
+| [自我改进说明](docs/improvement.md) | 受控提示/经验优化闭环：真实评测、候选搜索（含 GEPA 后端）、独立验收、版本晋升与回退 | 要调提示词 / 做评测 |
+| [业务场景与商业价值判断](docs/business-opportunities.md) | 场景筛选调研：三类候选场景的价值、已有基础与缺口，什么条件下才算优势 | 产品 / 业务视角 |
 | [技术说明书](docs/technical-spec.md)（[PDF](docs/technical-spec.pdf)） | 业务需求、功能实现、架构与选型理由、出错补救、工程化与安全、已知限制 | 负责人评审 |
-| [项目说明](docs/overview.md)（[PDF](docs/overview.pdf)） | 两页速览：问题、做法、证据、局限 | 面试 / 初次了解 |
-| [案例研究](docs/case-study.md) | 真实数据集上的业务场景、标准答案与对照实验 | 判断业务价值 |
-| [架构说明](docs/architecture.md) | 分层、节点路径、有界循环、存储模式 | 改代码前 |
 
 ## 核心能力
 
@@ -41,46 +45,93 @@ InsightFlow 是一个基于 LangGraph 和 LangChain 构建的 Agentic 数据分�
 - 自动生成 Markdown、HTML 和 PDF 报告
 - 基于 FastAPI 的数据与知识文件上传接口
 - 按 Run 保存分析产物与运行日志
+- 受控自我改进（可选的离线闭环）：真实重复评测、提示/经验候选搜索（含 GEPA 后端）、独立验收、版本晋升与回退
 
 ## Demo 演示
 
+### 真实数据演示：跨境电商经营复盘
+
+用仓库自带的零售数据（德国站 + 法国站 2011 年订单，17,049 行）跑一次完整分析：
+提交数据与业务口径文档 → 得到带图表、带来源引用的复盘报告（图表逐张校验，历史
+真实运行产出 3/3 张）。操作步骤、演示 Prompt、预期结果与常见问题见
+**[演示手册](docs/demo/README.md)**；业务叙述与有/无口径的对照实验见
+**[案例研究](docs/case-study.md)**。
+
+![GMV 环比图（历史真实运行产出）](./docs/demo/case-retail-gmv.png)
+
 ### 自动生成的数据分析报告
 
-![InsightFlow 分析报告](./docs/demo/demo-03-report.png)
+![InsightFlow-Agent2 分析报告](./docs/demo/demo-03-report.png)
 
 
 ## Agentic 工作流
 
-> 图由 `docs/architecture.md` 的同一份结构维护；改动图请直接改这里，不要再引入图片副本。
+一次分析请求的完整业务流程（与 `workflow.py` 拓扑一致；图由本 README 维护，改动请直接改这里。
+`figures/` 下另有一份逐节点核验过的图册：系统总览、分析工作流、Harness 治理、评测与改进，
+含渲染好的 PNG/SVG，见 [figures/project-flow-review.md](figures/project-flow-review.md)）：
 
 ```mermaid
 flowchart TD
-    IN["数据文件 / 业务知识 / 用户问题"] --> LOAD["loader：解析数据源，写表快照"]
-    LOAD --> CTX["context：数据上下文"]
-    CTX --> GLOBAL["knowledge：规划前全局检索"]
-    GLOBAL --> PLAN["planner：生成结构化任务"]
-    PLAN --> VALID{"计划校验：结构 / ID / 授权表 / 来源类型"}
-    VALID -- "不合法（最多 3 次）" --> PLAN
-    VALID -- "合法" --> NEED{"需要人工审批?"}
-    NEED -- "是" --> GATE["approval_gate：计划指纹 + 版本号"]
-    NEED -- "否" --> ROUTER["router：按来源选 SQL / Python"]
-    GATE -- "批准" --> ROUTER
-    GATE -- "拒绝" --> STOP["结束，不产出交付物"]
-    ROUTER --> EXEC["execution：任务级检索 + 生成代码"]
-    EXEC --> TOOL["tool_execution：Docker 沙箱 / MCP SQL（只读）"]
-    TOOL -- "执行错误" --> DECIDE
-    TOOL -- "成功" --> CRITIC["critic：结果是否回答任务"]
-    CRITIC --> DECIDE{"decide：观察 → 决策 → 策略校验"}
-    DECIDE -- "repair / refine / retrieve_more" --> EXEC
-    DECIDE -- "replan_remaining" --> REPLAN["runtime_replan：只改未执行任务"]
-    REPLAN --> ROUTER
-    DECIDE -- "continue / skip_task" --> ADVANCE["advance：推进到下一任务"]
-    ADVANCE --> ROUTER
-    ADVANCE -- "全部完成" --> VIZ["visualization_planner → plot"]
-    DECIDE -- "finish" --> VIZ
-    VIZ --> REPORT["report：含来源附录"]
-    REPORT --> ARTIFACT["artifact：md / html / pdf"]
+    U["用户提交分析：数据文件 + 业务知识文档 + 分析问题<br/>（控制台 / POST /runs / 会话消息）"] --> LOAD["loader：解析数据源，写表快照"]
+    LOAD --> CTX["context：生成数据上下文（schema / 行数 / 样本）"]
+    CTX --> RAG["knowledge_retrieval：规划前全局业务知识检索"]
+    RAG --> PLAN["planner：生成结构化分析计划"]
+    PLAN -- "空计划（数据不足以支撑分析）" --> VIZP
+    PLAN --> VALID{"计划校验：结构 / 任务 ID / 授权表 / 来源类型"}
+    VALID -- "不合法，有界重规划（≤3 次）" --> PLAN
+    VALID -- "超限仍不合法（运行记为 failed，按空计划收尾）" --> VIZP
+    VALID -- "合法" --> GATE1["approval_gate（可选）：计划审批<br/>计划指纹 + 版本号"]
+    GATE1 -- "拒绝" --> STOP1["结束，不产出交付物"]
+    GATE1 -- "批准 / 未开启审批" --> ROUTER["router：按来源类型选 SQL / Python"]
+    ROUTER --> EXEC["execution：任务级知识检索 + 生成执行代码"]
+    EXEC --> TOOL["tool_execution：Docker 沙箱 / 只读 SQL<br/>（预算、幂等、授权边界）"]
+    TOOL -- "执行错误（固定编排）" --> REPAIR["repair（≤3 次；环境类错误不占修复额度，直接记失败）"]
+    REPAIR --> TOOL
+    REPAIR -- "超限" --> FAILED["failed_task：记录失败与原因"]
+    TOOL -- "成功" --> CRITIC["critic：结果是否回答了任务"]
+    CRITIC -- "质量问题（固定编排）" --> REFINE["refine（≤3 次）"]
+    REFINE --> TOOL
+    REFINE -- "超限" --> FAILED
+    CRITIC -- "通过（固定编排）" --> ADV["advance_task：推进到下一任务"]
+    FAILED -- "固定编排" --> ADV
+    TOOL -- "执行错误（动态决策开启）" --> DECIDE
+    CRITIC -- "通过或质量问题（动态决策开启）" --> DECIDE
+    FAILED -- "动态决策开启" --> DECIDE["decide：观察 → 动作决策 → 确定性策略校验<br/>（上限：8 步 / 重规划 2 / 补充检索 2 / 重复动作 2）"]
+    DECIDE -- "repair" --> REPAIR
+    DECIDE -- "refine" --> REFINE
+    DECIDE -- "retrieve_more" --> EXEC
+    DECIDE -- "replan_remaining" --> REPLAN["runtime_replan：只重写未执行任务，<br/>过与初始计划相同的校验"]
+    REPLAN -- "修订需审批" --> GATE1
+    REPLAN -- "继续执行" --> ROUTER
+    REPLAN -- "修订被拒 / 任务已完" --> VIZP
+    DECIDE -- "continue / skip_task" --> ADV
+    DECIDE -- "finish" --> VIZP
+    ADV -- "还有任务" --> ROUTER
+    ADV -- "全部完成" --> VIZP["visualization_planner：图表规划（≤3 张）<br/>逐张校验，不合法带原因重规划（≤3 轮）"]
+    VIZP -- "有合法图表" --> PLOT["plot_generation → plot_execution<br/>（出错走 plot_repair，每张 ≤3 次，超限进入下一张）"]
+    PLOT --> ADVCH["advance_chart：下一张图"]
+    ADVCH -- "还有图表" --> PLOT
+    ADVCH -- "完成" --> REPORT
+    VIZP -- "无合法图表（记入降级附录）" --> REPORT["report：正文 + 知识来源引用附录<br/>+ 图表附录 + 图表降级/失败说明"]
+    REPORT --> GATE2["report_publish_gate（可选）：发布审批"]
+    GATE2 -- "拒绝" --> STOP2["结束，不产出交付物"]
+    GATE2 -- "批准 / 未开启审批" --> ART["artifact：写 md / html / pdf<br/>（缺浏览器时 PDF 降级，状态 degraded）"]
+    ART --> USER["用户交互：轮询状态 / 查看报告 / 会话追问 /<br/>签名产物链接 / 飞书卡片（可选）"]
+    TOOL -. "预算耗尽" .-> BUDGET["budget_stop：安全收尾"]
+    EXEC -. "预算耗尽" .-> BUDGET
+    BUDGET -.-> GATE2
 ```
+
+**阅读须知**（详细展开见 [docs/architecture.md](docs/architecture.md)）：
+
+- **固定工作流 vs 动态决策**：图中主干（loader→…→artifact）是固定的有界编排；`decide`/`runtime_replan` 只在开启动态决策时经过。API 层 `enable_dynamic_loop` 默认 `false`，网页控制台默认勾选——它是可配置能力，不是每次运行的必经环节。
+- **Agent vs Harness**：Agent 节点（planner/critic/reporter 等）负责"想"；每一次真实的模型调用与工具派发都经过 `harness/`，预算、账本、幂等只在那里实现。
+- **RAG vs 长期记忆**：RAG 检索的是本次运行传入的业务知识文档（产出带来源的证据）；长期记忆存的是跨会话、经用户确认的口径与偏好，默认只产生候选。
+- **Checkpoint / 预算 / 幂等是内部治理机制**，不是用户直接操作的功能；用户可感知的只有审批开关、运行状态、报告与通知。
+- **飞书通知可选**：未配置 `FEISHU_WEBHOOK_URL` 时整条通知链路关闭；配置后是单向状态卡片。
+- **PDF 导出依赖本机浏览器**：缺失时降级为 Markdown + HTML，状态 `degraded`，属设计内行为。
+- **MCP 只是 SQL 工具的一种可选后端**（stdio 子进程），与 direct 模式共用同一套只读防护；Python/绘图始终在一次性 Docker 容器中执行。
+- 任何环节预算耗尽都会进入 `budget_stop` 安全收尾，仍然经过发布闸与产物登记。
 
 
 ## 运行时治理层（Harness）
@@ -218,7 +269,7 @@ decide → continue | finish | repair | refine | retrieve_more
 
 ## 业务知识 Grounding
 
-InsightFlow 支持使用 Markdown、TXT 和 PDF 等业务知识文档，为数据分析过程提供业务语义和规则约束。
+InsightFlow-Agent2 支持使用 Markdown、TXT 和 PDF 等业务知识文档，为数据分析过程提供业务语义和规则约束。
 
 例如，业务知识中可以定义：
 
@@ -267,7 +318,7 @@ Refine
 并比较各地区高价值客户的销售贡献。
 ```
 
-InsightFlow 会自动完成：
+InsightFlow-Agent2 会自动完成：
 
 1. 检索与当前问题相关的高价值客户业务定义；
 2. 自动生成分析计划；
@@ -309,10 +360,14 @@ insightflow-agent2/
 ├── sandbox/       # Docker 执行沙箱（镜像、宿主执行器、容器入口）
 ├── services/      # 分析、会话、记忆与知识服务层
 ├── tools/         # Python / SQL / Plot 工具
-├── utils/         # 报告、重试等通用工具
-├── docs/          # 架构说明
-├── deploy/        # docker compose（PostgreSQL + pgvector、Redis）
-├── data/          # 示例数据
+├── utils/         # 报告、重试、账本、HTML 净化等通用工具
+├── core/          # 配置、模型工厂、鉴权与资源访问校验
+├── integrations/  # 飞书群机器人卡片（可选）
+├── web/           # 零构建单页控制台（index.html）
+├── scripts/       # 服务启动、队列 worker、模型检查与回归脚本
+├── docs/          # 文档与演示材料
+├── deploy/        # docker compose（本地依赖 + 整套编排）
+├── data/          # 示例数据（含零售案例）
 ├── api.py         # FastAPI 入口
 ├── api_runs.py    # Run 接口
 ├── api_conversations.py  # 会话与长期记忆接口
@@ -338,63 +393,11 @@ insightflow-agent2/
 - `services/`：封装分析、会话、记忆与知识服务，供 CLI 和 FastAPI 共同调用
 - `mcp_bridge/`：MCP Server / Client（stdio）与 Run 级数据授权
 - `profiling/`：数据画像与 schema 推断
-- `deploy/`：本地开发依赖的 docker compose
-- `nodes.py`：定义 LangGraph 工作流中的节点逻辑
-- `conditions.py`：条件路由（含动态决策的开关分支）
-- `workflow.py`：负责节点连接、条件路由和工作流构建
-- `state.py`：定义各 Agent 共享的工作流状态
-- `api.py`：提供 FastAPI 接口
-- `api_runs.py`：Run 创建、查询、恢复与审批接口
-- `api_conversations.py`：会话、轮次与长期记忆接口
-- `main.py`：提供本地 Demo 启动入口
-
-## 项目结构
-
-```text
-insightflow-agent2/
-├── agents/        # 各类分析 Agent
-├── agent_loop/    # 运行期观察、动作决策与策略校验
-├── planning/      # 计划校验、初始重规划、运行期计划修订
-├── harness/       # 执行治理：模型调用、工具派发、预算、上下文选择
-├── context/       # 自适应数据上下文
-├── ingestion/     # CSV / Excel / SQLite 数据加载
-├── knowledge/     # 示例业务知识
-├── rag/           # 业务知识检索、证据与缓存
-├── storage/       # 会话、长期记忆、知识索引与迁移
-├── mcp_bridge/    # MCP Server / Client（stdio）与 Run 级数据授权
-├── sandbox/       # Docker 执行沙箱（镜像、宿主执行器、容器入口）
-├── services/      # 分析、会话、记忆与知识服务层
-├── tools/         # Python / SQL / Plot 工具
-├── utils/         # 报告、重试等通用工具
-├── docs/          # 架构说明
-├── deploy/        # docker compose（PostgreSQL + pgvector、Redis）
-├── data/          # 示例数据
-├── api.py         # FastAPI 入口
-├── api_runs.py    # Run 接口
-├── api_conversations.py  # 会话与长期记忆接口
-├── main.py        # CLI Demo 入口
-├── conditions.py  # 条件路由
-├── nodes.py       # LangGraph 节点
-├── state.py       # 工作流共享状态
-└── workflow.py    # LangGraph 工作流定义
-```
-
-主要模块职责：
-
-- `agents/`：负责分析规划、代码生成、错误修复、结果验证、结果优化、可视化与报告撰写
-- `agent_loop/`：负责运行期观察、动作决策与确定性策略校验
-- `planning/`：负责计划校验、初始重规划与运行期计划修订
-- `harness/`：所有模型与工具调用、预算、上下文选择与度量的唯一入口
-- `storage/`：负责会话、长期记忆、知识索引与数据库迁移
-- `ingestion/`：负责加载 CSV、Excel 和 SQLite 数据
-- `context/`：负责生成适合 Agent 使用的数据上下文
-- `rag/`：负责业务知识文档加载、切分、Embedding、检索、相关性过滤和缓存
-- `tools/`：负责 Python、SQL 和绘图代码的调用与结果归一化
-- `sandbox/`：负责 Python 与绘图代码的容器化执行（镜像构建、宿主侧执行器、容器入口）
-- `services/`：封装分析、会话、记忆与知识服务，供 CLI 和 FastAPI 共同调用
-- `mcp_bridge/`：MCP Server / Client（stdio）与 Run 级数据授权
-- `profiling/`：数据画像与 schema 推断
-- `deploy/`：本地开发依赖的 docker compose
+- `core/`：配置、模型工厂（`llm.py`）、鉴权（`auth.py`）与资源访问校验（`resource_access.py`）
+- `integrations/`：飞书群机器人卡片构建与推送（可选，未配置即整链路关闭）
+- `web/`：零构建单页控制台
+- `scripts/`：服务启动、队列 worker、模型检查、真实模型回归等脚本
+- `deploy/`：docker compose（本地开发依赖 + 整套编排 `compose.app.yaml`）
 - `nodes.py`：定义 LangGraph 工作流中的节点逻辑
 - `conditions.py`：条件路由（含动态决策的开关分支）
 - `workflow.py`：负责节点连接、条件路由和工作流构建
@@ -408,7 +411,7 @@ insightflow-agent2/
 
 除了接口和 CLI，服务自带一个零构建的单页控制台：启动后访问 `http://127.0.0.1:8123/ui/`。
 
-![InsightFlow 控制台](./docs/demo/demo-console.png)
+![InsightFlow-Agent2 控制台](./docs/demo/demo-console.png)
 
 它只做四件事——选数据与业务知识、填分析问题、看运行状态与预算、在需要时审批并打开报告。
 页面本身是 `web/index.html`（原生 JS，无 CDN 依赖，可离线使用），由 API 挂载在 `/ui`；
@@ -551,7 +554,7 @@ FEISHU_SIGN_SECRET=            # 创建机器人时勾选"签名校验"才有
 
 ## API 接口
 
-InsightFlow 基于 FastAPI 提供健康检查、数据分析和报告下载接口。
+InsightFlow-Agent2 基于 FastAPI 提供健康检查、数据分析和报告下载接口。
 
 ### 健康检查
 
@@ -575,7 +578,7 @@ GET /health
 POST /analyze/upload
 ```
 
-执行完整的 InsightFlow Agentic 数据分析流程。
+执行完整的 InsightFlow-Agent2 Agentic 数据分析流程。
 
 表单参数：
 
@@ -634,12 +637,14 @@ http://127.0.0.1:8000/docs
 
 ## 当前限制
 
-当前版本的 InsightFlow 主要面向本地开发、学习和项目演示场景。
+当前版本的 InsightFlow-Agent2 主要面向本地开发、学习和项目演示场景。
 
 目前主要限制包括：
 
-- Vector Store 和缓存目前保存在进程内存中，服务重启后不会持久化。
-- 分析请求目前采用同步执行方式，复杂任务需要等待完整工作流结束后才能返回。
+- 知识索引、会话与记忆按存储模式持久化（`local`=SQLite，`postgres`=PostgreSQL+pgvector）；
+  Redis 只是可选的检索缓存，不保存权威状态。两种模式的 Checkpoint 不互相迁移。
+- 分析请求异步受理：`POST /runs` 立即返回 202 与 run_id，local 模式在有界线程池中执行，
+  postgres 队列模式由独立 worker 认领执行；但没有实时进度推送，前端依赖轮询。
 - Python 与绘图代码已在一次性 Docker 容器中执行（只读根、无网络、
   资源与并发上限），但容器与宿主共享内核，**不是绝对安全保证**，
   也受限于本机 Docker Desktop 的隔离能力。
@@ -662,11 +667,9 @@ http://127.0.0.1:8000/docs
 未来可以进一步扩展：
 
 - 把 SQL 执行迁入受限容器或独立进程
-- 持久化向量数据库
 - LangSmith 工作流追踪与可观测性
 - 完整账户生命周期、限流与按用户配额
 - RAG 与 Agent 分析质量 Benchmark
-- 异步分析任务和后台执行
 - 实时工作流进度推送
 - 基于 DuckDB 的跨数据源分析
 - 企业身份接入与租户管理
@@ -721,13 +724,13 @@ HF_TOKEN=your_huggingface_token
 
 ### 5. 安装 PDF 报告所需浏览器
 
-InsightFlow 使用 Playwright 生成 PDF 报告：
+InsightFlow-Agent2 使用 Playwright 生成 PDF 报告：
 
 ```bash
 playwright install chromium
 ```
 
-如果本机已经安装 Google Chrome 或 Microsoft Edge，InsightFlow 也可能直接使用本地浏览器。
+如果本机已经安装 Google Chrome 或 Microsoft Edge，InsightFlow-Agent2 也可能直接使用本地浏览器。
 
 ## 快速开始
 
@@ -815,7 +818,7 @@ http://127.0.0.1:8000/docs
 - Markdown、TXT 或 PDF 业务知识文档
 - 自然语言分析问题
 
-InsightFlow 会自动执行完整的 Agentic 数据分析流程，并返回分析结果与生成的报告产物。
+InsightFlow-Agent2 会自动执行完整的 Agentic 数据分析流程，并返回分析结果与生成的报告产物。
 
 ### 评测与可靠性基准
 
@@ -862,11 +865,13 @@ MCP 不可用、数据源缺失属于环境故障，应安全失败而**不**进
 
 
 
-# InsightFlow — Agentic Data Intelligence Platform
+# InsightFlow-Agent2 — Periodic Business-Analysis Agent for E-Commerce Operations
 
-InsightFlow is an agentic data analysis platform built with LangGraph and LangChain.
+InsightFlow-Agent2 is an agentic business-analysis system built on LangGraph, aimed at small and mid-size e-commerce operations and agency teams and their **periodic business reviews** (e.g. a weekly report on GMV, returns and per-market performance).
 
-Users can upload structured datasets and optional business knowledge documents. InsightFlow autonomously understands the data, plans analytical tasks, selects execution tools, generates and executes code, repairs failures, validates analytical results, creates visualizations, and produces final reports.
+Users submit order/transaction data (CSV, Excel, SQLite) together with optional business-caliber documents. The system understands the data, plans the analysis, generates and executes code in a sandbox, validates results, draws charts, and produces a report **with conclusions, charts and knowledge-source citations**. Harness governance, RAG and the dynamic decision loop are engineering means that serve this business goal.
+
+> Documentation index, the business-flow diagram and the reading notes are maintained once, in the Chinese half above.
 
 ## Core Capabilities
 
@@ -896,9 +901,20 @@ Users can upload structured datasets and optional business knowledge documents. 
 
 ## Demo & Results
 
+### Real-Data Demo: Cross-Border E-Commerce Business Review
+
+Run a full periodic review on the retail dataset shipped with this repo
+(Germany + France orders, 2011, 17,049 rows): submit the data plus a business-caliber
+document and get back a report with charts and source citations. Step-by-step
+instructions, the demo prompt, expected results and troubleshooting are in the
+**[demo manual](docs/demo/README.md)** (Chinese); the business narrative and the
+with/without-caliber comparison are in the **[case study](docs/case-study.md)**.
+
+![GMV month-over-month chart (from a historical real run)](./docs/demo/case-retail-gmv.png)
+
 ### Automatically Generated Analysis Report
 
-![InsightFlow Analysis Report](./docs/demo/demo-03-report.png)
+![InsightFlow-Agent2 Analysis Report](./docs/demo/demo-03-report.png)
 
 
 ## Agentic Workflow
@@ -1006,7 +1022,7 @@ strictly more expensive.
 
 ## Business Knowledge Grounding
 
-InsightFlow can use business documents such as Markdown, text, and PDF files to ground analytical decisions.
+InsightFlow-Agent2 can use business documents such as Markdown, text, and PDF files to ground analytical decisions.
 
 For example, a business rule may define:
 
@@ -1041,7 +1057,7 @@ Analyze the performance of high-value customers across regions
 and compare their sales contribution.
 ```
 
-InsightFlow automatically:
+InsightFlow-Agent2 automatically:
 
 1. retrieves the relevant high-value customer definition,
 2. plans the required analyses,
@@ -1063,11 +1079,7 @@ InsightFlow automatically:
 - FastAPI
 - Hugging Face Sentence Transformers
 - Matplotlib
-- Playwright# InsightFlow — Agentic Data Intelligence Platform
-
-InsightFlow is an agentic data analysis platform built with LangGraph and LangChain.
-
-Users can upload structured datasets and optional business knowledge documents. InsightFlow autonomously understands the data, plans analytical tasks, selects execution tools, generates and executes code, repairs failures, validates analytical results, creates visualizations, and produces final reports.
+- Playwright
 
 ## Installation
 
@@ -1114,13 +1126,13 @@ HF_TOKEN=your_huggingface_token
 
 ### 5. Install browser support for PDF reports
 
-InsightFlow uses Playwright to generate PDF reports.
+InsightFlow-Agent2 uses Playwright to generate PDF reports.
 
 ```bash
 playwright install chromium
 ```
 
-If Google Chrome or Microsoft Edge is already available, InsightFlow may use the installed browser automatically.
+If Google Chrome or Microsoft Edge is already available, InsightFlow-Agent2 may use the installed browser automatically.
 
 ## Quick Start
 
@@ -1180,7 +1192,7 @@ The interactive API interface allows you to upload:
 - Markdown, TXT, or PDF business knowledge documents
 - a natural-language analysis question
 
-InsightFlow then runs the complete agentic analysis workflow and returns the analysis results and generated artifacts.
+InsightFlow-Agent2 then runs the complete agentic analysis workflow and returns the analysis results and generated artifacts.
 
 ## Evaluation & Reliability Benchmark
 
@@ -1369,7 +1381,7 @@ Key modules:
 
 ## API Endpoints
 
-InsightFlow exposes a FastAPI interface for health checks, analysis requests, and report retrieval.
+InsightFlow-Agent2 exposes a FastAPI interface for health checks, analysis requests, and report retrieval.
 
 ### Health Check
 
@@ -1393,7 +1405,7 @@ Example response:
 POST /analyze/upload
 ```
 
-Runs the complete InsightFlow analysis workflow.
+Runs the complete InsightFlow-Agent2 analysis workflow.
 
 Form fields:
 
@@ -1451,7 +1463,7 @@ http://127.0.0.1:8000/docs
 
 ## Limitations
 
-The current version of InsightFlow is designed as a local development and demonstration platform.
+The current version of InsightFlow-Agent2 is designed as a local development and demonstration platform.
 
 Current limitations include:
 
